@@ -387,6 +387,35 @@ Each milestone ends in a result that can be checked.
 | M8 | **Performance pass.** Measure. Optimise command translation, memory classes, shader code quality (uniformity), thread scheduling for 4C/8T, large pages, host FSR 4, a host DXR option. | Numbers in `docs/perf.md` against the M7 baseline. |
 | M9 | **Polish.** HDR, resolution options, keyboard / mouse mapping, Series X mode, robustness. | — |
 
+### Order of work
+
+M3 (the shader recompiler) runs **alongside M2**, not after it. Its batch jobs need hours of
+machine time (section 7a), and the machine can work through them while M2's code is written.
+By the time M4 needs shaders, the cache should be warm.
+
+## 7a. Background jobs: what the PC precomputes
+
+| Job | Tool | When it can start | Machine time (Dev PC 1, 4 cores) | Kept in |
+|---|---|---|---|---|
+| Shader corpus: every record of `shaders.rpf` inflated and de-duplicated | `am-shaders index` | **now (done)** | 48 s | `cache\shaders\pack` |
+| Translation survey: every program through the recompiler, failures by reason | `am-shaders survey` (M3) | once the RDNA2 decoder exists | minutes; rerun after each recompiler change | `cache\shaders\survey.json` |
+| Precompile: every translated program through DXC to DXIL | `am-shaders precompile` (M3) | once the recompiler emits code | several CPU-hours on first run; afterwards only programs whose translation changed | `cache\shaders\dxil` (content-addressed) |
+| Driver pipeline warm-up | the runtime | first game runs | per pipeline the game creates; the driver's cache and our pipeline library keep them | driver cache, `cache\pipelines` |
+| CPU census per executable build | automatic at load | always | seconds, once per build | `cache\cpu` |
+
+The batch jobs must be safe to leave running:
+* resumable: an interrupted run continues where it stopped;
+* below-normal priority, so the PC stays usable;
+* content-addressed by the console bytes plus the recompiler version, so a recompiler change
+  recompiles only what it changes;
+* a summary written as they go.
+
+Not precomputed, by design:
+* textures: detiled on the GPU as they stream; converting ~150 GB ahead would only duplicate
+  it;
+* audio: decoded live;
+* ray-tracing BVHs: built by the game's own builder at run time.
+
 ## 8. Proposed dependencies (permissive, chosen on purpose)
 
 * **Zydis** (MIT): x86 decoding for the CPU census and patcher.
@@ -586,5 +615,25 @@ Patch plan for the 41 sites:
 
 69 imports are stubs so far: 39 console functions and 30 refused wrappers.
 
-Next: **M2.** Memory (`xmem`, console `VirtualAlloc` flags, physical pages), then files
-(console paths), threads and topology, XGameRuntime, D3D12.X device and presentation.
+### M3 groundwork: the shader corpus (done)
+
+* **DEFLATE decoder** (`src/formats/inflate`): raw and zlib-wrapped, table-driven, with checks
+  for truncated, corrupt and oversized streams. Tested with synthetic vectors (stored, fixed,
+  fixed with matches, dynamic, zlib with Adler-32). DirectStorage's zlib will use it too.
+* **Shader pack reader** (`src/shader/pack`). It finds records by their own framing, without
+  the encrypted table of contents, and accepts one only if it inflates to exactly its stated
+  size as a DXBC container. Tested on a synthetic pack with junk and a decoy.
+* **`am-shaders index`** on the game's `shaders.rpf`:
+  * 26,503 records, 25,889 distinct containers (234 MB), 48 s;
+  * 0 rejected, 0 unreadable;
+  * by kind: 12,101 pixel, 9,282 mesh, 2,689 compute, 2,236 vertex, 195 geometry.
+* **Container layout.** Every container has the parts `SFI0 ISG1 OSG1 PSV0 HASH DXIL PRIV`.
+  The `DXIL` part starts with the PC's program header (kind and shader model 6.6), followed by
+  the console's `XDAT` block, then an `XBCH` block, and ends with a dummy 4-byte "bitcode".
+  The RDNA2 machine code is inside the console blocks; mapping them is M3's first task.
+
+Next, in parallel:
+* **M2.** Memory (`xmem`, console `VirtualAlloc` flags, physical pages), then files (console
+  paths), threads and topology, XGameRuntime, D3D12.X device and presentation.
+* **M3.** The console blocks' layout, the RDNA2 decoder (with an assembler / disassembler as a
+  test oracle), the survey, then translation and `am-shaders precompile`.
