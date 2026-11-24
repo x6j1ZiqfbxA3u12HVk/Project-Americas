@@ -1,0 +1,3 @@
+#!/bin/sh
+# Refuses commits that would add game data or other binary material to the repository.
+exec python -I -B "$(git rev-parse --show-toplevel)/scripts/check_assets.py" --staged
