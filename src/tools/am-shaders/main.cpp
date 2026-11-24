@@ -12,6 +12,12 @@
 //       an instruction histogram, in <cache>\shaders\survey.json.
 //   am-shaders disasm <hash prefix> [--out <dir>] [--raw <dir>]
 //       A listing of one container's console programs; --raw also writes their code bytes.
+//   am-shaders translate <hash prefix> [--out <dir>] [--raw <hlsl dir>]
+//       One container's programs through the shader translator; the HLSL goes to
+//       <cache>\shaders\hlsl and is compiled with DXC.
+//   am-shaders tsurvey [<programs to compile>] [--out <dir>]
+//       Every program through the translator: what translates, what holds the rest up, and DXC
+//       on a sample, in <cache>\shaders\translation.json.
 
 #include <windows.h>
 
@@ -46,7 +52,9 @@ int usage() {
                "usage: am-shaders index [<shaders.rpf>] [--out <dir>]\n"
                "       am-shaders dump <name or hash prefix> [--out <dir>]\n"
                "       am-shaders survey [--out <dir>]\n"
-               "       am-shaders disasm <hash prefix> [--out <dir>] [--raw <dir>]\n");
+               "       am-shaders disasm <hash prefix> [--out <dir>] [--raw <dir>]\n"
+               "       am-shaders translate <hash prefix> [--out <dir>] [--raw <hlsl dir>]\n"
+               "       am-shaders tsurvey [<programs to compile>] [--out <dir>]\n");
   return 2;
 }
 
@@ -249,5 +257,12 @@ int wmain(int argc, wchar_t** argv) {
   if (command == L"dump" && positional.size() == 1) return dump(narrow(positional[0]), out);
   if (command == L"survey" && positional.empty()) return tools::survey(out, out.parent_path() / L"survey.json");
   if (command == L"disasm" && positional.size() == 1) return tools::disasm(narrow(positional[0]), out, raw);
+  if (command == L"translate" && positional.size() == 1) {
+    return tools::translate(narrow(positional[0]), out, raw.empty() ? out.parent_path() / L"hlsl" : raw);
+  }
+  if (command == L"tsurvey" && positional.size() <= 1) {
+    const size_t sample = positional.empty() ? 200 : std::stoul(positional[0]);
+    return tools::translation_survey(out, out.parent_path() / L"translation.json", sample);
+  }
   return usage();
 }

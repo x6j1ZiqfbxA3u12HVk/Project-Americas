@@ -46,7 +46,10 @@ GPU rendering yet)". The picture is black until the GPU back end exists. Closing
 ends the run.
 
 **M3:** the RDNA 2 decoder is done and decodes all 26,084 console GPU programs of the corpus,
-checked against LLVM (100 % on 2.8 M instructions). Next there: the translator.
+checked against LLVM (100 % on 2.8 M instructions). **Translator version 1 runs** (PLAN.md,
+section 11, "M3.2"): compute programs become HLSL, one thread per console lane, and are checked
+on the host GPU against the ISA. 69 of 2,682 compute programs translate so far, all of them
+compile; the survey lists what blocks the rest.
 
 ## 1. Rules from the user (follow them exactly)
 
@@ -138,11 +141,11 @@ Set-Location "C:\Users\Admin\Documents\GitHub\Project Americas"; . .\scripts\env
 |---|---|
 | `src/core` | read-only file mapping, path containment, SHA-256, JSON writer, settings |
 | `src/pe` | bounds-checked PE32+ parser: imports with IAT addresses, exports, TLS, CodeView, relocations, function table |
-| `src/host` | CPU features vs the console's, memory and topology, GPUs and D3D12 features, target-GPU choice, DXC discovery |
+| `src/host` | CPU features vs the console's, memory and topology, GPUs and D3D12 features, target-GPU choice, DXC discovery, `dxc_compile` (in-process DXC) |
 | `src/x86` | our x86-64 decoder (length, operands, flow, required feature) and the two-pass code census |
 | `src/loader` | the import routing policy: ours / wrap / host / title / unresolved |
 | `src/formats` | DEFLATE (raw and zlib) |
-| `src/shader` | shader pack reader (records found by their framing), DXBC container parser, `console_program` (XDAT / XBCH / FSSM: the native programs and their records), `rdna2` (the decoder; `rdna2_tables.inl` generated from AMD's XML) |
+| `src/shader` | shader pack reader (records found by their framing), DXBC container parser, `console_program` (XDAT / XBCH / FSSM: the native programs and their records), `rdna2` (the decoder; `rdna2_tables.inl` generated from AMD's XML), `translate` (console program → HLSL) |
 | `src/runtime` | the runtime DLL, below |
 | `src/runtime/memory` | title memory: console flag translation, physical pages, the XMemAlloc default allocator |
 | `src/runtime/gdk` | XGameRuntime: `runtime.*` (exports, QueryApiImpl, area objects, report), `catalog.cpp` (the areas not done yet, by slot), `task_queue*` (XTaskQueue / XAsync), `offline.cpp` (XUser, XSystem, XGame, XNetworking, features, events) |
@@ -273,8 +276,16 @@ RDNA 2 decoder decodes all 26,084 programs by control flow, checked against LLVM
   checks the decoder against `C:\Project Americas\tools\llvm-amdgpu-23.1.6\bin\llvm-mc.exe`.
 * Regenerate the tables with `python -I scripts\gen_rdna2_tables.py <rdna2.xml> <rdna1.xml>`.
 
-3. **Translator** (IR, structuring, EXEC removal, uniformity, resource tracing; HLSL → DXC),
-   then `am-shaders precompile`.
+3. **Translator.** Version 1 (a faithful wave, PLAN.md 5.6 step 3) runs for compute:
+   * `am-shaders translate <hash prefix>` (HLSL and DXC for one program) and
+     `am-shaders tsurvey [<n>]` (the whole corpus in 8 s; `cache\shaders\translation.json`).
+   * GPU tests in `tests/translate_tests.cpp`: assemble with llvm-mc
+     (`-triple=amdgcn -mcpu=gfx1030 -mattr=+wavefrontsize64 --show-encoding`), put the words
+     in, check registers and memory.
+   * Next, by the survey's list: typed buffers, `v_fma_mix`, SDWA/DPP, `v_alignbit`,
+     `v_permlanex16`, cube ops; then images (a texture binding model), the other stages, the
+     indirect jumps, and the runtime binding model (M4).
+   * Then the speed work (IR, structuring, uniformity) and `am-shaders precompile`.
    * It must be resumable, run below normal priority, and be content-addressed (console bytes
      + translator version).
    * Started as soon as it works for a share of the corpus, so the PC grinds in the

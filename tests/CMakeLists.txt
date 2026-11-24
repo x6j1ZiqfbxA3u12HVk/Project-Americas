@@ -5,6 +5,7 @@ add_executable(am_tests
   cpu_tests.cpp
   d3d12x_tests.cpp
   files_tests.cpp
+  gpu_runner.cpp
   inflate_tests.cpp
   memory_tests.cpp
   pe_tests.cpp
@@ -14,8 +15,9 @@ add_executable(am_tests
   present_tests.cpp
   shader_pack_tests.cpp
   storage_tests.cpp
+  translate_tests.cpp
   x86_tests.cpp)
-target_link_libraries(am_tests PRIVATE am_core am_pe am_host am_loader am_x86 am_runtime am_formats am_shader)
+target_link_libraries(am_tests PRIVATE am_core am_pe am_host am_loader am_x86 am_runtime am_formats am_shader d3d12 dxgi dxguid)
 
 add_test(NAME unit COMMAND am_tests)
 # The tools run on this machine: the probe finds a usable GPU, the inspector reads a PE we built.

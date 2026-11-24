@@ -292,28 +292,41 @@ the 26,503 records of `shaders.rpf`.
    metadata, and pixel-shader export patch tables.
 2. **GFX10 (RDNA2) decoder.** Every encoding: SOP*, SMEM, VOP1/2/3/3P/C, DPP, SDWA, DS,
    MUBUF/MTBUF, MIMG, FLAT/GLOBAL/SCRATCH, EXP, interpolation.
-3. **IR and analysis.**
+3. **Translation, version 1: a faithful wave** (`shader/translate`). One HLSL thread per
+   console lane, at the program's own wave size (`[WaveSize]`):
+   * SGPRs, VCC, EXEC, M0 and SCC are variables every lane holds alike; VGPRs are per lane;
+   * EXEC is kept exactly: each vector write is predicated on the lane's EXEC bit, and compares
+     build their lane masks with `WaveActiveBallot`;
+   * this GPU's branches are always wave-uniform, so control flow is a dispatcher loop, a
+     `switch` over block starts. That is correct for every program without structuring;
+   * memory goes through a binding model's functions: the tests map GPU addresses onto one
+     buffer; the runtime's model (the graphics layer's page table and descriptors) comes with
+     M4.
+
+   Correct before fast: the steps below turn it into fast code without changing its meaning.
+   The GPU tests check every change.
+4. **IR and analysis** (speed, after version 1).
    * SSA IR and control-flow graph;
    * structuring (loops, branches, far jumps);
    * EXEC-mask removal (lane masks become per-lane predicates);
    * uniformity analysis (scalar register math stays wave-uniform in DXIL);
    * resource tracing (each T#/V#/S# back to its root argument, table or heap slot).
-4. **Stages.**
+5. **Stages.**
    * VS: the fetch-shader call becomes vertex inputs;
    * PS: interpolants, exports, discard, depth;
    * CS: LDS, wave64 through `WaveSize`;
    * NGG primitive shaders: mesh shaders;
    * GS, plus its copy stage;
    * ray-tracing instructions.
-5. **Emit.** HLSL, then DXC (Windows SDK 10.0.26100 or a newer release), then DXIL. Wave size is
+6. **Emit.** HLSL, then DXC (Windows SDK 10.0.26100 or a newer release), then DXIL. Wave size is
    kept where it matters, and RDNA4 runs wave64 natively. Direct DXIL emission is a later option
    to shorten the first-run compile time; runtime speed would be the same, because the output
    is cached.
-6. **Cache.** Content-addressed: the hash of the console bytes plus the translator version,
+7. **Cache.** Content-addressed: the hash of the console bytes plus the translator version,
    under `C:\Project Americas\cache\shaders`. An offline tool precompiles the whole pack in
    parallel. That is several CPU-hours once on 4 cores, so it runs overnight; the driver's PSO
    cache is warmed after it.
-7. **Tests.**
+8. **Tests.**
    * per-instruction GPU tests: our own small programs, assembled with an assembler used by the
      tests only, run on the host GPU and checked against CPU reference semantics;
    * a pack-wide survey: translate everything and count failures by reason.
@@ -807,6 +820,39 @@ builder's `XMemVirtualQuery` calls, and the arguments logged at run time.
   * the two opcode bits and the legacy MAD;
   * the control-flow scan;
   * a synthetic container through `read_console_shader`.
+
+### M3.2: translator version 1, a faithful wave (in progress)
+
+* **The model** (`shader/translate`): every console lane is one HLSL thread of a
+  `[WaveSize(32|64)]` compute shader (`cs_6_6`), so a console wave is one host wave.
+  * SGPRs are a wave-uniform array `s[128]` (VCC in 106/107, M0 124, EXEC 126/127) and `scc`.
+  * VGPRs are a per-lane array; every vector write is predicated on the lane's EXEC bit.
+  * Compares build their masks with `WaveActiveBallot`.
+  * Branches are uniform (the console's are on SGPRs), so control flow is a dispatcher:
+    `for (;;) switch (pc)` over the block starts.
+  * Literal templates are filled in one pass, so sources holding the placeholder letters
+    (hex literals) are safe.
+* **The compute ABI** (from `COMPUTE_PGM_RSRC2`, read from each CS record at `+0x54+0x24`,
+  with the thread counts after it): user SGPRs first, then the enabled group ids; v0..v2 hold
+  the thread ids up to `TIDIG_COMP_CNT`.
+* **Memory:** `s_load` and `s_buffer_load`, untyped `buffer_*` through the V# (base, stride,
+  records, bounds), `global_*`, and LDS (`ds_read/write` b32, read2/write2).
+* **Two binding models:** `Test` (memory at a GPU base address in one UAV, a register dump in
+  another) for the tests; `Runtime` follows with M4.
+* **Host side:** `host/dxc_compile` loads `dxcompiler.dll` from the found DXC and compiles in
+  process.
+* **`am-shaders translate <hash prefix>`** writes the HLSL and compiles it;
+  **`am-shaders tsurvey [<n>]`** translates the whole corpus in 8 s, compiles `n` of the
+  results and writes `cache\shaders\translation.json` with what blocks the rest.
+* **Tests** (`tests/translate_tests.cpp`, `tests/gpu_runner.*`): console programs assembled with
+  LLVM's AMDGPU assembler run on the host GPU, and every SGPR, the SCC, every lane's VGPRs and
+  the memory are checked against the ISA: scalar ALU and loops, vector ALU with EXEC masking,
+  `cmpx`, `mbcnt`, scalar/global/buffer memory. All pass on the RX 9060 XT.
+* **First survey:** 69 of the 2,682 compute programs translate, and **all 69 compile with DXC**.
+  What blocks the rest, by programs held up: image loads, stores and samples (1,932, 1,740,
+  1,599), typed buffer access (`buffer_load_format_x` 1,595, `tbuffer_load_format_xy` 1,067),
+  `v_fma_mix_f32` 1,411, SDWA/DPP forms (about 1,100 each for the common ALU ops),
+  `v_alignbit_b32` 1,037, `v_permlanex16_b32` 902, the cube ops 794.
 
 ### M2.3: console files and DirectStorage (done)
 

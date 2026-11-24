@@ -92,6 +92,14 @@ bool read_blob(std::span<const uint8_t> blob, NativeBlob& out, std::string& erro
       error = std::string(hw_stage_name(s.stage)) + " code out of bounds";
       return false;
     }
+    if (s.stage == HwStage::Cs) {
+      const uint64_t e = record + kRecordSize;
+      if (!read(p, e + 0x24, prog.cs_rsrc2) || !read(p, e + 0x28, prog.cs_threads[0]) ||
+          !read(p, e + 0x2c, prog.cs_threads[1]) || !read(p, e + 0x30, prog.cs_threads[2])) {
+        error = "CS stage data out of bounds";
+        return false;
+      }
+    }
     prog.wave32 = (prog.flags >> 5) & 1;
     prog.vgprs = regs & 0x3FF;
     prog.sgprs = (regs >> 20) & 0xFF;

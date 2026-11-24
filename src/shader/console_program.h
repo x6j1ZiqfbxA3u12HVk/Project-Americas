@@ -15,6 +15,7 @@
 //           +0x14    u32 flags: bit 5 wave32 (else wave64)
 //           +0x4c    u32 LDS bytes; +0x50 u32 registers: bits 0-9 VGPRs, 20-27 SGPRs
 //   stage data follows the record (inputs, outputs, export patches; read by the translator).
+//   Compute: +0x54+0x24 u32 COMPUTE_PGM_RSRC2, +0x54+0x28 u32 x3 thread-group size.
 //
 // A vertex shader can carry two blobs (for use with and without a geometry shader).
 
@@ -38,6 +39,10 @@ struct NativeProgram {
   bool wave32 = false;
   uint32_t vgprs = 0, sgprs = 0;  // the record's raw counts
   uint32_t lds_bytes = 0;
+  // Compute only: COMPUTE_PGM_RSRC2 (user SGPRs, group id SGPRs, thread id VGPRs) and the
+  // thread-group size, from the stage data after the record (record + 0x54 + 0x24 / + 0x28).
+  uint32_t cs_rsrc2 = 0;
+  uint32_t cs_threads[3] = {0, 0, 0};
 };
 
 struct NativeBlob {
