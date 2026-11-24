@@ -6,7 +6,8 @@ libraries and GPU layer underneath it. See [docs/PLAN.md](docs/PLAN.md).
 
 **Status:** milestone M1 done. The loader runs the game's executable into its own
 initialization; it stops at the first console service not implemented yet (memory). See
-[docs/PLAN.md](docs/PLAN.md), section 11.
+[docs/PLAN.md](docs/PLAN.md), section 11. Continuing the work? Start with
+[docs/HANDOFF.md](docs/HANDOFF.md).
 
 ## Rules
 

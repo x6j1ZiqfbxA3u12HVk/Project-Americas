@@ -632,6 +632,23 @@ Patch plan for the 41 sites:
   the console's `XDAT` block, then an `XBCH` block, and ends with a dummy 4-byte "bitcode".
   The RDNA2 machine code is inside the console blocks; mapping them is M3's first task.
 
+### Local tools (in `C:\Project Americas\tools`, never in the repository)
+
+| Tool | Version, source | Use | Note |
+|---|---|---|---|
+| `amd-isa-xml\amdgpu_isa_rdna2.xml` | AMD machine-readable GPU ISA, 2026-08-06 release, gpuopen.com | The source for the RDNA 2 decoder tables: 1,153 instructions in every RDNA 2 encoding | MIT licence: generated tables that are committed must carry AMD's copyright notice |
+| `downloads\amd-rdna2-isa\*.pdf` | AMD RDNA 2 ISA reference guide (Nov 2020), docs.amd.com | Reading the instruction semantics | AMD's terms forbid copying or redistributing it: local reference only |
+| `llvm-23.1.6\bin\llvm-mc.exe`, `llvm-objdump.exe` | LLVM 23.1.6 Windows release, github.com/llvm | A second x86 disassembler next to `dumpbin` | **The official Windows build has no AMD GPU target** (x86 and ARM64 only), so it cannot check the RDNA 2 decoder |
+| `zstd-1.5.7\zstd.exe` | zstd v1.5.7, github.com/meta/zstd | Unpacking LLVM's packages (`-d --long=31`); Windows' own `tar` refuses their window size | — |
+
+An RDNA 2 oracle (for decoder tests, as `dumpbin` was for x86) is still needed. Candidates,
+each needing a further download:
+* AMD's own MIT-licensed decoder that reads the same XML (GPUOpen `isa_spec_manager`), built
+  from source;
+* `llvm-mc` / `llvm-objdump` built from LLVM's source with the AMDGPU target (an assembler
+  too, which tests need to generate programs);
+* the AMD HIP SDK for Windows, whose LLVM includes the target (a large install).
+
 Next, in parallel:
 * **M2.** Memory (`xmem`, console `VirtualAlloc` flags, physical pages), then files (console
   paths), threads and topology, XGameRuntime, D3D12.X device and presentation.
