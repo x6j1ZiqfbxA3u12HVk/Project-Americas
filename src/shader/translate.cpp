@@ -48,6 +48,10 @@ struct Ctx {
   std::string failure;
   bool uses_lds = false;
   uint32_t max_vgpr = 0;
+  bool dpp = false;  // this instruction's src0 is am_dpp, and am_dpp_on gates its writes
+
+  // The lane condition of a vector write (EXEC, and DPP's masks when it has them).
+  std::string act() const { return dpp ? "(AM_ACT != 0u && am_dpp_on)" : "(AM_ACT != 0u)"; }
 
   uint32_t f(Field x) const { return in->field(x); }
   void line(const std::string& s) { out += "      " + s + "\n"; }
@@ -112,8 +116,18 @@ struct Ctx {
     }
     line("{ uint64_t r = " + expr + "; s[" + num(code) + "] = uint(r); s[" + num(code + 1) + "] = uint(r >> 32); }");
   }
-  // A masked VGPR write.
-  void vwrite(uint32_t reg, const std::string& expr) { line("if (AM_ACT) " + vdst(reg) + " = " + expr + ";"); }
+  // A masked VGPR write; SDWA's destination select places the result in its byte or word.
+  void vwrite(uint32_t reg, const std::string& expr) {
+    std::string e = expr;
+    if (in->form == rd::Form::Sdwa && in->encoding != rd::Encoding::Vopc) {
+      const uint32_t sel = in->field(Field::DST_SEL), unused = in->field(Field::DST_UNUSED);
+      if (sel < 6) {
+        const uint32_t sh = sel < 4 ? 8 * sel : 16 * (sel - 4), w = sel < 4 ? 8 : 16;
+        e = "am_sdwa_dst(" + vdst(reg) + ", " + e + ", " + num(sh) + "u, " + num(w) + "u, " + num(unused) + "u)";
+      }
+    }
+    line("if " + act() + " " + vdst(reg) + " = " + e + ";");
+  }
 };
 
 // ---- vector operand access by instruction shape ----
@@ -123,6 +137,24 @@ bool is_vop3(const rd::Instruction& i) { return i.encoding == rd::Encoding::Vop3
 // Source k of a vector ALU instruction (VOP1/2/C, or VOP3).
 std::string vsrc(Ctx& c, int k, bool f16 = false) {
   const rd::Instruction& i = *c.in;
+  if (i.form == rd::Form::Sdwa && k < 2) {
+    // The register is a VGPR, or with S0 / S1 a scalar operand; then the byte or word select.
+    const uint32_t reg = c.f(k == 0 ? Field::VSRC0 : Field::VSRC1);
+    const bool scalar = c.f(k == 0 ? Field::S0 : Field::S1) != 0;
+    std::string x;
+    if (scalar) x = c.src(reg, f16);
+    else {
+      c.touch_v(reg);
+      x = "v[" + num(reg) + "]";
+    }
+    const uint32_t sel = c.f(k == 0 ? Field::SRC0_SEL : Field::SRC1_SEL);
+    const bool sext = c.f(k == 0 ? Field::SRC0_SEXT : Field::SRC1_SEXT) != 0;
+    if (sel >= 6) return x;
+    const uint32_t sh = sel < 4 ? 8 * sel : 16 * (sel - 4), w = sel < 4 ? 8 : 16;
+    if (sext) return "asuint(asint(" + x + " << " + num(32 - sh - w) + "u) >> " + num(32 - w) + "u)";
+    return "((" + x + " >> " + num(sh) + "u) & " + hex32((1u << w) - 1) + ")";
+  }
+  if ((i.form == rd::Form::Dpp16 || i.form == rd::Form::Dpp8) && k == 0) return "am_dpp";
   if (is_vop3(i) || i.encoding == rd::Encoding::Vop3p) {
     return c.src(c.f(k == 0 ? Field::SRC0 : k == 1 ? Field::SRC1 : Field::SRC2), f16);
   }
@@ -137,17 +169,23 @@ std::string vsrc(Ctx& c, int k, bool f16 = false) {
 // The same as a float, with VOP3's abs and neg.
 std::string fsrc(Ctx& c, int k) {
   std::string x = "asfloat(" + vsrc(c, k) + ")";
+  bool abs = false, neg = false;
   if (is_vop3(*c.in)) {
-    if ((c.f(Field::ABS) >> k) & 1) x = "abs(" + x + ")";
-    if ((c.f(Field::NEG) >> k) & 1) x = "(-" + x + ")";
+    abs = (c.f(Field::ABS) >> k) & 1;
+    neg = (c.f(Field::NEG) >> k) & 1;
+  } else if ((c.in->form == rd::Form::Sdwa || c.in->form == rd::Form::Dpp16) && k < 2) {
+    abs = c.f(k == 0 ? Field::SRC0_ABS : Field::SRC1_ABS) != 0;
+    neg = c.f(k == 0 ? Field::SRC0_NEG : Field::SRC1_NEG) != 0;
   }
+  if (abs) x = "abs(" + x + ")";
+  if (neg) x = "(-" + x + ")";
   return x;
 }
 uint32_t vop_dst(Ctx& c) { return c.f(Field::VDST); }
 // A float result with VOP3's output modifier and clamp.
 std::string fresult(Ctx& c, const std::string& expr) {
   std::string r = expr;
-  if (is_vop3(*c.in)) {
+  if (is_vop3(*c.in) || c.in->form == rd::Form::Sdwa) {
     switch (c.f(Field::OMOD)) {
       case 1: r = "(" + r + ") * 2.0f"; break;
       case 2: r = "(" + r + ") * 4.0f"; break;
@@ -158,9 +196,85 @@ std::string fresult(Ctx& c, const std::string& expr) {
   }
   return "asuint(" + r + ")";
 }
-bool no_sdwa_dpp(Ctx& c) {
-  if (c.in->form != rd::Form::Plain) return c.fail(std::string(c.in->info->name) + " (sdwa/dpp)");
+bool plain_form(Ctx& c) {
+  if (c.in->form == rd::Form::Sdwa) return c.fail(std::string(c.in->info->name) + " (sdwa)");
+  if (c.in->form != rd::Form::Plain) return c.fail(std::string(c.in->info->name) + " (dpp)");
   if (is_vop3(*c.in) && c.f(Field::OP_SEL)) return c.fail(std::string(c.in->info->name) + " (op_sel)");
+  return true;
+}
+
+// DPP: src0 comes from another lane of the wave. Fetched before any EXEC test, so every host
+// lane takes part in the read; a source lane out of its row (or, without FI, disabled) gives 0
+// with BOUND_CTRL and otherwise leaves the lane unwritten.
+bool dpp_prelude(Ctx& c) {
+  const rd::Instruction& i = *c.in;
+  const uint32_t r = c.f(Field::VSRC0);
+  c.touch_v(r);
+  std::string lane, valid = "true";
+  bool fi, zero_when_out;
+  std::string masks = "true";
+  if (i.form == rd::Form::Dpp8) {
+    const uint32_t sels = (i.words[1] >> 8) & 0xFFFFFF;
+    lane = "((am_lane & ~7u) | ((" + hex32(sels) + " >> ((am_lane & 7u) * 3u)) & 7u))";
+    fi = c.f(Field::SRC0) == 0xEA;
+    zero_when_out = true;
+  } else {
+    const uint32_t ctrl = c.f(Field::DPP_CTRL), n = ctrl & 15;
+    if (ctrl < 0x100) {
+      lane = "((am_lane & ~3u) | ((" + num(ctrl) + "u >> ((am_lane & 3u) * 2u)) & 3u))";
+    } else if (ctrl > 0x100 && ctrl <= 0x10F) {  // row_shl: lane l reads l + n
+      lane = "(am_lane + " + num(n) + "u)";
+      valid = "((am_lane & 15u) + " + num(n) + "u < 16u)";
+    } else if (ctrl > 0x110 && ctrl <= 0x11F) {  // row_shr: l reads l - n
+      lane = "(am_lane - " + num(n) + "u)";
+      valid = "((am_lane & 15u) >= " + num(n) + "u)";
+    } else if (ctrl > 0x120 && ctrl <= 0x12F) {  // row_ror
+      lane = "((am_lane & ~15u) | ((am_lane - " + num(n) + "u) & 15u))";
+    } else if (ctrl == 0x140) {
+      lane = "((am_lane & ~15u) | (15u - (am_lane & 15u)))";
+    } else if (ctrl == 0x141) {
+      lane = "((am_lane & ~7u) | (7u - (am_lane & 7u)))";
+    } else if (ctrl >= 0x150 && ctrl <= 0x15F) {  // row_share
+      lane = "((am_lane & ~15u) | " + num(n) + "u)";
+    } else if (ctrl >= 0x160 && ctrl <= 0x16F) {  // row_xmask
+      lane = "((am_lane & ~15u) | ((am_lane & 15u) ^ " + num(n) + "u))";
+    } else {
+      return c.fail(std::string(i.info->name) + " (dpp control " + hex32(ctrl) + ")");
+    }
+    fi = c.f(Field::FI) != 0;
+    zero_when_out = c.f(Field::BOUND_CTRL) != 0;
+    const uint32_t rm = c.f(Field::ROW_MASK), bm = c.f(Field::BANK_MASK);
+    if (rm != 0xF || bm != 0xF) {
+      masks = "(((" + num(rm) + "u >> (am_lane >> 4)) & 1u) != 0u && ((" + num(bm) + "u >> ((am_lane >> 2) & 3u)) & 1u) != 0u)";
+    }
+  }
+  c.line("{ uint l = " + lane + "; bool ok = " + valid + ";");
+  c.line("  am_dpp = WaveReadLaneAt(v[" + num(r) + "], ok ? l : am_lane);");
+  if (!fi) c.line("  ok = ok && am_lane_on(l);");
+  if (zero_when_out) c.line("  if (!ok) am_dpp = 0u; am_dpp_on = " + masks + "; }");
+  else c.line("  am_dpp_on = ok && " + masks + "; }");
+  c.dpp = true;
+  return true;
+}
+
+bool vector_form(Ctx& c) {
+  if (is_vop3(*c.in) && c.f(Field::OP_SEL)) return c.fail(std::string(c.in->info->name) + " (op_sel)");
+  if (c.in->form == rd::Form::Dpp16 || c.in->form == rd::Form::Dpp8) return dpp_prelude(c);
+  return true;
+}
+
+// MUBUF / MTBUF: opens a lane's block with the V# in `rs`, the address in `p` and the bytes
+// in bounds from there in `lim`.
+bool buffer_address(Ctx& c) {
+  if (c.f(Field::LDS) || c.f(Field::TFE)) return c.fail("buffer access with lds/tfe");
+  const uint32_t r = c.f(Field::SRSRC) * 4, va = c.f(Field::VADDR);
+  const bool idx = c.f(Field::IDXEN), off = c.f(Field::OFFEN);
+  c.touch_v(va + (idx && off ? 1 : 0));
+  const std::string index = idx ? "v[" + num(va) + "]" : "0u";
+  const std::string offset = off ? "v[" + num(va + (idx ? 1 : 0)) + "]" : "0u";
+  c.line("if (AM_ACT) { uint4 rs = uint4(s[" + num(r) + "], s[" + num(r + 1) + "], s[" + num(r + 2) + "], s[" + num(r + 3) + "]);");
+  c.line("  uint64_t p; uint lim; am_buffer_address(rs, " + index + ", " + offset + " + " + num(c.f(Field::OFFSET)) + "u, " +
+         c.src(c.f(Field::SOFFSET)) + ", p, lim);");
   return true;
 }
 
@@ -170,14 +284,14 @@ using Handler = std::function<bool(Ctx&)>;
 
 void float_unary(std::unordered_map<std::string, Handler>& t, const char* name, const char* body) {
   t[name] = [body](Ctx& c) {
-    if (!no_sdwa_dpp(c)) return false;
+    if (!vector_form(c)) return false;
     c.vwrite(vop_dst(c), fresult(c, fill(body, fsrc(c, 0))));
     return true;
   };
 }
 void float_binary(std::unordered_map<std::string, Handler>& t, const char* name, const char* body) {
   t[name] = [body](Ctx& c) {
-    if (!no_sdwa_dpp(c)) return false;
+    if (!vector_form(c)) return false;
     const std::string a = fsrc(c, 0), b = fsrc(c, 1);
     c.vwrite(vop_dst(c), fresult(c, fill(body, a, b)));
     return true;
@@ -185,7 +299,7 @@ void float_binary(std::unordered_map<std::string, Handler>& t, const char* name,
 }
 void float_ternary(std::unordered_map<std::string, Handler>& t, const char* name, const char* body) {
   t[name] = [body](Ctx& c) {
-    if (!no_sdwa_dpp(c) || !is_vop3(*c.in)) return c.fail(std::string(c.in->info->name));
+    if (!vector_form(c) || !is_vop3(*c.in)) return c.fail(std::string(c.in->info->name));
     const std::string a = fsrc(c, 0), b = fsrc(c, 1), d = fsrc(c, 2);
     c.vwrite(vop_dst(c), fresult(c, fill(body, a, b, d)));
     return true;
@@ -194,7 +308,7 @@ void float_ternary(std::unordered_map<std::string, Handler>& t, const char* name
 // Integer forms: A, B, C are uint sources; `vop3_only` for three-source ones.
 void int_op(std::unordered_map<std::string, Handler>& t, const char* name, const char* body) {
   t[name] = [body](Ctx& c) {
-    if (!no_sdwa_dpp(c)) return false;
+    if (!vector_form(c)) return false;
     const std::string e = body;
     const bool three = e.find('C') != std::string::npos;
     if (three && !is_vop3(*c.in)) return c.fail(std::string(c.in->info->name));
@@ -212,7 +326,7 @@ void compare(std::unordered_map<std::string, Handler>& t, const std::string& nam
   for (const bool x : {false, true}) {
     const std::string full = (x ? "v_cmpx_" : "v_cmp_") + name;
     t[full] = [cond, fl, x, is64](Ctx& c) {
-      if (!no_sdwa_dpp(c)) return false;
+      if (!vector_form(c)) return false;
       std::string a, b;
       if (is64) {
         a = c.src64(c.f(Field::SRC0));
@@ -224,8 +338,9 @@ void compare(std::unordered_map<std::string, Handler>& t, const std::string& nam
         a = vsrc(c, 0);
         b = vsrc(c, 1);
       }
-      c.line("{ uint4 m = WaveActiveBallot((" + fill(cond, a, b) + ") && AM_ACT != 0u);");
-      const uint32_t dst = is_vop3(*c.in) ? c.f(Field::VDST) : 106;
+      c.line("{ uint4 m = WaveActiveBallot((" + fill(cond, a, b) + ") && " + c.act() + ");");
+      uint32_t dst = is_vop3(*c.in) ? c.f(Field::VDST) : 106;
+      if (c.in->form == rd::Form::Sdwa && c.f(Field::SD)) dst = c.f(Field::SDST);
       if (x) {
         c.line("  s[126] = m.x;" + std::string(c.wave64 ? " s[127] = m.y;" : ""));
       } else if (dst != 125) {
@@ -275,7 +390,7 @@ const std::unordered_map<std::string, Handler>& table() {
     // dst = A * B + dst.
     for (const char* name : {"v_fmac_f32", "v_mac_f32"}) {
       t[name] = [](Ctx& c) {
-        if (!no_sdwa_dpp(c)) return false;
+        if (!vector_form(c)) return false;
         const uint32_t d = vop_dst(c);
         c.vwrite(d, fresult(c, "mad(" + fsrc(c, 0) + ", " + fsrc(c, 1) + ", asfloat(" + c.vdst(d) + "))"));
         return true;
@@ -295,7 +410,7 @@ const std::unordered_map<std::string, Handler>& table() {
     float_unary(t, "v_cvt_f32_i32", "float(asint(X))");
     for (int n = 0; n < 4; ++n) {
       t["v_cvt_f32_ubyte" + std::to_string(n)] = [n](Ctx& c) {
-        if (!no_sdwa_dpp(c)) return false;
+        if (!vector_form(c)) return false;
         c.vwrite(vop_dst(c), fresult(c, "float((" + vsrc(c, 0) + " >> " + std::to_string(8 * n) + "u) & 0xFFu)"));
         return true;
       };
@@ -303,7 +418,7 @@ const std::unordered_map<std::string, Handler>& table() {
     int_op(t, "v_cvt_u32_f32", "am_cvt_u32(asfloat(A))");
     int_op(t, "v_cvt_i32_f32", "asuint(am_cvt_i32(asfloat(A)))");
     t["v_cvt_f32_f16"] = [](Ctx& c) {
-      if (!no_sdwa_dpp(c)) return false;
+      if (!vector_form(c)) return false;
       c.vwrite(vop_dst(c), fresult(c, "f16tof32(" + vsrc(c, 0, true) + ")"));
       return true;
     };
@@ -353,9 +468,58 @@ const std::unordered_map<std::string, Handler>& table() {
     int_op(t, "v_bcnt_u32_b32", "(countbits(A) + B)");
     int_op(t, "v_mbcnt_lo_u32_b32", "(countbits(A & am_lanes_below_lo()) + B)");
     int_op(t, "v_mbcnt_hi_u32_b32", "(countbits(A & am_lanes_below_hi()) + B)");
+    int_op(t, "v_alignbit_b32", "uint(am_u64(B, A) >> (C & 31u))");
+    int_op(t, "v_alignbyte_b32", "uint(am_u64(B, A) >> ((C & 3u) * 8u))");
+    int_op(t, "v_ffbh_u32", "(A == 0u ? 0xFFFFFFFFu : 31u - firstbithigh(A))");
+    int_op(t, "v_cvt_floor_i32_f32", "asuint(am_cvt_i32(floor(asfloat(A))))");
+    int_op(t, "v_cvt_rpi_i32_f32", "asuint(am_cvt_i32(floor(asfloat(A) + 0.5f)))");
+    // Cube maps: face id, the face's s and t, and twice the major axis.
+    float_ternary(t, "v_cubeid_f32", "am_cube(A, B, C).x");
+    float_ternary(t, "v_cubesc_f32", "am_cube(A, B, C).y");
+    float_ternary(t, "v_cubetc_f32", "am_cube(A, B, C).z");
+    float_ternary(t, "v_cubema_f32", "am_cube(A, B, C).w");
+    // Mixed precision: each source is f32, or with op_sel_hi a half (op_sel: the high one);
+    // NEG_HI is abs here. mixlo / mixhi round the result to a half in that half of the register.
+    for (const auto& [name, to] : {std::pair{"v_fma_mix_f32", 0}, {"v_fma_mixlo_f16", 1}, {"v_fma_mixhi_f16", 2}}) {
+      t[name] = [to = to](Ctx& c) {
+        const uint32_t sel = c.f(Field::OP_SEL), hi = c.f(Field::OP_SEL_HI) | c.f(Field::OP_SEL_HI_2) << 2;
+        const uint32_t neg = c.f(Field::NEG), abs = c.f(Field::NEG_HI);
+        std::string x[3];
+        for (int k = 0; k < 3; ++k) {
+          const bool half = (hi >> k) & 1;
+          const std::string r = vsrc(c, k, half);
+          x[k] = half ? "f16tof32((" + r + " >> " + ((sel >> k) & 1 ? "16u" : "0u") + ") & 0xFFFFu)" : "asfloat(" + r + ")";
+          if ((abs >> k) & 1) x[k] = "abs(" + x[k] + ")";
+          if ((neg >> k) & 1) x[k] = "(-" + x[k] + ")";
+        }
+        std::string r = "mad(" + x[0] + ", " + x[1] + ", " + x[2] + ")";
+        if (c.f(Field::CLAMP)) r = "saturate(" + r + ")";
+        const uint32_t d = vop_dst(c);
+        if (to == 0) c.vwrite(d, "asuint(" + r + ")");
+        else if (to == 1) c.vwrite(d, "((" + c.vdst(d) + " & 0xFFFF0000u) | f32tof16(" + r + "))");
+        else c.vwrite(d, "((" + c.vdst(d) + " & 0xFFFFu) | (f32tof16(" + r + ") << 16))");
+        return true;
+      };
+    }
+    // Lane permutes: lane l reads src0 from the lane src1/src2 name for it (four bits a lane), in
+    // its own row (permlane16) or the other row of its half (permlanex16). op_sel: FI, BOUND_CTRL.
+    for (const bool cross : {false, true}) {
+      t[cross ? "v_permlanex16_b32" : "v_permlane16_b32"] = [cross](Ctx& c) {
+        const uint32_t r = c.f(Field::SRC0) - 256, d = vop_dst(c), sel = c.f(Field::OP_SEL);
+        if (c.f(Field::SRC0) < 256) return c.fail("permlane source");
+        c.touch_v(r);
+        const std::string s1 = c.src(c.f(Field::SRC1)), s2 = c.src(c.f(Field::SRC2));
+        c.line("{ uint i = am_lane & 15u; uint k = i < 8u ? (" + s1 + " >> (i * 4u)) & 15u : (" + s2 + " >> ((i - 8u) * 4u)) & 15u;");
+        c.line(std::string("  uint l = ") + (cross ? "((am_lane & ~15u) ^ 16u)" : "(am_lane & ~15u)") + " | k;");
+        c.line("  uint x = WaveReadLaneAt(v[" + num(r) + "], l);");
+        c.line(std::string("  bool ok = ") + ((sel & 1) ? "true" : "am_lane_on(l)") + ";");
+        c.line("  if (AM_ACT) { if (ok) " + c.vdst(d) + " = x;" + ((sel & 2) ? " else " + c.vdst(d) + " = 0u;" : "") + " } }");
+        return true;
+      };
+    }
     t["v_nop"] = [](Ctx&) { return true; };
     t["v_lshlrev_b64"] = [](Ctx& c) {
-      if (!no_sdwa_dpp(c)) return false;
+      if (!plain_form(c)) return false;
       const uint32_t d = vop_dst(c);
       c.touch_v(d + 1);
       c.line("if (AM_ACT) { uint64_t r = " + c.src64(c.f(Field::SRC1)) + " << (" + vsrc(c, 0) + " & 63u); v[" + num(d) +
@@ -364,7 +528,7 @@ const std::unordered_map<std::string, Handler>& table() {
     };
     // VOP2: VCC picks src1; VOP3: the mask in src2.
     t["v_cndmask_b32"] = [](Ctx& c) {
-      if (!no_sdwa_dpp(c)) return false;
+      if (!vector_form(c)) return false;
       std::string mask;
       if (is_vop3(*c.in)) {
         const uint32_t m = c.f(Field::SRC2);
@@ -379,7 +543,7 @@ const std::unordered_map<std::string, Handler>& table() {
     };
     // Carry: VOP3b writes the carry mask to its SDST; VOP2 reads and writes VCC.
     t["v_add_co_u32"] = [](Ctx& c) {
-      if (!no_sdwa_dpp(c) || !is_vop3(*c.in)) return c.fail("v_add_co_u32 form");
+      if (!plain_form(c) || !is_vop3(*c.in)) return c.fail("v_add_co_u32 form");
       const uint32_t sd = c.f(Field::SDST);
       c.line("{ uint a = " + vsrc(c, 0) + ", b = " + vsrc(c, 1) + "; uint r = a + b; bool cy = r < a;");
       c.line("  uint4 m = WaveActiveBallot(cy && AM_ACT != 0u);");
@@ -389,7 +553,7 @@ const std::unordered_map<std::string, Handler>& table() {
       return true;
     };
     t["v_add_co_ci_u32"] = [](Ctx& c) {
-      if (!no_sdwa_dpp(c)) return false;
+      if (!plain_form(c)) return false;
       const bool vop3 = is_vop3(*c.in);
       const uint32_t in = vop3 ? c.f(Field::SRC2) : 106, out = vop3 ? c.f(Field::SDST) : 106;
       c.line("{ uint a = " + vsrc(c, 0) + ", b = " + vsrc(c, 1) + "; uint ci = am_lane_bit(s[" + num(in) + "], " +
@@ -517,12 +681,45 @@ const std::unordered_map<std::string, Handler>& table() {
         {"s_bcnt1_i32_b32", "countbits(a)", "r != 0u"}, {"s_ff1_i32_b32", "firstbitlow(a)", ""},
         {"s_wqm_b32", "am_wqm(a)", "r != 0u"},       {"s_sext_i32_i8", "asuint(int(a << 24) >> 24)", ""},
         {"s_sext_i32_i16", "asuint(int(a << 16) >> 16)", ""}, {"s_abs_i32", "asuint(abs(asint(a)))", "r != 0u"},
+        {"s_bcnt0_i32_b32", "countbits(~a)", "r != 0u"}, {"s_ff0_i32_b32", "firstbitlow(~a)", ""},
+        // Leading zeros from the top bit; -1 for zero.
+        {"s_flbit_i32_b32", "(a == 0u ? 0xFFFFFFFFu : 31u - firstbithigh(a))", ""},
     };
     for (const S1& x : sop1) {
       t[x.name] = [x](Ctx& c) {
         c.line("{ uint a = " + c.src(c.f(Field::SSRC0)) + "; uint r = " + x.expr + ";" +
                (std::string(x.scc).empty() ? "" : " scc = " + std::string(x.scc) + ";") + " " + c.sdst(c.f(Field::SDST)) +
                " = r; }");
+        return true;
+      };
+    }
+    // 64-bit sources, 32-bit results.
+    const S1 sop1_64to32[] = {
+        {"s_bcnt1_i32_b64", "countbits(uint(a)) + countbits(uint(a >> 32))", "r != 0u"},
+        {"s_bcnt0_i32_b64", "countbits(~uint(a)) + countbits(~uint(a >> 32))", "r != 0u"},
+        {"s_ff1_i32_b64", "(uint(a) != 0u ? firstbitlow(uint(a)) : uint(a >> 32) != 0u ? 32u + firstbitlow(uint(a >> 32)) : 0xFFFFFFFFu)", ""},
+        {"s_ff0_i32_b64", "(~uint(a) != 0u ? firstbitlow(~uint(a)) : ~uint(a >> 32) != 0u ? 32u + firstbitlow(~uint(a >> 32)) : 0xFFFFFFFFu)", ""},
+    };
+    for (const S1& x : sop1_64to32) {
+      t[x.name] = [x](Ctx& c) {
+        c.line("{ uint64_t a = " + c.src64(c.f(Field::SSRC0)) + "; uint r = " + x.expr + ";" +
+               (std::string(x.scc).empty() ? "" : " scc = " + std::string(x.scc) + ";") + " " + c.sdst(c.f(Field::SDST)) +
+               " = r; }");
+        return true;
+      };
+    }
+    // Set or clear bit s0 of the destination itself.
+    for (const bool one : {false, true}) {
+      t[one ? "s_bitset1_b32" : "s_bitset0_b32"] = [one](Ctx& c) {
+        const std::string d = c.sdst(c.f(Field::SDST));
+        c.line(d + (one ? " |= " : " &= ~") + "(1u << (" + c.src(c.f(Field::SSRC0)) + " & 31u));");
+        return true;
+      };
+      t[one ? "s_bitset1_b64" : "s_bitset0_b64"] = [one](Ctx& c) {
+        const uint32_t d = c.f(Field::SDST);
+        if (d > 105 && d != 106 && d != 126) return c.fail("64-bit scalar destination " + num(d));
+        c.line("{ uint b = " + c.src(c.f(Field::SSRC0)) + " & 63u; uint i = " + num(d) + "u + (b >> 5);");
+        c.line(std::string("  s[i] ") + (one ? "|= " : "&= ~") + "(1u << (b & 31u)); }");
         return true;
       };
     }
@@ -676,21 +873,34 @@ const std::unordered_map<std::string, Handler>& table() {
         };
       }
     }
-    // -- buffer and global memory (raw dwords) --
+    // -- buffer and global memory: raw dwords, and typed (the V#'s format, or the instruction's) --
     for (int n : {1, 2, 3, 4}) {
       const std::string sfx = n == 1 ? "" : "x" + std::to_string(n);
+      static const char* const kChannels[] = {"x", "xy", "xyz", "xyzw"};
       for (const bool store : {false, true}) {
+        for (const bool tbuffer : {false, true}) {
+          const std::string name = std::string(tbuffer ? "tbuffer_" : "buffer_") + (store ? "store" : "load") + "_format_" + kChannels[n - 1];
+          t[name] = [n, store, tbuffer](Ctx& c) {
+            if (!buffer_address(c)) return false;
+            const uint32_t vd = c.f(Field::VDATA);
+            c.touch_v(vd + n - 1);
+            const std::string fmt = tbuffer ? num(c.f(Field::FORMAT)) + "u" : "((rs.w >> 12) & 0x7Fu)";
+            if (store) {
+              std::string val = "uint4(";
+              for (int k = 0; k < 4; ++k) val += (k ? ", " : "") + (k < n ? "v[" + num(vd + k) + "]" : std::string("0u"));
+              c.line("  am_fmt_store(p, lim, am_fmt_info(" + fmt + "), " + num(n) + "u, " + val + "));");
+            } else {
+              c.line("  uint4 r = am_fmt_load(p, lim, am_fmt_info(" + fmt + "), rs.w);");
+              for (int k = 0; k < n; ++k) c.line("  v[" + num(vd + k) + "] = r[" + num(k) + "];");
+            }
+            c.line("}");
+            return true;
+          };
+        }
         t[(store ? "buffer_store_dword" : "buffer_load_dword") + sfx] = [n, store](Ctx& c) {
-          if (c.f(Field::LDS) || c.f(Field::TFE)) return c.fail("buffer access with lds/tfe");
-          const uint32_t r = c.f(Field::SRSRC) * 4, va = c.f(Field::VADDR), vd = c.f(Field::VDATA);
-          const bool idx = c.f(Field::IDXEN), off = c.f(Field::OFFEN);
-          c.touch_v(va + (idx && off ? 1 : 0));
+          if (!buffer_address(c)) return false;
+          const uint32_t vd = c.f(Field::VDATA);
           c.touch_v(vd + n - 1);
-          const std::string index = idx ? "v[" + num(va) + "]" : "0u";
-          const std::string offset = off ? "v[" + num(va + (idx ? 1 : 0)) + "]" : "0u";
-          c.line("if (AM_ACT) { uint4 rs = uint4(s[" + num(r) + "], s[" + num(r + 1) + "], s[" + num(r + 2) + "], s[" + num(r + 3) + "]);");
-          c.line("  uint64_t p; uint lim; am_buffer_address(rs, " + index + ", " + offset + " + " + num(c.f(Field::OFFSET)) + "u, " +
-                 c.src(c.f(Field::SOFFSET)) + ", p, lim);");
           for (int k = 0; k < n; ++k) {
             if (store) c.line("  if (" + num(4 * k) + "u < lim) am_store(p + " + num(4 * k) + ", v[" + num(vd + k) + "]);");
             else c.line("  v[" + num(vd + k) + "] = " + num(4 * k) + "u < lim ? am_load(p + " + num(4 * k) + ") : 0u;");
@@ -716,6 +926,41 @@ const std::unordered_map<std::string, Handler>& table() {
             if (store) c.line("  am_store(p + " + num(4 * k) + ", v[" + num(vd + k) + "]);");
             else c.line("  v[" + num(vd + k) + "] = am_load(p + " + num(4 * k) + ");");
           }
+          c.line("}");
+          return true;
+        };
+      }
+    }
+    // -- atomics: 32-bit; GLC returns the value before --
+    {
+      static const char* const kAtomics[] = {"swap", "cmpswap", "add", "sub", "smin", "umin", "smax", "umax", "and", "or", "xor"};
+      for (uint32_t op = 0; op < 11; ++op) {
+        t[std::string("buffer_atomic_") + kAtomics[op]] = [op](Ctx& c) {
+          if (!buffer_address(c)) return false;
+          const uint32_t vd = c.f(Field::VDATA);
+          c.touch_v(vd + (op == 1 ? 1 : 0));
+          const std::string cmp = op == 1 ? "v[" + num(vd + 1) + "]" : "0u";
+          c.line("  uint o = 4u <= lim ? am_atomic(" + num(op) + "u, p, v[" + num(vd) + "], " + cmp + ") : 0u;");
+          if (c.f(Field::GLC)) c.line("  v[" + num(vd) + "] = o;");
+          c.line("}");
+          return true;
+        };
+        t[std::string("global_atomic_") + kAtomics[op]] = [op](Ctx& c) {
+          const uint32_t sa = c.f(Field::SADDR), va = c.f(Field::ADDR), vd = c.f(Field::DATA), dst = c.f(Field::VDST);
+          const int32_t imm = static_cast<int32_t>(c.f(Field::OFFSET) << 20) >> 20;
+          std::string addr;
+          if (sa == 125 || sa == 0x7F) {
+            c.touch_v(va + 1);
+            addr = "am_u64(v[" + num(va) + "], v[" + num(va + 1) + "])";
+          } else {
+            c.touch_v(va);
+            addr = "am_u64(s[" + num(sa) + "], s[" + num(sa + 1) + "]) + uint64_t(v[" + num(va) + "])";
+          }
+          c.touch_v(vd + (op == 1 ? 1 : 0));
+          const std::string cmp = op == 1 ? "v[" + num(vd + 1) + "]" : "0u";
+          c.line("if (AM_ACT) { uint o = am_atomic(" + num(op) + "u, " + addr + " + uint64_t(int64_t(" + std::to_string(imm) +
+                 ")), v[" + num(vd) + "], " + cmp + ");");
+          if (c.f(Field::GLC)) c.line("  " + c.vdst(dst) + " = o;");
           c.line("}");
           return true;
         };
@@ -774,6 +1019,21 @@ uint am_bfe_i32(uint a, uint off, uint width) {
 }
 uint am_cvt_u32(float f) { return f != f || f <= 0.0f ? 0u : f >= 4294967295.0f ? 0xFFFFFFFFu : uint(f); }
 int am_cvt_i32(float f) { return f != f ? 0 : f <= -2147483648.0f ? int(0x80000000u) : f >= 2147483647.0f ? 0x7FFFFFFF : int(f); }
+// SDWA's destination: the result's low bits in a byte or word; the other bits zero, the sign,
+// or what the register held (DST_UNUSED 0, 1, 2).
+uint am_sdwa_dst(uint old, uint r, uint sh, uint w, uint mode) {
+  uint m = ((1u << w) - 1u) << sh;
+  uint x = (r << sh) & m;
+  if (mode == 2u) return (old & ~m) | x;
+  if (mode == 1u && ((r >> (w - 1u)) & 1u) != 0u && sh + w < 32u) x |= 0xFFFFFFFFu << (sh + w);
+  return x;
+}
+// v_cube*: (face id, s, t, 2 * major axis) for the direction (x, y, z).
+float4 am_cube(float x, float y, float z) {
+  if (abs(z) >= abs(x) && abs(z) >= abs(y)) return float4(z < 0.0f ? 5.0f : 4.0f, z < 0.0f ? -x : x, -y, 2.0f * z);
+  if (abs(y) >= abs(x)) return float4(y < 0.0f ? 3.0f : 2.0f, x, y < 0.0f ? -z : z, 2.0f * y);
+  return float4(x < 0.0f ? 1.0f : 0.0f, x < 0.0f ? z : -z, -y, 2.0f * x);
+}
 uint am_wqm(uint a) {
   uint r = 0u;
   [unroll] for (uint q = 0u; q < 8u; ++q) if ((a >> (4u * q)) & 0xFu) r |= 0xFu << (4u * q);
@@ -822,6 +1082,29 @@ cbuffer am_args : register(b0) { uint4 am_user[8]; uint2 am_base; uint2 am_pad; 
 uint am_offset(uint64_t a) { return uint(a - am_u64(am_base.x, am_base.y)); }
 uint am_load(uint64_t a) { return am_memory.Load(am_offset(a)); }
 void am_store(uint64_t a, uint x) { am_memory.Store(am_offset(a), x); }
+// 32-bit atomics by number (swap, cmpswap, add, sub, smin, umin, smax, umax, and, or, xor);
+// the value before. cmpswap writes x where the memory equals `cmp`.
+uint am_atomic(uint op, uint64_t a, uint x, uint cmp) {
+  uint at = am_offset(a), o = 0u;
+  if (op == 0u) am_memory.InterlockedExchange(at, x, o);
+  else if (op == 1u) am_memory.InterlockedCompareExchange(at, cmp, x, o);
+  else if (op == 2u) am_memory.InterlockedAdd(at, x, o);
+  else if (op == 3u) am_memory.InterlockedAdd(at, 0u - x, o);
+  else if (op == 4u) { int so; am_memory.InterlockedMin(at, asint(x), so); o = asuint(so); }
+  else if (op == 5u) am_memory.InterlockedMin(at, x, o);
+  else if (op == 6u) { int so; am_memory.InterlockedMax(at, asint(x), so); o = asuint(so); }
+  else if (op == 7u) am_memory.InterlockedMax(at, x, o);
+  else if (op == 8u) am_memory.InterlockedAnd(at, x, o);
+  else if (op == 9u) am_memory.InterlockedOr(at, x, o);
+  else am_memory.InterlockedXor(at, x, o);
+  return o;
+}
+// Writes the bits of `m` only; other lanes may write the rest of the dword at the same time.
+void am_store_masked(uint64_t a, uint x, uint m) {
+  if (m == 0xFFFFFFFFu) { am_store(a, x); return; }
+  am_memory.InterlockedAnd(am_offset(a), ~m);
+  am_memory.InterlockedOr(am_offset(a), x & m);
+}
 )";
 
 const char* kBufferHelpers = R"(
@@ -836,7 +1119,113 @@ void am_buffer_address(uint4 rs, uint index, uint offset, uint soffset, out uint
   uint64_t range = stride == 0u ? uint64_t(records) : uint64_t(records) * stride;
   lim = at >= range ? 0u : uint(min(range - at, uint64_t(16)));
 }
+
+uint am_fmt_info(uint f) { return f < 78u ? am_formats[f] : 0u; }
+uint am_fmt_width(uint info, uint k) { return (info >> (6u + 6u * k)) & 63u; }
+uint am_fmt_bytes(uint info) {
+  uint bits = 0u;
+  for (uint k = 0u; k < ((info >> 3) & 7u); ++k) bits += am_fmt_width(info, k);
+  return bits >> 3;
+}
+// The 1 a missing W reads as: 1 for the integer types, 1.0 otherwise.
+uint am_fmt_one(uint info) { uint t = info & 7u; return t == 4u || t == 5u ? 1u : 0x3F800000u; }
+
+// One typed element: its channels as the shader sees them, after the V#'s selects (word 3, three
+// bits a channel: 0, 1, or X..W as 4..7). Out of bounds reads zero.
+uint4 am_fmt_load(uint64_t p, uint lim, uint info, uint w3) {
+  uint eb = am_fmt_bytes(info);
+  if (eb == 0u || eb > lim) return uint4(0u, 0u, 0u, 0u);
+  uint raw[4] = {0u, 0u, 0u, 0u};
+  if (eb < 4u) raw[0] = am_load(p & ~uint64_t(3)) >> (uint(p & 3u) * 8u);
+  else for (uint d = 0u; d < eb / 4u; ++d) raw[d] = am_load(p + 4u * d);
+  uint t = info & 7u, n = (info >> 3) & 7u, o = 0u;
+  uint c[4];
+  for (uint k = 0u; k < 4u; ++k) {
+    if (k >= n) { c[k] = k == 3u ? am_fmt_one(info) : 0u; continue; }
+    uint w = am_fmt_width(info, k);
+    uint m = w == 32u ? 0xFFFFFFFFu : (1u << w) - 1u;
+    uint x = (raw[o >> 5] >> (o & 31u)) & m;
+    int sx = int(x << (32u - w)) >> (32u - w);
+    o += w;
+    if (t == 0u) c[k] = asuint(float(x) / float(m));
+    else if (t == 1u) c[k] = asuint(max(float(sx) / float(m >> 1), -1.0f));
+    else if (t == 2u) c[k] = asuint(float(x));
+    else if (t == 3u) c[k] = asuint(float(sx));
+    else if (t == 4u) c[k] = x;
+    else if (t == 5u) c[k] = asuint(sx);
+    else if (w == 32u) c[k] = x;
+    else c[k] = asuint(f16tof32(x << (15u - min(w, 15u))));  // half, or the unsigned 11/10-bit floats
+  }
+  uint4 r;
+  for (uint ch = 0u; ch < 4u; ++ch) {
+    uint sel = (w3 >> (3u * ch)) & 7u;
+    r[ch] = sel >= 4u ? c[sel - 4u] : sel == 1u ? am_fmt_one(info) : 0u;
+  }
+  return r;
+}
+
+// Writes the first `n` channels of one typed element.
+void am_fmt_store(uint64_t p, uint lim, uint info, uint n, uint4 val) {
+  uint eb = am_fmt_bytes(info);
+  if (eb == 0u || eb > lim) return;
+  uint t = info & 7u, o = 0u;
+  uint data[4] = {0u, 0u, 0u, 0u}, mask[4] = {0u, 0u, 0u, 0u};
+  for (uint k = 0u; k < ((info >> 3) & 7u); ++k) {
+    uint w = am_fmt_width(info, k);
+    uint m = w == 32u ? 0xFFFFFFFFu : (1u << w) - 1u, h = m >> 1;
+    if (k < n) {
+      float f = asfloat(val[k]);
+      uint x;
+      if (t == 0u) x = uint(round(saturate(f) * float(m)));
+      else if (t == 1u) x = uint(int(round(clamp(f, -1.0f, 1.0f) * float(h))));
+      else if (t == 2u) x = min(am_cvt_u32(f), m);
+      else if (t == 3u) x = uint(clamp(am_cvt_i32(f), -int(h) - 1, int(h)));
+      else if (t == 4u) x = min(val[k], m);
+      else if (t == 5u) x = uint(clamp(int(val[k]), -int(h) - 1, int(h)));
+      else if (w == 32u) x = val[k];
+      else if (w == 16u) x = f32tof16(f);
+      else x = f32tof16(max(f, 0.0f)) >> (15u - w);
+      data[o >> 5] |= (x & m) << (o & 31u);
+      mask[o >> 5] |= m << (o & 31u);
+    }
+    o += w;
+  }
+  if (eb < 4u) {
+    uint sh = uint(p & 3u) * 8u;
+    am_store_masked(p & ~uint64_t(3), data[0] << sh, mask[0] << sh);
+  } else {
+    for (uint d = 0u; d < eb / 4u; ++d) if (mask[d] != 0u) am_store_masked(p + 4u * d, data[d], mask[d]);
+  }
+}
 )";
+
+// The unified buffer formats (gfx10): bits 0-2 the type (unorm, snorm, uscaled, sscaled, uint,
+// sint, float), 3-5 the channels, then six bits of width a channel, from bit 0 of the element up.
+std::string format_table() {
+  struct Group {
+    uint32_t first;
+    std::vector<uint32_t> widths;
+    std::vector<uint32_t> types;
+  };
+  const std::vector<uint32_t> six = {0, 1, 2, 3, 4, 5}, seven = {0, 1, 2, 3, 4, 5, 6}, wide = {4, 5, 6};
+  // The names give the channels from the top bit down: 10_11_11 is X 11 bits at bit 0.
+  const Group groups[] = {{1, {8}, six},           {7, {16}, seven},           {14, {8, 8}, six},
+                          {20, {32}, wide},        {23, {16, 16}, seven},      {30, {11, 11, 10}, seven},
+                          {37, {10, 11, 11}, seven}, {44, {2, 10, 10, 10}, six}, {50, {10, 10, 10, 2}, six},
+                          {56, {8, 8, 8, 8}, six}, {62, {32, 32}, wide},       {65, {16, 16, 16, 16}, seven},
+                          {72, {32, 32, 32}, wide}, {75, {32, 32, 32, 32}, wide}};
+  uint32_t v[78] = {};
+  for (const Group& g : groups) {
+    for (size_t k = 0; k < g.types.size(); ++k) {
+      uint32_t x = g.types[k] | static_cast<uint32_t>(g.widths.size()) << 3;
+      for (size_t j = 0; j < g.widths.size(); ++j) x |= g.widths[j] << (6 + 6 * j);
+      v[g.first + k] = x;
+    }
+  }
+  std::string out = "static const uint am_formats[78] = {";
+  for (int i = 0; i < 78; ++i) out += (i ? ", " : "") + hex32(v[i]);
+  return out + "};\n";
+}
 
 }  // namespace
 
@@ -892,6 +1281,7 @@ Translation translate(const TranslateInput& in, Binding binding) {
     c.pc = at;
     c.next = next;
     c.out.clear();
+    c.dpp = false;
     const std::string name = insn.info->name;
     const uint16_t flags = insn.info->flags;
     bool ok = true;
@@ -943,6 +1333,7 @@ Translation translate(const TranslateInput& in, Binding binding) {
   h += "// Translated by Project Americas' shader translator, version " + num(kTranslatorVersion) + ".\n";
   h += kHelpers;
   h += kTestBinding;
+  h += format_table();
   h += kBufferHelpers;
   if (c.uses_lds || in.lds_bytes) h += "groupshared uint am_lds[" + num(std::max<uint32_t>(in.lds_bytes / 4, 1)) + "];\n";
   const uint32_t tx = std::max<uint32_t>(in.cs_threads[0], 1), ty = std::max<uint32_t>(in.cs_threads[1], 1),
@@ -952,6 +1343,7 @@ Translation translate(const TranslateInput& in, Binding binding) {
   h += "  uint s[128];\n  [unroll] for (uint i = 0u; i < 128u; ++i) s[i] = 0u;\n";
   h += "  uint v[" + num(nv) + "];\n  [unroll] for (uint j = 0u; j < " + num(nv) + "u; ++j) v[j] = 0u;\n";
   h += "  uint am_null = 0u;\n  bool scc = false;\n  uint am_lane = WaveGetLaneIndex();\n";
+  h += "  uint am_dpp = 0u;\n  bool am_dpp_on = true;\n";
   for (uint32_t i = 0; i < user; ++i) h += "  s[" + num(i) + "] = am_user[" + num(i / 4) + "][" + num(i % 4) + "];\n";
   uint32_t next_s = user;
   for (int k = 0; k < 3; ++k) {
@@ -969,6 +1361,7 @@ Translation translate(const TranslateInput& in, Binding binding) {
     h += "#define am_lane_bit(lo, hi) (((((am_lane < 32u) ? (lo) : (hi)) >> (am_lane & 31u)) & 1u) != 0u)\n";
     h += "#define am_first_active() (s[126] != 0u ? firstbitlow(s[126]) : s[127] != 0u ? 32u + firstbitlow(s[127]) : 0u)\n";
     h += "#define am_lanes_below_lo() (am_lane >= 32u ? 0xFFFFFFFFu : (1u << am_lane) - 1u)\n";
+    h += "#define am_lane_on(l) (((((l) < 32u ? s[126] : s[127]) >> ((l) & 31u)) & 1u) != 0u)\n";
     h += "#define am_lanes_below_hi() (am_lane < 32u ? 0u : (1u << (am_lane - 32u)) - 1u)\n";
   } else {
     h += "#define AM_ACT ((s[126] >> am_lane) & 1u)\n";
@@ -976,6 +1369,7 @@ Translation translate(const TranslateInput& in, Binding binding) {
     h += "#define am_lane_bit(lo, hi) ((((lo) >> am_lane) & 1u) != 0u)\n";
     h += "#define am_first_active() (s[126] != 0u ? firstbitlow(s[126]) : 0u)\n";
     h += "#define am_lanes_below_lo() ((1u << am_lane) - 1u)\n#define am_lanes_below_hi() 0u\n";
+    h += "#define am_lane_on(l) (((s[126] >> ((l) & 31u)) & 1u) != 0u)\n";
   }
   // At s_endpgm the tests' binding dumps the registers.
   h += "#define AM_END() { [unroll] for (uint d = 0u; d < " + num(nv) + "u; ++d) am_dump.Store(" + num(kDumpLanes) +

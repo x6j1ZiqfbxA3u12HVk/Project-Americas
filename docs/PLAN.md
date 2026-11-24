@@ -837,6 +837,17 @@ builder's `XMemVirtualQuery` calls, and the arguments logged at run time.
   the thread ids up to `TIDIG_COMP_CNT`.
 * **Memory:** `s_load` and `s_buffer_load`, untyped `buffer_*` through the V# (base, stride,
   records, bounds), `global_*`, and LDS (`ds_read/write` b32, read2/write2).
+  * **Typed buffers** (`buffer_*_format_*`, `tbuffer_*`): all 77 unified formats (gfx10
+    numbering, checked against LLVM's names), unpacked and packed by a table, with the V#'s
+    channel selects. Sub-dword stores merge with atomics, so neighbouring lanes may share a
+    dword.
+  * **Atomics:** buffer and global swap, cmpswap, add, sub, min, max, and, or, xor (32-bit).
+* **Forms:** SDWA (operand byte/word selects, sign extension, scalar sources, the destination
+  select and its unused bits, VOPC destinations) and DPP16 / DPP8 (quad_perm, row shifts and
+  rotates, mirrors, row_share, row_xmask; row and bank masks, bound control, FI). DPP reads
+  src0 with `WaveReadLaneAt` before any EXEC test, so every host lane takes part.
+* **Also:** `v_fma_mix*` (f16 or f32 per source), `v_permlane16` / `v_permlanex16`, the cube
+  ops, `v_alignbit` / `v_alignbyte`, the 64-bit bit counts and finds, `s_bitset*`.
 * **Two binding models:** `Test` (memory at a GPU base address in one UAV, a register dump in
   another) for the tests; `Runtime` follows with M4.
 * **Host side:** `host/dxc_compile` loads `dxcompiler.dll` from the found DXC and compiles in
@@ -847,12 +858,18 @@ builder's `XMemVirtualQuery` calls, and the arguments logged at run time.
 * **Tests** (`tests/translate_tests.cpp`, `tests/gpu_runner.*`): console programs assembled with
   LLVM's AMDGPU assembler run on the host GPU, and every SGPR, the SCC, every lane's VGPRs and
   the memory are checked against the ISA: scalar ALU and loops, vector ALU with EXEC masking,
-  `cmpx`, `mbcnt`, scalar/global/buffer memory. All pass on the RX 9060 XT.
-* **First survey:** 69 of the 2,682 compute programs translate, and **all 69 compile with DXC**.
-  What blocks the rest, by programs held up: image loads, stores and samples (1,932, 1,740,
-  1,599), typed buffer access (`buffer_load_format_x` 1,595, `tbuffer_load_format_xy` 1,067),
-  `v_fma_mix_f32` 1,411, SDWA/DPP forms (about 1,100 each for the common ALU ops),
-  `v_alignbit_b32` 1,037, `v_permlanex16_b32` 902, the cube ops 794.
+  `cmpx`, `mbcnt`, scalar/global/buffer memory, typed buffers, SDWA, DPP, permutes, mixed
+  precision, cube ops and atomics. All pass on the RX 9060 XT.
+  * They check that the HLSL does what we read the ISA to say. They cannot check that reading
+    itself, since no PC GPU runs this ISA: where AMD's text is thin (DPP's out-of-row lanes,
+    typed stores of fewer channels than the format has), the choice is noted in the code.
+* **Survey** (`tsurvey`, 8 s for the corpus; DXC on a sample of 500):
+  * the first: 69 of the 2,682 compute programs, all compiling;
+  * with typed buffers 149; with SDWA and DPP 174; with the ALU ops and atomics above **296
+    (11 %), and every one compiles**.
+  * What blocks the rest is now nearly all images (`image_store` 1,932, `image_load` 1,740,
+    `image_sample_lz` 1,599, `image_sample_l` 1,322, `image_gather4_lz` 962, ...). After them:
+    `ds_swizzle_b32` 113, LDS atomics, D16 buffer forms, the 16-bit and packed ALU ops.
 
 ### M2.3: console files and DirectStorage (done)
 

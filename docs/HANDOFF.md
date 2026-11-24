@@ -48,8 +48,8 @@ ends the run.
 **M3:** the RDNA 2 decoder is done and decodes all 26,084 console GPU programs of the corpus,
 checked against LLVM (100 % on 2.8 M instructions). **Translator version 1 runs** (PLAN.md,
 section 11, "M3.2"): compute programs become HLSL, one thread per console lane, and are checked
-on the host GPU against the ISA. 69 of 2,682 compute programs translate so far, all of them
-compile; the survey lists what blocks the rest.
+on the host GPU against the ISA. 296 of 2,682 compute programs (11 %) translate so far, all of
+them compile; what blocks the rest is nearly all image instructions.
 
 ## 1. Rules from the user (follow them exactly)
 
@@ -282,9 +282,10 @@ RDNA 2 decoder decodes all 26,084 programs by control flow, checked against LLVM
    * GPU tests in `tests/translate_tests.cpp`: assemble with llvm-mc
      (`-triple=amdgcn -mcpu=gfx1030 -mattr=+wavefrontsize64 --show-encoding`), put the words
      in, check registers and memory.
-   * Next, by the survey's list: typed buffers, `v_fma_mix`, SDWA/DPP, `v_alignbit`,
-     `v_permlanex16`, cube ops; then images (a texture binding model), the other stages, the
-     indirect jumps, and the runtime binding model (M4).
+   * Done since: typed buffers, SDWA/DPP, `v_fma_mix`, permutes, cube ops, atomics.
+   * Next: images (a texture binding model: the T# and S# decoded at run time, descriptor
+     heaps in the test harness), then the other stages (PS/VS/mesh I/O from the FSSM
+     records), the indirect jumps, and the runtime binding model (M4).
    * Then the speed work (IR, structuring, uniformity) and `am-shaders precompile`.
    * It must be resumable, run below normal priority, and be content-addressed (console bytes
      + translator version).
