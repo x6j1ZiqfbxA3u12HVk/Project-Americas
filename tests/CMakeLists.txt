@@ -3,6 +3,7 @@ add_executable(am_tests
   core_tests.cpp
   cpu_emulation_tests.cpp
   cpu_tests.cpp
+  files_tests.cpp
   inflate_tests.cpp
   memory_tests.cpp
   pe_tests.cpp
@@ -10,6 +11,7 @@ add_executable(am_tests
   runtime_tests.cpp
   policy_tests.cpp
   shader_pack_tests.cpp
+  storage_tests.cpp
   x86_tests.cpp)
 target_link_libraries(am_tests PRIVATE am_core am_pe am_host am_loader am_x86 am_runtime am_formats am_shader)
 

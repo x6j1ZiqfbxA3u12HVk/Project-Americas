@@ -23,3 +23,5 @@ add_executable(am_test_title title_main.cpp)
 add_dependencies(am_test_title am_fixture_console_libs)
 target_link_libraries(am_test_title PRIVATE am_options am_test_title_dll ${console_libs})
 set_target_properties(am_test_title PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${fixture_dir}")
+# The fixture calls fopen as console titles do (the game imports it), to test our wrapper.
+target_compile_definitions(am_test_title PRIVATE _CRT_SECURE_NO_WARNINGS)

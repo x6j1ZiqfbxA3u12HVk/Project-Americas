@@ -36,6 +36,23 @@ void add_graphics(std::vector<Function>& out);
 
 }  // namespace am::rt::hle
 
+namespace am::rt::files {
+struct Roots;
+void configure(const Roots& roots);  // before the title runs
+void add_files(std::vector<hle::Function>& out);
+// For our own readers (DirectStorage): a read-only handle by the title's rules, or
+// INVALID_HANDLE_VALUE with the last error set.
+void* open_for_reading(const wchar_t* path);
+}
+
+namespace am {
+class JsonWriter;
+}
+namespace am::rt::storage {
+void add_storage(std::vector<hle::Function>& out);  // XCRDAPI.dll
+void write_storage_report(JsonWriter& j);
+}
+
 namespace am::rt::input {
 void add_input(std::vector<hle::Function>& out);  // GameInput.dll
 }

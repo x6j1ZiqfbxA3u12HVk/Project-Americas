@@ -69,6 +69,9 @@ class TitleMemory {
   void* map_pages(void* address, uint64_t count, const uint64_t* pages);
   // XMemMapPhysicalPagesScatter: one page per address; `pages` null or a page 0 unmaps.
   bool map_pages_scatter(void* const* addresses, uint64_t count, const uint64_t* pages);
+  // Writes bytes [offset, offset + size) of the pages listed (64 KiB each, in order), mapped
+  // anywhere or not (DirectStorage destinations). False if a page is unknown.
+  bool write_pages(const uint64_t* pages, uint64_t page_count, uint64_t offset, const uint8_t* data, uint64_t size);
 
   MemoryStats stats() const;
 

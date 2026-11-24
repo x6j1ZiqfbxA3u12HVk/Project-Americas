@@ -3,6 +3,7 @@
 #include <psapi.h>
 
 #include <algorithm>
+#include <cstring>
 #include <iterator>
 
 #include "core/text.h"
@@ -470,6 +471,62 @@ bool TitleMemory::map_pages_scatter(void* const* addresses, uint64_t count, cons
   for (uint64_t k = 0; k < count; ++k) {
     const uint64_t page = pages ? pages[k] : 0;
     if (!map_pages(addresses[k], 1, page ? &page : nullptr)) return false;
+  }
+  return true;
+}
+
+bool TitleMemory::write_pages(const uint64_t* pages, uint64_t page_count, uint64_t offset, const uint8_t* data,
+                              uint64_t size) {
+  if (!size) return true;
+  if (!pages || offset > page_count * kPage || size > page_count * kPage - offset) {
+    SetLastError(ERROR_INVALID_PARAMETER);
+    return false;
+  }
+  const uint64_t first = offset / kPage, last = (offset + size - 1) / kPage;
+  std::vector<uint64_t> index(last - first + 1);
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (uint64_t k = first; k <= last; ++k) {
+      if (!page_index(pages[k], &index[k - first])) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return false;
+      }
+    }
+    uint64_t fresh = 0;
+    for (uint64_t i : index) fresh += !test_bit(committed_, i);
+    if (fresh && options_.commit_cap && private_commit() + (committed_count_ + fresh) * kPage > options_.commit_cap) {
+      logf("memory: writing physical pages would pass the memory limit of %s", format_bytes(options_.commit_cap).c_str());
+      SetLastError(ERROR_COMMITMENT_LIMIT);
+      return false;
+    }
+    for (uint64_t i : index) {
+      if (!test_bit(committed_, i)) {
+        set_bit(committed_, i);
+        ++committed_count_;
+      }
+    }
+  }
+  // One view of our own per run of consecutive pages, outside the lock: the copies are large.
+  uint64_t done = 0, within = offset % kPage;
+  for (size_t k = 0; k < index.size();) {
+    size_t run = 1;
+    while (k + run < index.size() && index[k + run] == index[k] + run) ++run;
+    const uint64_t len = run * kPage;
+    const uint64_t at = index[k] * kPage;
+    void* view = MapViewOfFile(section_, FILE_MAP_WRITE, static_cast<DWORD>(at >> 32), static_cast<DWORD>(at), len);
+    if (!view || !VirtualAlloc(view, len, MEM_COMMIT, PAGE_READWRITE)) {
+      const DWORD error = GetLastError();
+      if (view) UnmapViewOfFile(view);
+      log_commit_failure(len, error);
+      SetLastError(error);
+      return false;
+    }
+    const uint64_t n = std::min(len - within, size - done);
+    std::memcpy(static_cast<uint8_t*>(view) + within, data + done, n);
+    UnmapViewOfFile(view);
+    done += n;
+    within = 0;
+    k += run;
   }
   return true;
 }

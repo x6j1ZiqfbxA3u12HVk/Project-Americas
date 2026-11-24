@@ -105,6 +105,28 @@ void check_console_memory() {
         "XMemGetWorkingSetStatistics: a budget above what is used");
 }
 
+// Files: the title's folder read-only, S:\ writable, the rest of the PC out of reach.
+void check_files() {
+  HANDLE self = CreateFileW(L"am_test_title.exe", GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+  char mz[2] = {};
+  DWORD got = 0;
+  check(self != INVALID_HANDLE_VALUE && ReadFile(self, mz, 2, &got, nullptr) && mz[0] == 'M' && mz[1] == 'Z',
+        "files: reading the title's own folder");
+  if (self != INVALID_HANDLE_VALUE) CloseHandle(self);
+  HANDLE write = CreateFileW(L"am_test_title.exe", GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
+  check(write == INVALID_HANDLE_VALUE && GetLastError() == ERROR_ACCESS_DENIED, "files: the title's folder is read-only");
+  FILE* f = std::fopen("new.txt", "w");
+  check(f == nullptr, "files: fopen for writing in the title's folder is refused");
+  check(GetFileAttributesW(L"C:\\Windows\\win.ini") == INVALID_FILE_ATTRIBUTES, "files: the rest of the PC is out of reach");
+  check(GetFileAttributesW(L"..\\..\\CMakeCache.txt") == INVALID_FILE_ATTRIBUTES, "files: .. cannot climb out");
+  FILE* s = std::fopen("S:\\fixture.txt", "wb");
+  const bool wrote = s && std::fputs("saved", s) >= 0 && std::fclose(s) == 0;
+  char back[8] = {};
+  FILE* r = std::fopen("S:\\fixture.txt", "rb");
+  const bool read = r && std::fread(back, 1, 5, r) == 5 && std::fclose(r) == 0;
+  check(wrote && read && std::strcmp(back, "saved") == 0 && DeleteFileW(L"S:\\fixture.txt"), "files: S:\\ is writable");
+}
+
 // XGameRuntime as the GDK reaches it: the DLL by name, its functions by GetProcAddress, an
 // area's object from QueryApiImpl, then one vtable slot with the object first.
 int g_runtime_callbacks = 0;
@@ -193,6 +215,7 @@ int main(int argc, char** argv) {
   check(AcpHalCreate(nullptr, nullptr) == nullptr, "unimplemented console import returns 0");
   check_console_memory();
   check_runtime();
+  check_files();
   check(am_fixture_dll_value() == 1234, "title DLL export");
   check(am_fixture_dll_attach_count() == 1, "title DLL: DllMain process attach, once");
   check(am_fixture_dll_tls_on_new_thread() == 99, "title DLL: static TLS on a new thread");

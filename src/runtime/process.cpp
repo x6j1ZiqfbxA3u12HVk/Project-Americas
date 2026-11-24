@@ -569,6 +569,8 @@ void TitleProcess::write_report() const {
       .field("physical_committed", ms.physical_committed).field("views", ms.views).field("map_calls", ms.map_calls)
       .field("reservations", ms.reservations).field("regions", ms.regions).field("refused", ms.refused);
   j.end_object();
+  j.key("dstorage");
+  storage::write_storage_report(j);
   j.key("runtime");
   gdk::write_runtime_report(j);
   j.key("passthrough").begin_array();

@@ -19,6 +19,8 @@
 #include "core/text.h"
 #include "host/system.h"
 #include "runtime/console.h"
+#include "runtime/files/console_paths.h"
+#include "runtime/hle/registry.h"
 #include "runtime/launcher_api.h"
 #include "runtime/log.h"
 #include "runtime/memory/title_memory.h"
@@ -128,6 +130,7 @@ extern "C" __declspec(dllexport) int am_launch(const rt::LauncherInfo* info) {
   for (const std::string& w : warnings) rt::logf("warning: %s", w.c_str());
   rt::logf("title %s", narrow(options.title.wstring()).c_str());
   rt::set_title_config(rt::read_title_config(options.title.parent_path()));
+  rt::files::configure({options.title.parent_path(), config.userdata_dir() / L"persistent", config.userdata_dir() / L"temp"});
   if (const rt::TitleConfig& tc = rt::title_config(); tc.title_id) {
     rt::logf("title id %08X, %s %s", tc.title_id, tc.identity_name.c_str(), tc.version.c_str());
   }

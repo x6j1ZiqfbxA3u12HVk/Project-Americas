@@ -77,38 +77,53 @@ def main():
     files = sorted(glob.glob(os.path.join(pack, '*.dxbc')))
     chosen = random.sample(files, min(sample, len(files)))
     raw_dir = tempfile.mkdtemp(prefix='rdna2_oracle_')
-    items = []  # (our name, dwords, hex, where)
-    for path in chosen:
-        name = os.path.basename(path)[:16]
-        for bin_path, insns in ours(am_shaders, pack, name, raw_dir):
-            code = open(bin_path, 'rb').read()
-            for offset, dwords, mnemonic, line in insns:
-                if mnemonic == 'v_nop' and dwords == 3:
-                    continue  # a hash marker
-                b = code[offset:offset + 4 * dwords]
-                items.append((mnemonic, dwords, ' '.join('0x%02x' % x for x in b), '%s+%06x' % (name, offset)))
-    verdict = ['?'] * len(items)
+    # Each distinct encoding is checked once; counts weigh the results.
+    checked = {}  # instruction bytes -> True (agrees) / the mismatch key
     mismatches = collections.Counter()
     examples = {}
-    for cpu in ('gfx1030', 'gfx1013'):
-        todo = [i for i, v in enumerate(verdict) if v != 'ok']
-        for start in range(0, len(todo), 30000):
-            batch = todo[start:start + 30000]
-            groups = llvm(llvm_mc, cpu, [items[i][2] for i in batch])
-            for k, i in enumerate(batch):
-                mnemonic, dwords, _, where = items[i]
-                got = groups.get(k)
-                insns = parse(got[0]) if got else []
-                if len(insns) == 1 and insns[0][1] == 4 * dwords and SUFFIX.sub('', insns[0][0]) == mnemonic:
-                    verdict[i] = 'ok'
-                elif cpu == 'gfx1013':
-                    llvm_says = ' + '.join('%s(%d)' % x for x in insns) or 'invalid'
-                    key = '%s(%d) vs %s' % (mnemonic, dwords * 4, llvm_says)
-                    mismatches[key] += 1
-                    examples.setdefault(key, where)
-    agree = verdict.count('ok')
-    print('%d containers, %d instructions compared: %d agree (%.3f %%)' % (len(chosen), len(items), agree,
-                                                                            100.0 * agree / max(1, len(items))))
+    total = agree = 0
+    for chunk_start in range(0, len(chosen), 300):
+        pending = {}  # bytes -> [mnemonic, dwords, where, count]
+        counts = collections.Counter()
+        for path in chosen[chunk_start:chunk_start + 300]:
+            name = os.path.basename(path)[:16]
+            for bin_path, insns in ours(am_shaders, pack, name, raw_dir):
+                code = open(bin_path, 'rb').read()
+                os.unlink(bin_path)
+                for offset, dwords, mnemonic, line in insns:
+                    if mnemonic == 'v_nop' and dwords == 3:
+                        continue  # a hash marker
+                    b = code[offset:offset + 4 * dwords]
+                    counts[b] += 1
+                    if b not in checked and b not in pending:
+                        pending[b] = [mnemonic, dwords, '%s+%06x' % (name, offset)]
+        keys = list(pending)
+        for cpu in ('gfx1030', 'gfx1013'):
+            todo = [b for b in keys if checked.get(b) is not True]
+            for start in range(0, len(todo), 30000):
+                batch = todo[start:start + 30000]
+                groups = llvm(llvm_mc, cpu, [' '.join('0x%02x' % x for x in b) for b in batch])
+                for k, b in enumerate(batch):
+                    mnemonic, dwords, where = pending[b]
+                    got = groups.get(k)
+                    insns = parse(got[0]) if got else []
+                    if len(insns) == 1 and insns[0][1] == 4 * dwords and SUFFIX.sub('', insns[0][0]) == mnemonic:
+                        checked[b] = True
+                    elif cpu == 'gfx1013':
+                        llvm_says = ' + '.join('%s(%d)' % x for x in insns) or 'invalid'
+                        key = '%s(%d) vs %s' % (mnemonic, dwords * 4, llvm_says)
+                        checked[b] = key
+                        examples.setdefault(key, where)
+        for b, n in counts.items():
+            total += n
+            if checked.get(b) is True:
+                agree += n
+            else:
+                mismatches[checked[b]] += n
+        print('  %d of %d containers: %d instructions, %d agree' % (min(chunk_start + 300, len(chosen)), len(chosen),
+                                                                    total, agree), flush=True)
+    print('%d containers, %d instructions compared (%d distinct encodings): %d agree (%.4f %%)' % (
+        len(chosen), total, len(checked), agree, 100.0 * agree / max(1, total)))
     for key, n in mismatches.most_common(40):
         print('  %7d  %s   e.g. %s' % (n, key, examples[key]))
 

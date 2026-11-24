@@ -12,6 +12,15 @@ executable through its memory set-up and runtime initialization (task queues, us
 networking, GameInput). It stops at the next console service we do not provide yet: the
 console DirectStorage factory. File access is still refused.
 
+**Files and DirectStorage (2026-11-24, night):** console paths work (the title's folder
+read-only, `S:\`/`T:\` in `userdata`, the rest refused; `runtime/files`, `hle/files.cpp`), and
+the console DirectStorage (`runtime/storage/dstorage.cpp`) opens files and runs queued reads
+(zlib, memory or physical-page destinations; BCPack and other transforms refused). The game now
+opens all its RPF archives and **stops at `d3d12_xs!D3D12XboxCreateDevice`** (the stub's 0, then a
+null device at `+0x247870a`): the D3D12.X device is next. It also asks for XPackage,
+XPersistentLocalStorage and XDisplay HDR, not implemented yet (`gdk/catalog.cpp`). PLAN.md
+section 11 has no entry for files and DirectStorage yet.
+
 **M3:** the RDNA 2 decoder is done and decodes all 26,084 console GPU programs of the corpus,
 checked against LLVM (100 % on 2.8 M instructions). Next there: the translator.
 

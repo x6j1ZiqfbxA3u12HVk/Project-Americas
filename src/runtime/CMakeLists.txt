@@ -8,22 +8,25 @@ add_library(am_runtime STATIC
   stubs.cpp
   title_config.cpp
   tls.cpp
+  files/console_paths.cpp
   gdk/catalog.cpp
   gdk/offline.cpp
   gdk/runtime.cpp
   gdk/task_queue.cpp
   gdk/task_queue_api.cpp
   memory/console_flags.cpp
+  storage/dstorage.cpp
   memory/default_alloc.cpp
   memory/title_memory.cpp
   hle/d3d12x.cpp
+  hle/files.cpp
   input/game_input.cpp
   hle/identity.cpp
   hle/network.cpp
   hle/registry.cpp
   hle/system.cpp
   hle/xmem.cpp)
-target_link_libraries(am_runtime PUBLIC am_core am_pe am_loader am_x86 PRIVATE ws2_32 winhttp)
+target_link_libraries(am_runtime PUBLIC am_core am_pe am_loader am_x86 am_formats PRIVATE ws2_32 winhttp)
 
 # The runtime proper, loaded by americas.exe.
 add_library(americas_rt SHARED rt_main.cpp)
