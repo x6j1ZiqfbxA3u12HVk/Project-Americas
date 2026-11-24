@@ -12,6 +12,9 @@ executable through its memory set-up and runtime initialization (task queues, us
 networking, GameInput). It stops at the next console service we do not provide yet: the
 console DirectStorage factory. File access is still refused.
 
+**M3:** the RDNA 2 decoder is done and decodes all 26,084 console GPU programs of the corpus,
+checked against LLVM (100 % on 2.8 M instructions). Next there: the translator.
+
 ## 1. Rules from the user (follow them exactly)
 
 1. **Read your memory notes first** (`MEMORY.md` in your project memory). They hold standing
@@ -29,8 +32,10 @@ console DirectStorage factory. File access is still refused.
    when one exists (Resizable BAR, 64-lane waves, large pages, the console's Zen 2
    instructions), with a working fallback when it does not. The user's PC is one test machine
    (PLAN.md section 4).
-7. **Ask before downloading anything**, with file name, source and size. Ask before anything
-   that changes the system outside `C:\Project Americas` and the repository.
+7. **Downloads need no asking** (the user's standing OK, 2026-11-24): official sources only,
+   everything under `C:\Project Americas\tools`, each tool recorded in PLAN.md's "Local tools".
+   Still ask before installing anything system-wide, outside `C:\Project Americas` and the
+   repository.
 8. **Native performance is the goal.** The user asked to be sure nothing is emulated. Be
    precise about the exceptions: see section 6 of this file.
 9. **Network stays off** in game runs. The game's crash reporter would upload dumps.
@@ -104,7 +109,7 @@ Set-Location "C:\Users\Admin\Documents\GitHub\Project Americas"; . .\scripts\env
 | `src/x86` | our x86-64 decoder (length, operands, flow, required feature) and the two-pass code census |
 | `src/loader` | the import routing policy: ours / wrap / host / title / unresolved |
 | `src/formats` | DEFLATE (raw and zlib) |
-| `src/shader` | shader pack reader (records found by their framing), DXBC container parser |
+| `src/shader` | shader pack reader (records found by their framing), DXBC container parser, `console_program` (XDAT / XBCH / FSSM: the native programs and their records), `rdna2` (the decoder; `rdna2_tables.inl` generated from AMD's XML) |
 | `src/runtime` | the runtime DLL, below |
 | `src/runtime/memory` | title memory: console flag translation, physical pages, the XMemAlloc default allocator |
 | `src/runtime/gdk` | XGameRuntime: `runtime.*` (exports, QueryApiImpl, area objects, report), `catalog.cpp` (the areas not done yet, by slot), `task_queue*` (XTaskQueue / XAsync), `offline.cpp` (XUser, XSystem, XGame, XNetworking, features, events) |
@@ -224,14 +229,13 @@ method the game calls.
 
 ### M3: shader recompiler
 
-1. **Map the console blocks** (`XDAT`, `XBCH`, `PRIV`) to find the RDNA2 code, resource and
-   user-data metadata, and per-stage I/O. Use `am-shaders dump` on small shaders first.
-2. **RDNA2 decoder** with its tables generated from `amdgpu_isa_rdna2.xml`, at build time or
-   committed with AMD's MIT notice.
-   * It needs an oracle for tests; ask the user which of the candidates in PLAN.md
-     ("Local tools") to download.
-   * Then `am-shaders survey`: decode every program, histogram the instructions, report
-     failures.
+Steps 1 and 2 are done (PLAN.md, section 11, "M3.1"): the console blocks are mapped, and the
+RDNA 2 decoder decodes all 26,084 programs by control flow, checked against LLVM.
+* `am-shaders survey` (3 s) and `am-shaders disasm <hash prefix> [--raw <dir>]` (a listing).
+* `python -I scripts\rdna2_oracle.py <am-shaders.exe> <llvm-mc.exe> <pack dir> [<sample> [<seed>]]`
+  checks the decoder against `C:\Project Americas\tools\llvm-amdgpu-23.1.6\bin\llvm-mc.exe`.
+* Regenerate the tables with `python -I scripts\gen_rdna2_tables.py <rdna2.xml> <rdna1.xml>`.
+
 3. **Translator** (IR, structuring, EXEC removal, uniformity, resource tracing; HLSL → DXC),
    then `am-shaders precompile`.
    * It must be resumable, run below normal priority, and be content-addressed (console bytes
@@ -313,6 +317,14 @@ method the game calls.
 * **Thread start and exit run under the loader lock.** Code on that path (the launcher's TLS
   callback, `TitleProcess::on_thread`) must never wait on a lock of ours: a thread holding it
   may be loading a DLL. It deadlocked once.
+* **The console GPU is RDNA 2 plus RDNA 1's MAD family** (`v_mac_f32`, `v_mad_f32`,
+  `v_madak_f32`), and MIMG / MUBUF have opcode bits the spec's layouts leave out (bit 0, bit 25).
+  LLVM's gfx1030 calls VOP2 31 `v_dot2c_f32_f16`: confirm `v_mac_f32` with the translator's
+  first GPU tests.
+* **Every console program starts with a 24-byte hash marker** (two VOP3 `v_nop`s with literals),
+  and some carry data after `s_endpgm`: decode by control flow, never linearly.
+* **llvm-mc as an oracle:** one instruction per line, a numbered `s_nop` with bit 15 set as the
+  delimiter (the code's own `s_nop`s never set it).
 * **Runtime thunks** are easy to list: calls of the GDK helper at `0x1455DE048`, with the
   class / interface GUIDs in `rcx` / `rdx` and the slot in the following `mov rax,[rax+slot*8]`.
 * **Commit in `--memory-limit` runs.** A job's memory limit counts private commit only, not

@@ -6,6 +6,7 @@ add_executable(am_tests
   inflate_tests.cpp
   memory_tests.cpp
   pe_tests.cpp
+  rdna2_tests.cpp
   runtime_tests.cpp
   policy_tests.cpp
   shader_pack_tests.cpp

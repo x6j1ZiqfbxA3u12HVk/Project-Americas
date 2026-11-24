@@ -7,6 +7,11 @@
 //   am-shaders dump <name or hash prefix> [--out <dir>]
 //       The structure of one container from the corpus: its parts, its program header, and the
 //       four-character tags inside the console payload.
+//   am-shaders survey [--out <dir>]
+//       Every console program of the corpus through the RDNA 2 decoder: failures by reason and
+//       an instruction histogram, in <cache>\shaders\survey.json.
+//   am-shaders disasm <hash prefix> [--out <dir>] [--raw <dir>]
+//       A listing of one container's console programs; --raw also writes their code bytes.
 
 #include <windows.h>
 
@@ -29,6 +34,7 @@
 #include "core/text.h"
 #include "shader/container.h"
 #include "shader/pack.h"
+#include "survey.h"
 
 namespace fs = std::filesystem;
 using namespace am;
@@ -38,7 +44,9 @@ namespace {
 int usage() {
   std::fprintf(stderr,
                "usage: am-shaders index [<shaders.rpf>] [--out <dir>]\n"
-               "       am-shaders dump <name or hash prefix> [--out <dir>]\n");
+               "       am-shaders dump <name or hash prefix> [--out <dir>]\n"
+               "       am-shaders survey [--out <dir>]\n"
+               "       am-shaders disasm <hash prefix> [--out <dir>] [--raw <dir>]\n");
   return 2;
 }
 
@@ -225,9 +233,11 @@ int wmain(int argc, wchar_t** argv) {
   const Config config = load_config(warnings);
   fs::path out = config.cache_dir() / L"shaders" / L"pack";
   std::vector<std::wstring> positional;
+  fs::path raw;
   for (int i = 2; i < argc; ++i) {
     const std::wstring a = argv[i];
     if (a == L"--out" && i + 1 < argc) out = argv[++i];
+    else if (a == L"--raw" && i + 1 < argc) raw = argv[++i];
     else if (!a.empty() && a[0] != L'-') positional.push_back(a);
     else return usage();
   }
@@ -237,5 +247,7 @@ int wmain(int argc, wchar_t** argv) {
     return index_pack(pack, out);
   }
   if (command == L"dump" && positional.size() == 1) return dump(narrow(positional[0]), out);
+  if (command == L"survey" && positional.empty()) return tools::survey(out, out.parent_path() / L"survey.json");
+  if (command == L"disasm" && positional.size() == 1) return tools::disasm(narrow(positional[0]), out, raw);
   return usage();
 }
