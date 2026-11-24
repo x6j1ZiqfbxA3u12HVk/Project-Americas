@@ -12,6 +12,7 @@ Registry::Registry() {
   add_memory(functions_);
   add_graphics(functions_);
   gdk::add_runtime_exports(functions_);
+  input::add_input(functions_);
 }
 
 const Function* Registry::find(std::string_view module, std::string_view name) const {

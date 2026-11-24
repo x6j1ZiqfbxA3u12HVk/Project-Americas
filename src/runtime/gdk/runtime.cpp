@@ -90,6 +90,7 @@ Catalog& catalog() {
   static Catalog* const c = [] {
     auto* cat = new Catalog;
     add_task_queue_interfaces(cat->interfaces);
+    add_offline_interfaces(cat->interfaces);
     add_system_interfaces(cat->interfaces);
     static const auto hresult = hresult_stubs(std::make_integer_sequence<int, kMaxSlots>());
     static const auto zero = zero_stubs(std::make_integer_sequence<int, kMaxSlots>());

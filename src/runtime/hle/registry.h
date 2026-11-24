@@ -35,3 +35,7 @@ void add_memory(std::vector<Function>& out);
 void add_graphics(std::vector<Function>& out);
 
 }  // namespace am::rt::hle
+
+namespace am::rt::input {
+void add_input(std::vector<hle::Function>& out);  // GameInput.dll
+}

@@ -7,8 +7,10 @@ The full design is [PLAN.md](PLAN.md); progress is its section 11. This file is 
 to start working: rules, setup, state, lessons learned, next steps.
 
 State as of 2026-11-24: **M0 and M1 are done, the M3 groundwork (the shader corpus) is done,
-and M2's first step (memory) is done.** The loader runs the real game executable through its
-memory set-up. It stops at the next console service we do not provide yet: XGameRuntime.
+and M2's memory and XGameRuntime core steps are done.** The loader runs the real game
+executable through its memory set-up and runtime initialization (task queues, user,
+networking, GameInput). It stops at the next console service we do not provide yet: the
+console DirectStorage factory. File access is still refused.
 
 ## 1. Rules from the user (follow them exactly)
 
@@ -64,8 +66,8 @@ Set-Location "C:\Users\Admin\Documents\GitHub\Project Americas"; . .\scripts\env
 ```
 
 * Binaries land in `C:\Project Americas\build\release\bin`.
-* `ctest` runs 5 entries: 46 unit test cases, the probe, the inspector, and the loader running
-  the fixture title (35 checks) at its own base and relocated.
+* `ctest` runs 5 entries: 52 unit test cases, the probe, the inspector, and the loader running
+  the fixture title (41 checks) at its own base and relocated.
 * `C:\Project Americas\build\release\test-root\logs\run.log` is the last fixture run's log:
   the relocated one.
 * `am_tests.exe <fragment>` runs a subset.
@@ -86,7 +88,9 @@ Set-Location "C:\Users\Admin\Documents\GitHub\Project Americas"; . .\scripts\env
 * Logs go to `C:\Project Americas\logs`:
   * `run.log`;
   * `report.json`: modules, stubs with call counts, CPU patches, emulation hits;
-  * `crash.txt`: the faulting `module+offset`, registers, and an unwound stack.
+  * `crash.txt`: the faulting `module+offset`, registers, and an unwound stack;
+  * `hang.txt` (when `--timeout` ends the run): every thread's name and stack. Name our own
+    frames with `python -I scripts\symbolize.py "C:\Project Americas\build\release\bin\americas_rt.map" <report>`.
 * `--unimplemented trap` makes stubs raise an exception naming the import, instead of
   returning 0.
 
@@ -103,11 +107,13 @@ Set-Location "C:\Users\Admin\Documents\GitHub\Project Americas"; . .\scripts\env
 | `src/shader` | shader pack reader (records found by their framing), DXBC container parser |
 | `src/runtime` | the runtime DLL, below |
 | `src/runtime/memory` | title memory: console flag translation, physical pages, the XMemAlloc default allocator |
+| `src/runtime/gdk` | XGameRuntime: `runtime.*` (exports, QueryApiImpl, area objects, report), `catalog.cpp` (the areas not done yet, by slot), `task_queue*` (XTaskQueue / XAsync), `offline.cpp` (XUser, XSystem, XGame, XNetworking, features, events) |
+| `src/runtime/input` | GameInput (no devices yet) |
 | `src/launcher` | `americas.exe`: TLS slot 0 for the title, a TLS callback, nothing else |
 | `src/tls_carrier` | `am_tls_1..4.dll`: one TLS slot each for title DLLs |
 | `src/tools/*` | `am-probe`, `am-inspect`, `am-cpuscan`, `am-shaders` |
 | `tests` | unit tests (own tiny runner, `tests/test.h`), the fixture title in `tests/fixtures/title` |
-| `scripts` | `env.ps1` (developer shell), `setup.ps1` (hooks, ini), `check_assets.py` (asset policy) |
+| `scripts` | `env.ps1` (developer shell), `setup.ps1` (hooks, ini), `check_assets.py` (asset policy); read-only analysis: `import_calls.py` (call sites of a DLL's imports), `vtable_calls.py` (slots called through an interface getter), `symbolize.py` (names our frames in hang and crash reports) |
 
 `src/runtime` in more detail:
 
@@ -115,6 +121,7 @@ Set-Location "C:\Users\Admin\Documents\GitHub\Project Americas"; . .\scripts\env
 |---|---|
 | `process.*` | the title process: maps modules, binds imports by the policy, maps title DLLs on demand, initializes them in dependency order, forwards thread start/exit, runs the entry point, crash filter, `report.json` |
 | `console.*` | the console profile (Series S / X): title memory budget, chosen from the host's RAM or the settings |
+| `title_config.*` | what `MicrosoftGame.Config` says: executable, title id, identity, local storage size |
 | `memory/console_flags.*` | the console's allocation, protection and XMem flag bits, and the host request each becomes (pure, unit-tested) |
 | `memory/title_memory.*` | allocations with their console attributes; the physical page pool (one section); views over placeholders; release, query, commit cap |
 | `memory/default_alloc.*` | `XMemAllocDefault`: size classes in 2 MiB arenas, large blocks on their own, all below 2^40 |
@@ -146,10 +153,12 @@ Set-Location "C:\Users\Admin\Documents\GitHub\Project Americas"; . .\scripts\env
   5. memory: `D3D12ConfigureVirtualMemoryX`, two 24 GiB reservations of 64 KiB pages, four
      2 MiB-page heaps (4.4 GiB) and a 20 MiB commit (PLAN.md, section 11, "M2.1");
   6. `GetFileAttributesW` is refused (files are not done);
-  7. **it stops after `xgameruntime!InitializeApiImplEx2` and `QueryApiImpl`.** The stub's 0
-     reads as `S_OK`, so the game calls through the interface pointer it never got, at
-     `game_scarlett_master.exe+0x55de020` (its helper at `+0x55de048` asks for the interface
-     whose GUID is at `0x145F41040`).
+  7. XGameRuntime: `InitializeApiImplEx2`, task queues, XUser, XNetworking (PLAN.md,
+     section 11, "M2.2");
+  8. GameInput: its gamepad device callback (no devices yet);
+  9. **it stops at `XCRDAPI!DStorageGetFactory`:** the stub's 0 reaches the game's own
+     assertion, `int3` at `game_scarlett_master.exe+0x1d8e505`. Other threads already call
+     `CreateFileW` and `_wfopen`, refused.
 * **Memory facts** (PLAN.md, section 11, "M2.1", has the full table):
   * XMem's reference pages on learn.microsoft.com are NDA-only: read the game's code instead;
   * allocation type bit 29 means 2 MiB pages, bits 29 + 22 mean 64 KiB pages;
@@ -187,14 +196,18 @@ Memory is done (PLAN.md, section 11, "M2.1"). The method that worked:
 * log the arguments at run time;
 * rerun the game after each step and follow `report.json`'s called stubs.
 
-1. **XGameRuntime (the current stop).** The game gets it through `QueryApiImpl` from
-   `xgameruntime.dll`, which `LoadLibrary` returns as a pseudo handle.
-   * Learn `InitializeApiImplEx2`'s and `QueryApiImpl`'s arguments from their call sites, and
-     which interfaces (GUIDs) the game asks for. The first is at `0x145F41040`.
-   * Then give it an offline user, package, system (Series S/X from `runtime/console`), and task
-     queue / async.
-   * Until an interface exists, `QueryApiImpl` must fail with `E_NOINTERFACE` and a null out
-     pointer, not return the stub's 0 (`S_OK`).
+XGameRuntime's core is done too (PLAN.md, section 11, "M2.2"). Its remaining areas
+(`gdk/catalog.cpp`: XPackage, XGameSave, XStore, XPersistentLocalStorage, ...) get implemented
+as the game reaches them; `report.json`'s `runtime` section and the log name each missing
+method the game calls.
+
+1. **DirectStorage's factory (the current stop).** `XCRDAPI!DStorageGetFactory` must return
+   the console's factory interface.
+   * Learn its arguments and the interface's slots from the game's code (`vtable_calls.py`
+     on the getter that caches the factory).
+   * Queues and requests read through the file layer (step 2), so the two go together.
+   * Decompression (zlib through `src/formats/inflate`, BCPack later) is M6; requests may fail
+     cleanly until then.
 2. **Files.** Console paths (the game root, `S:\` persistent storage, `T:\` temp) mapped to
    the read-only dump and `C:\Project Americas\userdata`. Deny by default, and refuse any
    write that resolves into the dump: check the final path of the opened handle too.
@@ -205,7 +218,9 @@ Memory is done (PLAN.md, section 11, "M2.1"). The method that worked:
 3. **Threads and topology.** Console affinity masks mapped onto the host's processors;
    decide what topology the game sees (PLAN.md section 5.1).
 4. **D3D12.X device** with a null back end (commands accepted and dropped), `PresentX`, frame
-   pacing, a window. GameInput.
+   pacing, a window.
+5. **GameInput devices:** pads through XInput (or the host's GameInput), readings and device
+   callbacks. The interface exists already, with no devices (`runtime/input`).
 
 ### M3: shader recompiler
 
@@ -231,7 +246,8 @@ Memory is done (PLAN.md, section 11, "M2.1"). The method that worked:
   care with branch targets. The exception handler stays only as the safety net for
   unconfirmed sites.
 * **Refused stubs return 0, and 0 is success for some functions** (`S_OK`, a `NULL` handle that
-  is not `INVALID_HANDLE_VALUE`, "attributes 0"). A per-function failure value for refused
+  is not `INVALID_HANDLE_VALUE`, "attributes 0"). `QueryApiImpl`, `GameInputCreate` and
+  `DStorageGetFactory` each stopped the game this way. A per-function failure value for refused
   wrappers would make runs more predictable.
 * **Decisions the user still owns** (PLAN.md section 10):
   * graphics back end (D3D12 recommended);
@@ -294,5 +310,10 @@ Memory is done (PLAN.md, section 11, "M2.1"). The method that worked:
 * **The executable's base can be taken.** A random allocation sometimes sat in
   `0x140000000`+176 MiB. The launcher now holds that window from its first instruction. When an
   image must move anyway, it goes into title memory, never above 2^40.
+* **Thread start and exit run under the loader lock.** Code on that path (the launcher's TLS
+  callback, `TitleProcess::on_thread`) must never wait on a lock of ours: a thread holding it
+  may be loading a DLL. It deadlocked once.
+* **Runtime thunks** are easy to list: calls of the GDK helper at `0x1455DE048`, with the
+  class / interface GUIDs in `rcx` / `rdx` and the slot in the following `mov rax,[rax+slot*8]`.
 * **Commit in `--memory-limit` runs.** A job's memory limit counts private commit only, not
   commit of page-file-backed sections. That is why the physical pool checks the cap itself.

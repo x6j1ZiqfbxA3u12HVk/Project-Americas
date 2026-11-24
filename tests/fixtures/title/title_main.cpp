@@ -136,8 +136,9 @@ void check_runtime() {
   const bool ran = reinterpret_cast<Dispatch>(vtable[16])(object, queue, 0, 0);
   check(ran && g_runtime_callbacks == 1, "XTaskQueueSubmitCallback + XTaskQueueDispatch");
   reinterpret_cast<Close>(vtable[17])(object, queue);
-  const GUID user = {0x01acd177, 0x91f9, 0x4763, {0xa3, 0x8e, 0xcc, 0xbb, 0x55, 0xce, 0x32, 0xe0}};
-  check(query(&user, &user, &object) < 0 && !object, "QueryApiImpl refuses an area not implemented");
+  const GUID store = {0x0dd112ac, 0x7c24, 0x448c, {0xb9, 0x2b, 0x39, 0x60, 0xfb, 0x5b, 0xd3, 0x0c}};
+  const GUID store_iid = {0xb09d803c, 0x2414, 0x4a05, {0x82, 0xc6, 0x66, 0xdf, 0xdc, 0x9e, 0x9a, 0x44}};
+  check(query(&store, &store_iid, &object) < 0 && !object, "QueryApiImpl refuses an area not implemented");
 }
 
 }  // namespace

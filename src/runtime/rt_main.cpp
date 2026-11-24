@@ -13,8 +13,6 @@
 #include <windows.h>
 
 #include <cstdio>
-#include <fstream>
-#include <iterator>
 #include <string>
 
 #include "core/config.h"
@@ -25,6 +23,7 @@
 #include "runtime/log.h"
 #include "runtime/memory/title_memory.h"
 #include "runtime/process.h"
+#include "runtime/title_config.h"
 
 // The TLS carriers (runtime/tls.h): imported, so Windows loads them with their slots.
 extern "C" __declspec(dllimport) void* am_tls_carrier_1();
@@ -42,23 +41,6 @@ int usage() {
                "                [--allow-missing-cpu-features] [--console auto|series_s|series_x]\n"
                "                [--memory-limit <MiB>] [--timeout <seconds>] [-- <title arguments>]\n");
   return 2;
-}
-
-// The executable named by MicrosoftGame.Config in the game folder: the Name attribute of its
-// first <Executable> element.
-std::filesystem::path executable_from_config(const std::filesystem::path& game_dir) {
-  std::ifstream in(game_dir / L"MicrosoftGame.Config", std::ios::binary);
-  const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-  const size_t tag = text.find("<Executable ");
-  if (tag == std::string::npos) return {};
-  const size_t tag_end = text.find('>', tag);
-  // " Name=" with the space, so OverrideDisplayName and the like do not match.
-  const size_t attr = text.find(" Name=\"", tag);
-  if (attr == std::string::npos || attr > tag_end) return {};
-  const size_t value = attr + 7;
-  const size_t quote = text.find('"', value);
-  if (quote == std::string::npos || quote > tag_end) return {};
-  return game_dir / widen(text.substr(value, quote - value));
 }
 
 void thread_hook(void* /*module*/, unsigned long reason) {
@@ -135,7 +117,7 @@ extern "C" __declspec(dllexport) int am_launch(const rt::LauncherInfo* info) {
       std::fprintf(stderr, "no --title and no game_dir in %s\n", narrow(config.ini_path.wstring()).c_str());
       return usage();
     }
-    options.title = executable_from_config(config.game_dir);
+    options.title = rt::read_title_config(config.game_dir).executable;
     if (options.title.empty()) {
       std::fprintf(stderr, "MicrosoftGame.Config in %s names no executable\n", narrow(config.game_dir.wstring()).c_str());
       return 1;
@@ -145,6 +127,10 @@ extern "C" __declspec(dllexport) int am_launch(const rt::LauncherInfo* info) {
   rt::log_open(options.logs_dir / L"run.log");
   for (const std::string& w : warnings) rt::logf("warning: %s", w.c_str());
   rt::logf("title %s", narrow(options.title.wstring()).c_str());
+  rt::set_title_config(rt::read_title_config(options.title.parent_path()));
+  if (const rt::TitleConfig& tc = rt::title_config(); tc.title_id) {
+    rt::logf("title id %08X, %s %s", tc.title_id, tc.identity_name.c_str(), tc.version.c_str());
+  }
   if (memory_limit_mib) {
     if (!limit_memory(memory_limit_mib)) rt::logf("cannot limit memory: error %lu", GetLastError());
     else rt::logf("memory limited to %llu MiB", static_cast<unsigned long long>(memory_limit_mib));

@@ -6,8 +6,10 @@ add_library(am_runtime STATIC
   log.cpp
   process.cpp
   stubs.cpp
+  title_config.cpp
   tls.cpp
   gdk/catalog.cpp
+  gdk/offline.cpp
   gdk/runtime.cpp
   gdk/task_queue.cpp
   gdk/task_queue_api.cpp
@@ -15,6 +17,7 @@ add_library(am_runtime STATIC
   memory/default_alloc.cpp
   memory/title_memory.cpp
   hle/d3d12x.cpp
+  input/game_input.cpp
   hle/identity.cpp
   hle/network.cpp
   hle/registry.cpp

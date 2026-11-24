@@ -381,7 +381,7 @@ Each milestone ends in a result that can be checked.
 |---|---|---|
 | M0 ✅ | **Foundations.** CMake + Ninja + MSVC (VS 2022), C++20; build tree under `C:\Project Americas\build`; `.gitignore` for build output; an asset-policy pre-commit check; `am-probe` (host GPU features incl. GPU upload heaps / Resizable BAR, SM level, wave64, mesh shaders, CPU instruction support, memory / page file); `am-inspect` (PE + import census with each import's planned route). | `am-inspect` lists all 587 imports with a route; `am-probe` reports the host. **Done**, see section 11. |
 | M1 ✅ | **CPU census and loader.** M1.1: disassembly census of Zen 2-only instructions in the exe and DLLs. Then mapping, binding, TLS carrier, exception tables, CPU patch pass, crash reports. A synthetic "console title" built from our own code exercises the loader in tests. | The game's code runs past CRT start-up into its own initialisation, with a full call census. **Done**, see section 11. |
-| M2 | **Boot to a frame loop.** Kernel, memory (done: M2.1, section 11), files, threads; XGameRuntime core (user, package, system, task queue / async); D3D12.X device and presentation with a null GPU backend (commands accepted and dropped); GameInput. | The window opens and the game's frame loop runs at its own 30 fps pacing. |
+| M2 | **Boot to a frame loop.** Kernel, memory (done: M2.1), files, threads; XGameRuntime core (user, system, task queue / async done: M2.2; package and saves to come); D3D12.X device and presentation with a null GPU backend (commands accepted and dropped); GameInput. | The window opens and the game's frame loop runs at its own 30 fps pacing. |
 | M3 | **Shader recompiler v1.** Decoder, IR, structuring, HLSL emit, DXC, cache; pack survey; precompile tool. | Pack translation rate tracked against a goal of 100 %; cache filled under `C:\Project Americas\cache\shaders`. |
 | M4 | **Menus render.** Command list translation (graphics + compute), descriptors, pipelines, tiled textures, memory classes A / B / C, Bink video. | The intro video and menus are visible. |
 | M5 | **Audio.** AcpHal / XApu / XDsp in software, XMA2 / Opus, WASAPI. | Menus and video have sound. |
@@ -705,6 +705,57 @@ builder's `XMemVirtualQuery` calls, and the arguments logged at run time.
   * large pages for the 2 MiB-page heaps (an M8 option);
   * the GPU memory classes, which the recorded GPU access will feed (M4).
 
+### M2.2: XGameRuntime core (done), GameInput without devices
+
+* **How the game reaches the runtime** (its own code, the GDK's static part):
+  1. it loads `xgameruntime.dll` by name and looks up `QueryApiImpl`, `InitializeApiImpl`,
+     `InitializeApiImplEx`, `InitializeApiImplEx2`, `UninitializeApiImpl` and `XErrorReport`;
+  2. it calls `InitializeApiImplEx2(0x633600002712, 0x65F400001EDD, flags 0xA, no options)`;
+  3. every runtime function is a thunk: `QueryApiImpl(class, interface, &object)`, then one
+     vtable slot with the object first, then `Release`.
+* **The catalog** (`runtime/gdk`): the game has 161 thunks in 17 interfaces, listed by class
+  GUID, interface GUID and slot as read from its code, with the GDK's public function names.
+  * An area is offered once one of its methods exists, so the game's thunks fail cleanly for the
+    rest.
+  * A missing slot logs its name and fails: `E_NOTIMPL`, or 0 where the function returns a
+    bool or a value.
+  * `report.json` lists the areas asked for and the missing methods called.
+* **XTaskQueue / XAsync / XThread**, complete, because the other areas build on them:
+  * manual, thread-pool, serialized and immediate ports;
+  * delayed callbacks, waiters, monitors, termination that cancels what is pending, composite
+    queues and the process queue;
+  * the XAsync provider protocol, results, cancellation (the provider's to do) and `XAsyncRun`.
+* **The offline console:**
+  * XUser: one local user, "Player", signed in, adult, without the privileges that need the
+    Xbox network;
+  * XSystem: made-up stable ids, the RETAIL sandbox, analytics `Windows.Xbox` and the profile's
+    console;
+  * XGame: the title id from `MicrosoftGame.Config` (`7952987A`);
+  * XNetworking: initialized, no connectivity, UDP port 3074; online-only calls fail with
+    `ERROR_NO_NETWORK`;
+  * every runtime feature available (the game asks about 10 and 20, XNetworking and XGameEvent);
+  * game events dropped.
+* **Not implemented yet:** XStore, XGameSave, XPackage, XPersistentLocalStorage, XGameUi,
+  XSpeechSynthesizer, XDisplay (HDR, timeout deferrals), XAppCapture, XLaunchUri.
+* **GameInput** (`runtime/input`): `GameInputCreate` (ordinal 1) and IGameInput in the public
+  API's layout, with no devices. The game uses slots 4–6 (readings), 9 (device callback), 13
+  (unregister) and 16 (`FindDeviceFromId`).
+* **Found on the way:**
+  * thread start and exit took the loader's module lock under the loader lock and deadlocked
+    against `GetProcAddress` loading a host DLL; they are lock-free now;
+  * a timed-out run writes every thread's name and stack to `logs\hang.txt`;
+    `americas_rt.dll` has a linker map, and `scripts/symbolize.py` names its frames.
+* **Tests:** 6 unit cases (queues in every mode, delays, waiters, monitors, composite queues,
+  termination, the async protocol) and 6 fixture checks through the pseudo module. The
+  fixture has 41.
+* **The game now:**
+  1. it initializes the runtime and creates its task queues;
+  2. it uses XUser and XNetworking;
+  3. it registers its gamepad callback;
+  4. it calls `XCRDAPI!DStorageGetFactory`; the stub's 0 reaches its own assertion
+     (`int3` at `+0x1d8e505`);
+  5. meanwhile other threads try `GetFileAttributesW`, `CreateFileW` and `_wfopen`, all refused.
+
 ### Local tools (in `C:\Project Americas\tools`, never in the repository)
 
 | Tool | Version, source | Use | Note |
@@ -723,7 +774,8 @@ each needing a further download:
 * the AMD HIP SDK for Windows, whose LLVM includes the target (a large install).
 
 Next, in parallel:
-* **M2.** XGameRuntime (`InitializeApiImplEx2`, `QueryApiImpl`: the current stop), files
-  (console paths), threads and topology, D3D12.X device and presentation.
+* **M2.** DirectStorage's factory (the current stop) and files (console paths), then
+  threads and topology, the D3D12.X device and presentation, GameInput devices, and the
+  remaining XGameRuntime areas as the game reaches them.
 * **M3.** The console blocks' layout, the RDNA2 decoder (with an assembler / disassembler as a
   test oracle), the survey, then translation and `am-shaders precompile`.

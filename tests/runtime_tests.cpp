@@ -86,8 +86,9 @@ TEST_CASE(runtime_guid_and_query) {
   TaskQueue* q = nullptr;
   CHECK(create(object, DispatchMode::Manual, DispatchMode::Manual, &q) == S_OK && q);
   queue_close(q);
-  const GUID user = guid("01acd177-91f9-4763-a38e-ccbb55ce32e0");  // catalogued, nothing implemented yet
-  CHECK(query_api(&user, &user, &object) == E_NOINTERFACE && object == nullptr);
+  const GUID store = guid("0dd112ac-7c24-448c-b92b-3960fb5bd30c");  // catalogued, nothing implemented yet
+  const GUID store_iid = guid("b09d803c-2414-4a05-82c6-66dfdc9e9a44");
+  CHECK(query_api(&store, &store_iid, &object) == E_NOINTERFACE && object == nullptr);
   const GUID unknown = guid("00000000-0000-0000-0000-000000000001");
   CHECK(query_api(&unknown, &unknown, &object) == E_NOINTERFACE);
 }

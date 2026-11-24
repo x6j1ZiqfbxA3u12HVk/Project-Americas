@@ -4,9 +4,10 @@ Runs the Xbox Series X|S build of Grand Theft Auto VI natively on Windows 11, fr
 the user supplies. The game's x86-64 code runs directly; this project supplies the console
 libraries and GPU layer underneath it. See [docs/PLAN.md](docs/PLAN.md).
 
-**Status:** milestone M1 done; M2 under way, its memory step done. The loader runs the game's
-executable through its memory set-up; it stops at the next console service not implemented yet
-(XGameRuntime). See
+**Status:** milestone M1 done; M2 under way: memory and the XGameRuntime core are done. The
+loader runs the game's executable through its memory set-up and runtime initialization; it
+stops at the next console service not implemented yet (DirectStorage), with file access still
+to do. See
 [docs/PLAN.md](docs/PLAN.md), section 11. Continuing the work? Start with
 [docs/HANDOFF.md](docs/HANDOFF.md).
 

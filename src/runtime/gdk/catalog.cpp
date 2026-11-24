@@ -1,6 +1,6 @@
-// The runtime areas the game calls besides XAsync / XTaskQueue: every function its thunks use,
-// by interface and slot. Functions not implemented yet are listed with no address; an area is
-// offered to the title once one of its functions exists.
+// The runtime areas the game calls that are not implemented yet: every function its thunks use,
+// by interface and slot. An area is offered to the title once one of its functions exists;
+// implemented areas live in their own files (task_queue_api.cpp, offline.cpp).
 
 #include "runtime/gdk/runtime.h"
 
@@ -8,32 +8,6 @@ namespace am::rt::gdk {
 
 void add_system_interfaces(std::vector<Interface>& out) {
   constexpr auto Z = Returns::Zero;
-  const GUID user = guid("01acd177-91f9-4763-a38e-ccbb55ce32e0");
-  out.push_back({"XUser", user, user, {
-      {3, "XUserDuplicateHandle", nullptr},
-      {4, "XUserCloseHandle", nullptr, Z},
-      {5, "XUserCompare", nullptr, Z},
-      {7, "XUserAddAsync", nullptr},
-      {8, "XUserAddResult", nullptr},
-      {9, "XUserGetLocalId", nullptr},
-      {10, "XUserFindUserByLocalId", nullptr},
-      {11, "XUserGetId", nullptr},
-      {12, "XUserFindUserById", nullptr},
-      {13, "XUserGetIsGuest", nullptr},
-      {14, "XUserGetState", nullptr},
-      {19, "XUserGetAgeGroup", nullptr},
-      {20, "XUserCheckPrivilege", nullptr},
-      {21, "XUserResolvePrivilegeWithUiAsync", nullptr},
-      {22, "XUserResolvePrivilegeWithUiResult", nullptr},
-      {23, "XUserGetTokenAndSignatureAsync", nullptr},
-      {24, "XUserGetTokenAndSignatureResultSize", nullptr},
-      {25, "XUserGetTokenAndSignatureResult", nullptr},
-      {33, "XUserRegisterForChangeEvent", nullptr},
-      {34, "XUserUnregisterForChangeEvent", nullptr, Z},
-  }});
-  out.push_back({"XUser (gamertag)", user, guid("cef4fac0-7676-4a94-a119-4c43f9eb5b74"), {
-      {3, "XUserGetGamertag", nullptr},
-  }});
   out.push_back({"XDisplay (HDR)", guid("03f0fe74-fdd9-4e5c-b630-f9339c47acc5"),
                  guid("35f07670-706e-4bfb-9476-090798c5ebf3"), {
       {4, "XDisplayTryEnableHdrMode", nullptr, Z},
@@ -93,19 +67,6 @@ void add_system_interfaces(std::vector<Interface>& out) {
       {4, "XDisplayAcquireTimeoutDeferral", nullptr},
       {5, "XDisplayCloseTimeoutDeferralHandle", nullptr, Z},
   }});
-  out.push_back({"XNetworking", guid("37e56907-2f10-41e8-b72f-36edb185331a"),
-                 guid("bf2346b2-39af-4658-b5ea-44713c7e83b3"), {
-      {3, "XNetworkingQueryPreferredLocalUdpMultiplayerPort", nullptr},
-      {4, "XNetworkingQueryPreferredLocalUdpMultiplayerPortAsync", nullptr},
-      {5, "XNetworkingQueryPreferredLocalUdpMultiplayerPortAsyncResult", nullptr},
-      {8, "XNetworkingQuerySecurityInformationForUrlAsync", nullptr},
-      {9, "XNetworkingQuerySecurityInformationForUrlAsyncResultSize", nullptr},
-      {10, "XNetworkingQuerySecurityInformationForUrlAsyncResult", nullptr},
-      {14, "XNetworkingVerifyServerCertificate", nullptr},
-      {15, "XNetworkingGetConnectivityHint", nullptr},
-      {16, "XNetworkingRegisterConnectivityHintChanged", nullptr},
-      {17, "XNetworkingUnregisterConnectivityHintChanged", nullptr, Z},
-  }});
   out.push_back({"XSpeechSynthesizer", guid("3e241977-6237-41e9-8559-102c2d9983f1"),
                  guid("d722b373-8c4d-4692-9e51-d6ad9b37aa7d"), {
       {8, "XSpeechSynthesizerEnumerateInstalledVoices", nullptr},
@@ -142,14 +103,6 @@ void add_system_interfaces(std::vector<Interface>& out) {
       {28, "XGameSaveSubmitUpdateAsync", nullptr},
       {29, "XGameSaveSubmitUpdateResult", nullptr},
   }});
-  const GUID feature = guid("8836fe87-edb9-4fe3-8dad-05f0d2cd5b40");
-  out.push_back({"XGameRuntimeIsFeatureAvailable", feature, feature, {
-      {3, "XGameRuntimeIsFeatureAvailable", nullptr, Z},
-  }});
-  out.push_back({"XGame", guid("973a344e-24bf-4d0f-8457-56c534892b29"), guid("2549f142-6419-4a06-97b5-931aab7c2f34"), {
-      {3, "XGameGetXboxTitleId", nullptr},
-      {4, "XLaunchNewGame", nullptr, Z},
-  }});
   out.push_back({"XAppCapture", guid("a4f1aee2-4bf1-4485-b008-a7c26d52ac27"),
                  guid("22e672d7-b4e3-406c-bd50-8f0d25236f9e"), {
       {5, "XAppCaptureTakeScreenshot", nullptr},
@@ -174,25 +127,12 @@ void add_system_interfaces(std::vector<Interface>& out) {
       {38, "XPackageMountWithUiResult", nullptr},
       {39, "XPackageEnumeratePackages", nullptr},
   }});
-  const GUID analytics = guid("b884675d-b738-4a9c-815d-9a9a1e0c6c9b");
-  out.push_back({"XSystem (analytics)", analytics, analytics, {
-      {3, "XSystemGetAnalyticsInfo", nullptr, Z},
-  }});
-  const GUID event = guid("bbfbdcc7-bfe7-409b-a5ca-edf054960b4d");
-  out.push_back({"XGameEvent", event, event, {
-      {3, "XGameEventWrite", nullptr},
-  }});
   out.push_back({"XGameUi", guid("dfcd4649-4ff8-4043-ba07-35d607df98b0"), guid("eaf669df-5542-4590-99a3-8dc061f837cc"), {
       {7, "XGameUiShowPlayerProfileCardAsync", nullptr},
       {8, "XGameUiShowPlayerProfileCardResult", nullptr},
       {17, "XGameUiShowTextEntryAsync", nullptr},
       {18, "XGameUiShowTextEntryResultSize", nullptr},
       {19, "XGameUiShowTextEntryResult", nullptr},
-  }});
-  out.push_back({"XSystem", guid("e349bd1a-fc20-4e40-b99c-4178cc6b409f"), guid("1861cf2e-e18b-4834-a9f5-b4a4e6efb4cf"), {
-      {3, "XSystemGetConsoleId", nullptr},
-      {4, "XSystemGetXboxLiveSandboxId", nullptr},
-      {5, "XSystemGetAppSpecificDeviceId", nullptr},
   }});
   out.push_back({"XPersistentLocalStorage", guid("f4faf4d4-2d04-4fce-b3e0-474a713a3e84"),
                  guid("41a4e10c-5a7e-41d9-8c37-37bde62a07d6"), {

@@ -370,7 +370,8 @@ void* TitleProcess::resolve_import(std::string_view dll_view, std::string_view f
 
   switch (policy_.route(dll, fn)) {
     case loader::Route::Ours:
-      if (const hle::Function* f = registry_.find(dll, fn)) return f->address;
+      // By name, or as "#<ordinal>" for functions a console module exports by ordinal only.
+      if (const hle::Function* f = registry_.find(dll, fn.empty() ? label : fn)) return f->address;
       return stubs_.stub(dll, label, "console function not implemented yet");
     case loader::Route::Wrap:
       if (const hle::Function* f = registry_.find_wrapper(fn)) return f->address;

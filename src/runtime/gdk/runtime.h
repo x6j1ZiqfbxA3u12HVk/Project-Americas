@@ -64,7 +64,8 @@ struct Interface {
 
 // Each area adds its interfaces.
 void add_task_queue_interfaces(std::vector<Interface>& out);
-void add_system_interfaces(std::vector<Interface>& out);
+void add_offline_interfaces(std::vector<Interface>& out);
+void add_system_interfaces(std::vector<Interface>& out);  // the catalogue of areas not done yet
 
 // The xgameruntime.dll exports, for the import registry.
 void add_runtime_exports(std::vector<hle::Function>& out);
