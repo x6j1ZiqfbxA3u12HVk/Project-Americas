@@ -105,6 +105,41 @@ void check_console_memory() {
         "XMemGetWorkingSetStatistics: a budget above what is used");
 }
 
+// XGameRuntime as the GDK reaches it: the DLL by name, its functions by GetProcAddress, an
+// area's object from QueryApiImpl, then one vtable slot with the object first.
+int g_runtime_callbacks = 0;
+void CALLBACK runtime_callback(void* context, bool canceled) {
+  if (context == &g_runtime_callbacks && !canceled) ++g_runtime_callbacks;
+}
+
+void check_runtime() {
+  HMODULE runtime = LoadLibraryExA("xgameruntime.dll", nullptr, 0x800);
+  check(runtime != nullptr, "LoadLibrary(xgameruntime.dll)");
+  using Init = long(WINAPI*)(unsigned long long, unsigned long long, unsigned long long, const void*);
+  using Query = long(WINAPI*)(const GUID*, const GUID*, void**);
+  auto init = reinterpret_cast<Init>(GetProcAddress(runtime, "InitializeApiImplEx2"));
+  auto query = reinterpret_cast<Query>(GetProcAddress(runtime, "QueryApiImpl"));
+  check(init && query && init(1, 2, 2, nullptr) == 0, "InitializeApiImplEx2");
+  if (!query) return;
+  const GUID area = {0x073b7dcb, 0x1fcf, 0x4030, {0x94, 0xbe, 0xe3, 0xc9, 0xeb, 0x62, 0x34, 0x28}};
+  void* object = nullptr;
+  check(query(&area, &area, &object) == 0 && object, "QueryApiImpl: the task queue area");
+  if (!object) return;
+  void** vtable = *static_cast<void***>(object);
+  using Create = long(WINAPI*)(void*, unsigned, unsigned, void**);
+  using Submit = long(WINAPI*)(void*, void*, unsigned, void*, void(CALLBACK*)(void*, bool));
+  using Dispatch = bool(WINAPI*)(void*, void*, unsigned, unsigned);
+  using Close = void(WINAPI*)(void*, void*);
+  void* queue = nullptr;
+  check(reinterpret_cast<Create>(vtable[12])(object, 0, 0, &queue) == 0 && queue, "XTaskQueueCreate (manual)");
+  reinterpret_cast<Submit>(vtable[18])(object, queue, 0, &g_runtime_callbacks, &runtime_callback);
+  const bool ran = reinterpret_cast<Dispatch>(vtable[16])(object, queue, 0, 0);
+  check(ran && g_runtime_callbacks == 1, "XTaskQueueSubmitCallback + XTaskQueueDispatch");
+  reinterpret_cast<Close>(vtable[17])(object, queue);
+  const GUID user = {0x01acd177, 0x91f9, 0x4763, {0xa3, 0x8e, 0xcc, 0xbb, 0x55, 0xce, 0x32, 0xe0}};
+  check(query(&user, &user, &object) < 0 && !object, "QueryApiImpl refuses an area not implemented");
+}
+
 }  // namespace
 
 #pragma comment(linker, "/INCLUDE:_tls_used")
@@ -156,6 +191,7 @@ int main(int argc, char** argv) {
 
   check(AcpHalCreate(nullptr, nullptr) == nullptr, "unimplemented console import returns 0");
   check_console_memory();
+  check_runtime();
   check(am_fixture_dll_value() == 1234, "title DLL export");
   check(am_fixture_dll_attach_count() == 1, "title DLL: DllMain process attach, once");
   check(am_fixture_dll_tls_on_new_thread() == 99, "title DLL: static TLS on a new thread");

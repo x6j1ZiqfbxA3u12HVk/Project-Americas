@@ -1,6 +1,7 @@
 #include "runtime/hle/registry.h"
 
 #include "core/text.h"
+#include "runtime/gdk/runtime.h"
 
 namespace am::rt::hle {
 
@@ -10,6 +11,7 @@ Registry::Registry() {
   add_network(functions_);
   add_memory(functions_);
   add_graphics(functions_);
+  gdk::add_runtime_exports(functions_);
 }
 
 const Function* Registry::find(std::string_view module, std::string_view name) const {

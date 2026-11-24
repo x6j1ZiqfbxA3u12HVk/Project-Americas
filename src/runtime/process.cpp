@@ -1,6 +1,7 @@
 #include "runtime/process.h"
 
 #include <intrin.h>
+#include <tlhelp32.h>
 
 #include <algorithm>
 #include <cstdio>
@@ -9,6 +10,7 @@
 #include "core/json.h"
 #include "core/text.h"
 #include "runtime/console.h"
+#include "runtime/gdk/runtime.h"
 #include "runtime/host_patch.h"
 #include "runtime/launcher_api.h"
 #include "runtime/log.h"
@@ -239,6 +241,7 @@ bool TitleProcess::initialize(MappedImage& m, std::string& error) {
       return false;
     }
   }
+  mark_ready(&m);
   logf("initialized %s", m.name.c_str());
   return true;
 }
@@ -250,6 +253,7 @@ int TitleProcess::run() {
   }
   call_tls_callbacks(*exe_, DLL_PROCESS_ATTACH);
   exe_->initialized = true;
+  mark_ready(exe_);
   using Entry = int(__cdecl*)(void*);
   auto entry = reinterpret_cast<Entry>(exe_->base + exe_->info.entry_rva);
   logf("starting %s", exe_->name.c_str());
@@ -257,14 +261,10 @@ int TitleProcess::run() {
 }
 
 void TitleProcess::on_thread(unsigned long reason) {
-  std::vector<MappedImage*> modules;
-  {
-    std::lock_guard<std::recursive_mutex> lock(mutex_);
-    for (const auto& m : modules_) {
-      if (m->initialized) modules.push_back(m.get());
-    }
-  }
-  for (MappedImage* m : modules) {
+  const size_t n = image_count_.load(std::memory_order_acquire);
+  for (size_t i = 0; i < n; ++i) {
+    if (!ready_[i].load(std::memory_order_acquire)) continue;
+    MappedImage* m = images_[i].load(std::memory_order_acquire);
     call_tls_callbacks(*m, reason);
     if (m != exe_ && m->thread_calls && m->info.entry_rva) {
       using DllMain = BOOL(WINAPI*)(HINSTANCE, DWORD, LPVOID);
@@ -291,6 +291,13 @@ MappedImage* TitleProcess::module_containing(const void* address) {
     if (m && m->contains(address)) return m;
   }
   return nullptr;
+}
+
+void TitleProcess::mark_ready(const MappedImage* m) {
+  const size_t n = image_count_.load(std::memory_order_acquire);
+  for (size_t i = 0; i < n; ++i) {
+    if (images_[i].load(std::memory_order_acquire) == m) ready_[i].store(true, std::memory_order_release);
+  }
 }
 
 void TitleProcess::publish(MappedImage* m) {
@@ -466,6 +473,68 @@ long TitleProcess::crash_filter(EXCEPTION_POINTERS* info) {
   return EXCEPTION_EXECUTE_HANDLER;
 }
 
+void TitleProcess::dump_threads() {
+  struct Captured {
+    DWORD id;
+    uint64_t frames[40];
+    int count;
+  };
+  std::vector<DWORD> ids;
+  const DWORD self = GetCurrentThreadId();
+  HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+  if (snapshot != INVALID_HANDLE_VALUE) {
+    THREADENTRY32 te{};
+    te.dwSize = sizeof te;
+    for (BOOL ok = Thread32First(snapshot, &te); ok; ok = Thread32Next(snapshot, &te)) {
+      if (te.th32OwnerProcessID == GetCurrentProcessId() && te.th32ThreadID != self) ids.push_back(te.th32ThreadID);
+    }
+    CloseHandle(snapshot);
+  }
+  std::vector<Captured> captured(ids.size());
+  std::string text = "threads: " + std::to_string(ids.size()) + " besides the reporting one\n";
+  for (size_t i = 0; i < ids.size(); ++i) {
+    Captured& c = captured[i];
+    c.id = ids[i];
+    c.count = 0;
+    HANDLE t = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_LIMITED_INFORMATION, FALSE, c.id);
+    if (!t) continue;
+    // Nothing that allocates while the thread is stopped: it may hold the heap's lock.
+    if (SuspendThread(t) != static_cast<DWORD>(-1)) {
+      CONTEXT ctx{};
+      ctx.ContextFlags = CONTEXT_FULL;
+      if (GetThreadContext(t, &ctx)) {
+        for (; c.count < 40 && ctx.Rip; ++c.count) {
+          c.frames[c.count] = ctx.Rip;
+          DWORD64 image_base = 0;
+          PRUNTIME_FUNCTION fn = RtlLookupFunctionEntry(ctx.Rip, &image_base, nullptr);
+          if (!fn) {
+            if (c.count) break;
+            // A leaf function (a system call stub): its return address is on top of the stack.
+            ctx.Rip = *reinterpret_cast<const DWORD64*>(ctx.Rsp);
+            ctx.Rsp += 8;
+            continue;
+          }
+          void* handler_data = nullptr;
+          DWORD64 establisher = 0;
+          RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, ctx.Rip, fn, &ctx, &handler_data, &establisher, nullptr);
+        }
+      }
+      ResumeThread(t);
+    }
+    PWSTR name = nullptr;
+    std::string label;
+    if (SUCCEEDED(GetThreadDescription(t, &name)) && name) {
+      label = narrow(name);
+      LocalFree(name);
+    }
+    CloseHandle(t);
+    text += "\nthread " + std::to_string(c.id) + (label.empty() ? "" : " \"" + label + "\"") + ":";
+    for (int k = 0; k < c.count; ++k) text += "\n    " + describe_address(c.frames[k]);
+  }
+  std::ofstream(options_.logs_dir / L"hang.txt", std::ios::binary) << text << '\n';
+  logf("hang.txt: stacks of %zu threads", ids.size());
+}
+
 void TitleProcess::write_report() const {
   JsonWriter j;
   j.begin_object();
@@ -499,6 +568,8 @@ void TitleProcess::write_report() const {
       .field("physical_committed", ms.physical_committed).field("views", ms.views).field("map_calls", ms.map_calls)
       .field("reservations", ms.reservations).field("regions", ms.regions).field("refused", ms.refused);
   j.end_object();
+  j.key("runtime");
+  gdk::write_runtime_report(j);
   j.key("passthrough").begin_array();
   for (const hle::Function& f : registry_.all()) {
     if (f.passthrough) j.value(f.name);

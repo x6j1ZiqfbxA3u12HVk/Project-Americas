@@ -80,7 +80,10 @@ bool limit_memory(uint64_t mib) {
 DWORD WINAPI watchdog(void* seconds) {
   Sleep(static_cast<DWORD>(reinterpret_cast<uintptr_t>(seconds)) * 1000);
   rt::logf("timeout: ending the run after %llu s", static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(seconds)));
-  if (g_title) g_title->write_report();
+  if (g_title) {
+    g_title->dump_threads();
+    g_title->write_report();
+  }
   TerminateProcess(GetCurrentProcess(), 3);
   return 0;
 }

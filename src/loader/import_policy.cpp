@@ -28,7 +28,7 @@ constexpr std::string_view kHostModules[] = {
     "advapi32.dll", "bcrypt.dll",     "combase.dll",  "concrt140.dll",   "crypt32.dll",  "dbghelp.dll",
     "dnsapi.dll",   "gdi32.dll",      "iphlpapi.dll", "kernel32.dll",    "kernelbase.dll", "mf.dll",
     "mfplat.dll",   "mfreadwrite.dll", "msvcp140.dll", "msvcp140_1.dll", "msvcp140_2.dll", "msvcp140_atomic_wait.dll",
-    "msvcp140_codecvt_ids.dll", "ntdll.dll", "ole32.dll", "oleaut32.dll", "secur32.dll", "shell32.dll",
+    "msvcp140_codecvt_ids.dll", "ntdll.dll", "ole32.dll", "oleaut32.dll", "rpcrt4.dll", "secur32.dll", "shell32.dll",
     "shlwapi.dll",  "ucrtbase.dll",   "user32.dll",   "vccorlib140.dll", "vcomp140.dll", "vcruntime140.dll",
     "vcruntime140_1.dll", "version.dll", "winhttp.dll", "ws2_32.dll", "xaudio2_9.dll",
 };

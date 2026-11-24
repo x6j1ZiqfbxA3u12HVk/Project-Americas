@@ -75,6 +75,8 @@ class TitleProcess {
 
   // report.json: what the title called that we do not provide yet.
   void write_report() const;
+  // logs\hang.txt: every other thread's name and unwound stack (when a run times out).
+  void dump_threads();
 
  private:
   MappedImage* require_module(std::string_view name, std::string& error);  // map + bind
@@ -98,7 +100,11 @@ class TitleProcess {
   static constexpr size_t kMaxImages = 256;
   std::array<std::atomic<MappedImage*>, kMaxImages> images_{};  // the same, readable without the lock
   std::atomic<size_t> image_count_{0};
+  // Set once an image is initialized: thread start and exit, which run under the loader lock,
+  // read these and never take mutex_ (a thread holding it may be waiting for the loader lock).
+  std::array<std::atomic<bool>, kMaxImages> ready_{};
   void publish(MappedImage* m);
+  void mark_ready(const MappedImage* m);
   std::map<const MappedImage*, std::vector<MappedImage*>> deps_;
   std::map<const MappedImage*, CpuCompatResult> cpu_;
   MappedImage* exe_ = nullptr;
