@@ -1,0 +1,24 @@
+# Build trees and generated output live under C:\Project Americas; these catch strays.
+/build/
+/out/
+/.vs/
+/CMakeUserPresets.json
+*.user
+
+# Game files and anything derived from them never belong in this repository.
+*.rpf
+*.ttpf
+*.xvd
+*.exe
+*.dll
+*.pdb
+*.lib
+*.bin
+*.dds
+*.bk2
+*.awc
+*.xml
+americas.ini
+
+# Python bytecode caches.
+__pycache__/
