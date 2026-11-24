@@ -25,7 +25,10 @@ add_library(am_runtime STATIC
   d3d12x/formats.cpp
   d3d12x/list.cpp
   d3d12x/object.cpp
+  d3d12x/pipeline.cpp
   d3d12x/queue.cpp
+  d3d12x/resource.cpp
+  d3d12x/root_signature.cpp
   d3d12x/views.cpp
   hle/files.cpp
   input/game_input.cpp

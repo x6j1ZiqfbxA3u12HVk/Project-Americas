@@ -8,6 +8,7 @@
 
 #include "runtime/d3d12x/object.h"
 #include "runtime/d3d12x/d3d12x.h"
+#include "runtime/d3d12x/root_signature.h"
 #include "runtime/log.h"
 
 namespace am::rt::d3d12x {
@@ -31,18 +32,6 @@ HRESULT WINAPI device_query_interface(Device* self, const GUID* iid, void** out)
     return S_OK;
   }
   return query_interface(self, iid, out);
-}
-
-// Struct-returning methods: the console's callers pass (return buffer, object, ...). Accept the
-// C++ order (object, return buffer, ...) too.
-template <class T>
-T* struct_return_args(uint64_t a0, uint64_t a1, Object*& self) {
-  if (is_object(reinterpret_cast<void*>(a1))) {
-    self = reinterpret_cast<Object*>(a1);
-    return reinterpret_cast<T*>(a0);
-  }
-  self = reinterpret_cast<Object*>(a0);
-  return reinterpret_cast<T*>(a1);
 }
 
 // Slot 26: GetCustomHeapProperties(node mask, heap type). The console's memory is unified: the
@@ -104,6 +93,30 @@ HRESULT WINAPI create_descriptor_heap_slot(Device*, const void* desc, const GUID
   return create_descriptor_heap(desc, riid, out);
 }
 
+// Slot 16: CreateRootSignature(node mask, blob, size, riid, out), as in D3D12.
+HRESULT WINAPI create_root_signature_slot(Device*, UINT node_mask, const void* data, SIZE_T size, const GUID* riid,
+                                          void** out) {
+  return create_root_signature(node_mask, data, size, riid, out);
+}
+
+// Slot 62: the console's compute pipeline creation: (D3D12_COMPUTE_PIPELINE_STATE_DESC, two
+// arguments passed as 0 so far, riid, out).
+HRESULT WINAPI create_compute_pipeline_x(Device*, const D3D12_COMPUTE_PIPELINE_STATE_DESC* desc, uint64_t extra0,
+                                         uint64_t extra1, const GUID* riid, void** out) {
+  return create_compute_pipeline(desc, extra0, extra1, riid, out);
+}
+
+// Slot 127: committed resource creation, shaped like D3D12's CreateCommittedResource3: (heap
+// properties, heap flags, description, initial barrier layout, clear value, protected session,
+// castable format count, castable formats, riid, out). The game asks for ID3D12Resource.
+HRESULT WINAPI create_committed_resource_x(Device* self, const D3D12_HEAP_PROPERTIES* heap, UINT heap_flags,
+                                           const D3D12_RESOURCE_DESC* desc, UINT initial_layout,
+                                           const D3D12_CLEAR_VALUE* clear, void* /*protected_session*/,
+                                           UINT /*castable_count*/, const DXGI_FORMAT* /*castable*/,
+                                           const GUID* riid, void** out) {
+  return create_committed_resource(self, heap, heap_flags, desc, initial_layout, clear, riid, out);
+}
+
 std::vector<Method> device_methods() {
   std::vector<Method> m = {
       {0, "QueryInterface", reinterpret_cast<void*>(&device_query_interface)},
@@ -111,10 +124,13 @@ std::vector<Method> device_methods() {
       {9, "CreateCommandAllocator", reinterpret_cast<void*>(&create_command_allocator)},
       {14, "CreateDescriptorHeap", reinterpret_cast<void*>(&create_descriptor_heap_slot)},
       {15, "GetDescriptorHandleIncrementSize", reinterpret_cast<void*>(&get_descriptor_handle_increment_size)},
+      {16, "CreateRootSignature", reinterpret_cast<void*>(&create_root_signature_slot)},
       {26, "GetCustomHeapProperties", reinterpret_cast<void*>(&get_custom_heap_properties)},
       {36, "CreateFence", reinterpret_cast<void*>(&create_fence_slot)},
       {48, "CreateCommandQueueX", reinterpret_cast<void*>(&create_command_queue_x)},
+      {62, "CreateComputePipelineStateX", reinterpret_cast<void*>(&create_compute_pipeline_x)},
       {73, "CreateCommandListX", reinterpret_cast<void*>(&create_command_list_x)},
+      {127, "CreateCommittedResourceX", reinterpret_cast<void*>(&create_committed_resource_x)},
   };
   add_view_methods(m);
   return m;

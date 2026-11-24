@@ -1,11 +1,12 @@
-// d3d12_xs.dll: Direct3D 12.X. D3D12ConfigureVirtualMemoryX here; the device and its objects in
-// runtime/d3d12x.
+// d3d12_xs.dll: Direct3D 12.X. D3D12ConfigureVirtualMemoryX here; the device, its objects and the
+// root signature serializer in runtime/d3d12x.
 
 #include <windows.h>
 
 #include <cstdint>
 
 #include "runtime/d3d12x/d3d12x.h"
+#include "runtime/d3d12x/root_signature.h"
 #include "runtime/hle/registry.h"
 #include "runtime/log.h"
 
@@ -29,6 +30,8 @@ void add_graphics(std::vector<Function>& out) {
   out.push_back(Function{"d3d12_xs.dll", "D3D12ConfigureVirtualMemoryX",
                          reinterpret_cast<void*>(&my_D3D12ConfigureVirtualMemoryX)});
   out.push_back(Function{"d3d12_xs.dll", "D3D12XboxCreateDevice", reinterpret_cast<void*>(&d3d12x::create_device)});
+  out.push_back(Function{"d3d12_xs.dll", "D3D12SerializeVersionedRootSignature",
+                         reinterpret_cast<void*>(&d3d12x::serialize_versioned_root_signature)});
 }
 
 }  // namespace am::rt::hle

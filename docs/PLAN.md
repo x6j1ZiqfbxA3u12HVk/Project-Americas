@@ -846,14 +846,17 @@ The device's slots, as learned so far:
 | 9 | CreateCommandAllocator | D3D12's |
 | 14 | CreateDescriptorHeap | D3D12's description followed by the memory's address and size: on the console a heap is title memory, and its start handle must be that address |
 | 15 | GetDescriptorHandleIncrementSize | 32 for resource views, 16 for samplers, 64 for render-target and depth (ours) |
+| 16 | CreateRootSignature | D3D12's; reads blobs in D3D12's serialized layout (raw, or a container's RTS0 part) |
 | 17–24 | the view creators, CopyDescriptors(Simple) | D3D12's order. Views write a tagged record into their descriptor slot; copies move memory |
 | 25 | GetResourceAllocationInfo | D3D12's sizing rules, including 4 KiB alignment for small textures |
 | 26 | GetCustomHeapProperties | the answers for a unified-memory adapter |
 | 36 | CreateFence | D3D12's |
 | 48 | CreateCommandQueueX | the console's own: 4 compute queues |
+| 62 | compute pipeline creation | `(D3D12_COMPUTE_PIPELINE_STATE_DESC, 0, 0, riid, out)`: the BVH builder's 40 pipelines |
 | 73 | CreateCommandListX | 16-byte description, allocator, initial pipeline, riid |
-| 127 | committed resource creation | heap properties, flags, description, state, clear value, protected session, riid, out: **next to implement** |
-| 70, 78, 79, 133 | not identified | probes; the game accepts their 0 |
+| 127 | committed resource creation | shaped like `CreateCommittedResource3`: heap properties, flags, description, initial barrier layout, clear value, protected session, castable formats (count, list), riid, out |
+| 27, 39, 41 | CreateCommittedResource, CreateQueryHeap, CreateCommandSignature | D3D12's order (seen in probes; not implemented yet) |
+| 61, 70, 74, 78, 79, 86, 133 | not identified | probes; the game accepts their 0. 74 takes the 6.1 GiB of physical pages the game maps (address, page count, out, protection) |
 
 Other objects:
 * **The DXGI view** (`IDXGIDevice`): adapter and output (the host's main display, reported at
@@ -863,15 +866,31 @@ Other objects:
 * **Command allocator.**
 * **Command list:** 4 KiB of console fields; the game calls its slots 9, 131 and 132 after
   creating it.
+* **Resource:** D3D12's `ID3D12Resource` slots (Map, Unmap, GetDesc, GetGPUVirtualAddress,
+  GetHeapProperties). Memory comes from `XMemAlloc` with the graphics allocator id (128),
+  large pages from 2 MiB, the alignment's power of two; zeroed unless `CREATE_NOT_ZEROED`.
+  The game's hook routes allocator 128 through handlers it pushes per thread: around its back
+  buffers, a bump allocator over a 64 MiB budget that takes only large-page requests, and an
+  assertion that the back buffers filled it to within 2 MiB. Everything else reaches
+  `XMemAllocDefault`.
+* **Root signatures:** `d3d12_xs!D3D12SerializeVersionedRootSignature` writes D3D12's
+  serialized layout (versions 1.0 to 1.2); the console's own flag bits (`0x3000000` in the BVH
+  builder's) pass through.
+* **Pipeline state:** keeps its root signature and a copy of the console shader container.
 
 Null back end: queues finish work at once and fences reach their value when signalled.
 
-**Where the game stops now.** It creates its back buffers (3840×2160 RGBA8, render target and
-unordered access) inside a 64 MiB memory budget it tracks itself, then asserts that the budget
-was used. On the console, the graphics runtime gets a committed resource's memory through the
-game's `XMemAlloc` hooks, which do that accounting. So the next step is resources: slot 127,
-with memory through the title's hooks (`memory/default_alloc`, `hle/xmem.cpp`), GPU virtual
-addresses equal to CPU addresses (unified memory), Map / Unmap / GetGPUVirtualAddress.
+**Physical pages commit on first touch.** The game maps 6.1 GiB of physical pages at once
+(its streaming heap). Committing them at map time passed the run's memory limit, and on a
+16 GB PC would take most of the system's commit. A mapped page is now committed by a fault
+handler when first touched; `XMemVirtualQuery` and `VirtualQuery` show mapped pages as
+committed; title `ReadFile` / `WriteFile` (the kernel cannot fault pages in) commit their
+buffers first.
+
+**Where the game stops now.** The console texture layout library, `xg_xs.dll`:
+`XGSuggestSwizzleMode` and `XGCreateTextureComputer` (its address computer object). The game
+sizes and places its textures with it, so the layouts must be the console GPU's own (the
+texture data on disk is laid out for them).
 
 ### Local tools (in `C:\Project Americas\tools`, never in the repository)
 
@@ -886,7 +905,7 @@ addresses equal to CPU addresses (unified memory), Map / Unmap / GetGPUVirtualAd
 
 
 Next, in parallel:
-* **M2.** The D3D12.X device (M2.4): resources through the title's memory hooks (the current
+* **M2.** The D3D12.X device (M2.4): the console texture layouts (`xg_xs.dll`, the current
   stop), then the rest of the device and command list slots the game reaches, `PresentX`,
   frame pacing and a window; threads and topology, GameInput devices, and the remaining
   XGameRuntime areas (XPackage, XPersistentLocalStorage, XDisplay HDR) as the game reaches

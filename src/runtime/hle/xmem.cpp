@@ -10,6 +10,7 @@
 #include "core/text.h"
 #include "runtime/console.h"
 #include "runtime/hle/registry.h"
+#include "runtime/hle/xmem.h"
 #include "runtime/log.h"
 #include "runtime/memory/default_alloc.h"
 #include "runtime/memory/title_memory.h"
@@ -51,12 +52,23 @@ struct XMemBasicInformation {
 };
 static_assert(offsetof(XMemBasicInformation, flags) == 0x30 && sizeof(XMemBasicInformation) == 0x40);
 
+// Mapped physical pages commit on first touch (memory/title_memory.h); to the title they are
+// committed from the moment they are mapped, as on the console.
+void show_physical_pages_committed(MEMORY_BASIC_INFORMATION& m) {
+  uint32_t protection = 0;
+  if (m.State == MEM_RESERVE && title_memory().in_physical_view(m.BaseAddress, &protection)) {
+    m.State = MEM_COMMIT;
+    m.Protect = protection;
+  }
+}
+
 BOOL WINAPI my_XMemVirtualQuery(HANDLE process, const void* address, XMemBasicInformation* out) {
   if (!out) {
     SetLastError(ERROR_INVALID_PARAMETER);
     return FALSE;
   }
   if (!VirtualQueryEx(process, address, &out->host, sizeof out->host)) return FALSE;
+  if (is_self(process)) show_physical_pages_committed(out->host);
   out->flags = out->host.State == MEM_FREE ? 0 : title_memory().xmem_flags(address);
   out->tag = 0;
   return TRUE;
@@ -99,12 +111,45 @@ BOOL WINAPI my_VirtualProtectEx(HANDLE process, LPVOID address, SIZE_T size, DWO
   }
   return my_VirtualProtect(address, size, protect, old);
 }
-// The host's answers. Physical pages mapped into a reservation show as mapped views.
+// The host's answers. Physical pages mapped into a reservation show as mapped views, committed.
 SIZE_T WINAPI my_VirtualQuery(LPCVOID address, PMEMORY_BASIC_INFORMATION out, SIZE_T size) {
-  return VirtualQuery(address, out, size);
+  const SIZE_T n = VirtualQuery(address, out, size);
+  if (n == sizeof(MEMORY_BASIC_INFORMATION)) show_physical_pages_committed(*out);
+  return n;
 }
 SIZE_T WINAPI my_VirtualQueryEx(HANDLE process, LPCVOID address, PMEMORY_BASIC_INFORMATION out, SIZE_T size) {
-  return VirtualQueryEx(process, address, out, size);
+  const SIZE_T n = VirtualQueryEx(process, address, out, size);
+  if (n == sizeof(MEMORY_BASIC_INFORMATION) && is_self(process)) show_physical_pages_committed(*out);
+  return n;
+}
+
+// ---- file reads and writes ----
+
+// The kernel reads and writes these buffers itself, where a never-touched physical page cannot
+// fault in: their pages are committed first.
+bool commit_buffer(const void* buffer, DWORD size) {
+  if (title_memory().commit_range(buffer, size)) return true;
+  SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+  return false;
+}
+
+BOOL WINAPI my_ReadFile(HANDLE file, LPVOID buffer, DWORD size, LPDWORD read, LPOVERLAPPED overlapped) {
+  if (!commit_buffer(buffer, size)) return FALSE;
+  return ReadFile(file, buffer, size, read, overlapped);
+}
+BOOL WINAPI my_ReadFileEx(HANDLE file, LPVOID buffer, DWORD size, LPOVERLAPPED overlapped,
+                          LPOVERLAPPED_COMPLETION_ROUTINE done) {
+  if (!commit_buffer(buffer, size)) return FALSE;
+  return ReadFileEx(file, buffer, size, overlapped, done);
+}
+BOOL WINAPI my_WriteFile(HANDLE file, LPCVOID buffer, DWORD size, LPDWORD written, LPOVERLAPPED overlapped) {
+  if (!commit_buffer(buffer, size)) return FALSE;
+  return WriteFile(file, buffer, size, written, overlapped);
+}
+BOOL WINAPI my_WriteFileEx(HANDLE file, LPCVOID buffer, DWORD size, LPOVERLAPPED overlapped,
+                           LPOVERLAPPED_COMPLETION_ROUTINE done) {
+  if (!commit_buffer(buffer, size)) return FALSE;
+  return WriteFileEx(file, buffer, size, overlapped, done);
 }
 
 // ---- XMemAlloc ----
@@ -218,6 +263,9 @@ BOOL WINAPI my_XMemTransferMemory(DWORD kind, SIZE_T size) {
 
 }  // namespace
 
+void* xmem_alloc(size_t size, uint64_t attributes) { return my_XMemAlloc(size, attributes); }
+void xmem_free(void* address, uint64_t attributes) { my_XMemFree(address, attributes); }
+
 void add_memory(std::vector<Function>& out) {
   out.insert(out.end(), {
       AM_XMEM(XMemVirtualAlloc), AM_XMEM(XMemVirtualQuery), AM_XMEM(XMemAlloc), AM_XMEM(XMemFree),
@@ -226,6 +274,7 @@ void add_memory(std::vector<Function>& out) {
       AM_XMEM(XMemGetWorkingSetStatistics), AM_XMEM(XMemIsToolsMemAvailable), AM_XMEM(XMemTransferMemory),
       AM_WRAP(VirtualAlloc), AM_WRAP(VirtualAllocEx), AM_WRAP(VirtualFree), AM_WRAP(VirtualFreeEx),
       AM_WRAP(VirtualProtect), AM_WRAP(VirtualProtectEx), AM_WRAP(VirtualQuery), AM_WRAP(VirtualQueryEx),
+      AM_WRAP(ReadFile), AM_WRAP(ReadFileEx), AM_WRAP(WriteFile), AM_WRAP(WriteFileEx),
   });
 }
 

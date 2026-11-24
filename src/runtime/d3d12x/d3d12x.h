@@ -3,6 +3,7 @@
 // d3d12_xs.dll's entry points (plan, section 5.5).
 
 #include <windows.h>
+#include <d3d12.h>
 
 #include <cstdint>
 #include <vector>
@@ -28,6 +29,20 @@ uint32_t descriptor_size(uint32_t type);
 struct Method;
 // views.cpp: device slots 17-25 (views, descriptor copies, GetResourceAllocationInfo).
 void add_view_methods(std::vector<Method>& out);
+
+// views.cpp: the bytes and alignment a resource needs (GetResourceAllocationInfo's rules).
+D3D12_RESOURCE_ALLOCATION_INFO allocation_info(const D3D12_RESOURCE_DESC& d);
+
+// resource.cpp: committed resources, their memory taken through XMemAlloc as on the console.
+HRESULT create_committed_resource(Object* device, const D3D12_HEAP_PROPERTIES* heap, uint32_t heap_flags,
+                                  const D3D12_RESOURCE_DESC* desc, uint32_t initial_layout,
+                                  const D3D12_CLEAR_VALUE* clear, const GUID* riid, void** out);
+// The XMemAlloc attributes for a resource's memory of `size` bytes at `alignment`.
+uint64_t resource_attributes(uint64_t size, uint64_t alignment);
+
+// pipeline.cpp: compute pipelines (device slot 62; the two extra arguments are kept).
+HRESULT create_compute_pipeline(const D3D12_COMPUTE_PIPELINE_STATE_DESC* desc, uint64_t extra0, uint64_t extra1,
+                                const GUID* riid, void** out);
 
 // descriptor_heap.cpp: the console's description (D3D12's, then memory address and size).
 HRESULT create_descriptor_heap(const void* desc, const GUID* riid, void** out);

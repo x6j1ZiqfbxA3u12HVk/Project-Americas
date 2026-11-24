@@ -72,6 +72,28 @@ void log_commit_failure(uint64_t bytes, DWORD error) {
        format_bytes(uint64_t{perf.CommitLimit} * perf.PageSize).c_str());
 }
 
+// Every live TitleMemory, for the fault handler (tests make several).
+std::mutex g_instances_mutex;
+std::vector<TitleMemory*> g_instances;
+
+LONG CALLBACK on_access_violation(EXCEPTION_POINTERS* info) {
+  const EXCEPTION_RECORD* e = info->ExceptionRecord;
+  if (e->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || e->NumberParameters < 2) return EXCEPTION_CONTINUE_SEARCH;
+  std::lock_guard<std::mutex> lock(g_instances_mutex);
+  for (TitleMemory* m : g_instances) {
+    if (m->commit_on_fault(e->ExceptionInformation[1], e->ExceptionInformation[0])) return EXCEPTION_CONTINUE_EXECUTION;
+  }
+  return EXCEPTION_CONTINUE_SEARCH;
+}
+
+bool access_allowed(uint32_t protection, uint64_t kind) {
+  const uint32_t p = protection & 0xFF;
+  if (protection & PAGE_GUARD) return false;
+  if (kind == 1) return p == PAGE_READWRITE || p == PAGE_WRITECOPY || p == PAGE_EXECUTE_READWRITE || p == PAGE_EXECUTE_WRITECOPY;
+  if (kind == 8) return p == PAGE_EXECUTE || p == PAGE_EXECUTE_READ || p == PAGE_EXECUTE_READWRITE || p == PAGE_EXECUTE_WRITECOPY;
+  return p != PAGE_NOACCESS && p != PAGE_EXECUTE;
+}
+
 }  // namespace
 
 bool host_supports_placeholders() {
@@ -90,9 +112,18 @@ void* allocate_title_range(uint64_t size, uint32_t type, uint32_t protect) {
   return placeholders().virtual_alloc2(GetCurrentProcess(), nullptr, size, type, protect, &parameter, 1);
 }
 
-TitleMemory::TitleMemory(MemoryOptions options) : options_(options) {}
+TitleMemory::TitleMemory(MemoryOptions options) : options_(options) {
+  static std::once_flag once;
+  std::call_once(once, [] { AddVectoredExceptionHandler(1, &on_access_violation); });
+  std::lock_guard<std::mutex> lock(g_instances_mutex);
+  g_instances.push_back(this);
+}
 
 TitleMemory::~TitleMemory() {
+  {
+    std::lock_guard<std::mutex> lock(g_instances_mutex);
+    std::erase(g_instances, this);
+  }
   std::lock_guard<std::mutex> lock(mutex_);
   const auto regions = regions_;
   for (const auto& [base, r] : regions) {
@@ -384,30 +415,117 @@ bool TitleMemory::map_view(uint64_t at, uint64_t pages, uint64_t first) {
     if (view) placeholders().unmap_view(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER);
     return false;
   }
-  if (!commit_allowed(first, pages) || !VirtualAlloc(view, len, MEM_COMMIT, PAGE_READWRITE)) {
+  views_[at] = View{len, first};
+  uint64_t low = views_low_.load(), high = views_high_.load();
+  while (at < low && !views_low_.compare_exchange_weak(low, at)) {
+  }
+  while (at + len > high && !views_high_.compare_exchange_weak(high, at + len)) {
+  }
+  // Pages touched before show at once (commit belongs to the section) and get the reservation's
+  // protection here; the others get it when first touched.
+  const uint32_t protection = view_protection(at);
+  if (protection != PAGE_READWRITE) {
+    for (uint64_t k = 0; k < pages;) {
+      if (!test_bit(committed_, first + k)) {
+        ++k;
+        continue;
+      }
+      uint64_t run = 1;
+      while (k + run < pages && test_bit(committed_, first + k + run)) ++run;
+      DWORD old = 0;
+      if (!VirtualProtect(ptr(at + k * kPage), run * kPage, protection, &old)) {
+        logf("memory: protection 0x%s for physical pages at 0x%s refused (error %lu)", hex(protection).c_str(),
+             hex(at + k * kPage).c_str(), GetLastError());
+      }
+      k += run;
+    }
+  }
+  return true;
+}
+
+uint32_t TitleMemory::view_protection(uint64_t at) const {
+  uint64_t base = 0;
+  const Region* r = region_at(at, &base);
+  return r && r->cpu_protect ? r->cpu_protect : PAGE_READWRITE;
+}
+
+const TitleMemory::View* TitleMemory::view_at(uint64_t address, uint64_t* at) const {
+  auto it = views_.upper_bound(address);
+  if (it == views_.begin()) return nullptr;
+  --it;
+  if (address - it->first >= it->second.size) return nullptr;
+  *at = it->first;
+  return &it->second;
+}
+
+bool TitleMemory::commit_page(uint64_t at, const View& view, uint64_t page) {
+  const uint64_t index = view.first + page;
+  if (test_bit(committed_, index)) return true;
+  if (!commit_allowed(index, 1)) return false;
+  void* p = ptr(at + page * kPage);
+  if (!VirtualAlloc(p, kPage, MEM_COMMIT, PAGE_READWRITE)) {
     const DWORD error = GetLastError();
-    if (error != ERROR_COMMITMENT_LIMIT || !options_.commit_cap) log_commit_failure(len, error);
-    placeholders().unmap_view(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER);
+    log_commit_failure(kPage, error);
     SetLastError(error);
     return false;
   }
-  for (uint64_t i = first; i < first + pages; ++i) {
-    if (!test_bit(committed_, i)) {
-      set_bit(committed_, i);
-      ++committed_count_;
-    }
-  }
-  uint64_t base = 0;
-  const Region* r = region_at(at, &base);
-  const uint32_t protection = r ? r->cpu_protect : PAGE_READWRITE;
+  set_bit(committed_, index);
+  ++committed_count_;
+  const uint32_t protection = view_protection(at);
   if (protection != PAGE_READWRITE) {
     DWORD old = 0;
-    if (!VirtualProtect(view, len, protection, &old)) {
-      logf("memory: protection 0x%s for physical pages at 0x%s refused (error %lu)", hex(protection).c_str(),
-           hex(at).c_str(), GetLastError());
+    VirtualProtect(p, kPage, protection, &old);
+  }
+  return true;
+}
+
+bool TitleMemory::commit_on_fault(uint64_t address, uint64_t kind) {
+  if (address < views_low_.load(std::memory_order_relaxed) || address >= views_high_.load(std::memory_order_relaxed)) {
+    return false;
+  }
+  std::lock_guard<std::mutex> lock(mutex_);
+  uint64_t at = 0;
+  const View* v = view_at(address, &at);
+  if (!v) return false;
+  const uint64_t page = (address - at) / kPage;
+  if (test_bit(committed_, v->first + page)) {
+    // Committed already: another thread got here first (the access can run again), or the
+    // page's protection refuses this access (a real fault).
+    MEMORY_BASIC_INFORMATION mbi;
+    return VirtualQuery(ptr(address), &mbi, sizeof mbi) == sizeof mbi && mbi.State == MEM_COMMIT &&
+           access_allowed(mbi.Protect, kind);
+  }
+  return commit_page(at, *v, page);
+}
+
+bool TitleMemory::commit_range(const void* address, uint64_t size) {
+  const uint64_t a = reinterpret_cast<uint64_t>(address);
+  if (!size || a + size <= views_low_.load(std::memory_order_relaxed) ||
+      a >= views_high_.load(std::memory_order_relaxed)) {
+    return true;
+  }
+  std::lock_guard<std::mutex> lock(mutex_);
+  const uint64_t end = a + size;
+  auto it = views_.upper_bound(a);
+  if (it != views_.begin() && std::prev(it)->first + std::prev(it)->second.size > a) --it;
+  for (; it != views_.end() && it->first < end; ++it) {
+    const uint64_t at = it->first;
+    const uint64_t from = (std::max(a, at) - at) / kPage;
+    const uint64_t to = (std::min(end, at + it->second.size) - at + kPage - 1) / kPage;
+    for (uint64_t page = from; page < to; ++page) {
+      if (!commit_page(at, it->second, page)) return false;
     }
   }
-  views_[at] = View{len, first};
+  return true;
+}
+
+bool TitleMemory::in_physical_view(const void* address, uint32_t* protection) const {
+  const uint64_t a = reinterpret_cast<uint64_t>(address);
+  if (a < views_low_.load(std::memory_order_relaxed) || a >= views_high_.load(std::memory_order_relaxed)) return false;
+  std::lock_guard<std::mutex> lock(mutex_);
+  uint64_t at = 0;
+  if (!view_at(a, &at)) return false;
+  if (protection) *protection = view_protection(at);
   return true;
 }
 

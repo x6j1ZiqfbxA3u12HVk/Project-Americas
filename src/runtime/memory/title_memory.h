@@ -5,7 +5,10 @@
 //
 // Physical pages are 64 KiB slices of one page-file-backed section the size of the console's
 // title memory. The section is reserved, not committed: a page costs commit only once it is
-// first mapped somewhere. The title maps pages into its own reservations, at several addresses
+// first touched. A mapped page that was never touched faults once; the fault handler commits it
+// and the access runs again (the game maps 6 GiB of pages at start-up and fills them over time).
+// Host calls that touch title memory in the kernel, where nothing faults, commit first
+// (commit_range). The title maps pages into its own reservations, at several addresses
 // if it likes, as on the console: each run of consecutive pages becomes one view of the section,
 // placed over a placeholder (VirtualAlloc2 + MapViewOfFile3).
 //
@@ -15,6 +18,7 @@
 #include <windows.h>
 
 #include <cstdint>
+#include <atomic>
 #include <map>
 #include <mutex>
 #include <vector>
@@ -33,7 +37,7 @@ struct MemoryStats {
   uint64_t physical_capacity = 0;   // bytes
   uint64_t physical_allocated = 0;  // bytes, now
   uint64_t physical_peak = 0;       // bytes, most at once
-  uint64_t physical_committed = 0;  // bytes of the pool ever mapped (commit stays with the section)
+  uint64_t physical_committed = 0;  // bytes of the pool ever touched (commit stays with the section)
   uint64_t views = 0;               // mapped views now
   uint64_t map_calls = 0;           // XMemMapPhysicalPages(Scatter) calls
   uint64_t reservations = 0;        // physical-page reservations now
@@ -73,6 +77,15 @@ class TitleMemory {
   // anywhere or not (DirectStorage destinations). False if a page is unknown.
   bool write_pages(const uint64_t* pages, uint64_t page_count, uint64_t offset, const uint8_t* data, uint64_t size);
 
+  // The fault handler's part: commits the never-touched physical page under `address` for an
+  // access of `kind` (0 read, 1 write, 8 execute). True when the access can run again.
+  bool commit_on_fault(uint64_t address, uint64_t kind);
+  // Commits the physical pages under [address, address + size) now. False (last error
+  // ERROR_COMMITMENT_LIMIT) when that would pass the memory limit.
+  bool commit_range(const void* address, uint64_t size);
+  // Whether `address` is in a view of physical pages, and the protection its pages get.
+  bool in_physical_view(const void* address, uint32_t* protection = nullptr) const;
+
   MemoryStats stats() const;
 
  private:
@@ -96,6 +109,9 @@ class TitleMemory {
   bool ensure_pool();
   bool page_index(uint64_t number, uint64_t* index) const;
   bool map_view(uint64_t at, uint64_t pages, uint64_t first);
+  const View* view_at(uint64_t address, uint64_t* at) const;
+  bool commit_page(uint64_t at, const View& view, uint64_t page);
+  uint32_t view_protection(uint64_t at) const;
   void unmap(uint64_t base, uint64_t size);
   bool release_physical(uint64_t base, uint64_t size);
   bool commit_allowed(uint64_t first, uint64_t pages);
@@ -110,6 +126,8 @@ class TitleMemory {
   std::vector<uint64_t> allocated_, committed_;  // bitmaps over the pool
   uint64_t allocated_count_ = 0, committed_count_ = 0, peak_ = 0, hint_ = 0;
   uint64_t map_calls_ = 0, refused_ = 0;
+  // Every address a view ever covered lies in [views_low_, views_high_): a cheap test first.
+  std::atomic<uint64_t> views_low_{UINT64_MAX}, views_high_{0};
 };
 
 // VirtualAlloc2, MapViewOfFile3 and UnmapViewOfFile2: Windows 10 1803 and later.

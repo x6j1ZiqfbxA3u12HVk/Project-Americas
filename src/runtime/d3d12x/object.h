@@ -98,6 +98,18 @@ T* make_object(const Kind& kind, Args&&... args) {
   return o;
 }
 
+// Struct-returning methods: the console's callers pass (return buffer, object, ...). Accept the
+// C++ order (object, return buffer, ...) too.
+template <class T>
+T* struct_return_args(uint64_t a0, uint64_t a1, Object*& self) {
+  if (is_object(reinterpret_cast<void*>(a1))) {
+    self = reinterpret_cast<Object*>(a1);
+    return reinterpret_cast<T*>(a0);
+  }
+  self = reinterpret_cast<Object*>(a0);
+  return reinterpret_cast<T*>(a1);
+}
+
 // Every kind adds itself here for the run report.
 void register_kind(Kind* k);
 void write_graphics_report(JsonWriter& j);

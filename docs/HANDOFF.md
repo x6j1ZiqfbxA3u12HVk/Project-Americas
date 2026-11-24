@@ -28,10 +28,16 @@ XPersistentLocalStorage and XDisplay HDR, not implemented yet (`gdk/catalog.cpp`
 * 5 descriptor heaps, the big one in its own memory;
 * null views.
 
-**It now stops at device slot 127, committed resource creation**: it builds its back buffers
-inside a 64 MiB budget it tracks through its own `XMemAlloc` hooks, and asserts at
-`+0x247af2d` because nothing was allocated through them. Next: resources, with memory through
-the title's hooks.
+**Resources, root signatures, pipelines (2026-11-24, late):** committed resources (slot 127)
+take their memory through the game's `XMemAlloc` hooks with the graphics allocator id, so its
+back-buffer budget check passes. The ray-tracing BVH builder (`XboxBvhBuilder.dll`) then
+serializes its root signatures through `d3d12_xs!D3D12SerializeVersionedRootSignature` (ours)
+and creates its 40 compute pipelines (slot 62). Physical pages now commit on first touch: the
+game maps 6.1 GiB of them at once, which eager commit could not hold in a 16 GB PC.
+
+**It now stops at the console texture layout library**, `xg_xs.dll`: `XGSuggestSwizzleMode`
+and `XGCreateTextureComputer`, not implemented, so it reads through a null texture computer
+at `+0x16f71fb`.
 
 **M3:** the RDNA 2 decoder is done and decodes all 26,084 console GPU programs of the corpus,
 checked against LLVM (100 % on 2.8 M instructions). Next there: the translator.
@@ -183,11 +189,11 @@ Set-Location "C:\Users\Admin\Documents\GitHub\Project Americas"; . .\scripts\env
      section 11, "M2.2");
   8. GameInput: its gamepad device callback (no devices yet);
   9. files and DirectStorage: it opens all its RPF archives (M2.3);
-  10. D3D12.X: device, queues, fences, command lists, DXGI view, descriptor heaps and views
-      (M2.4);
-  11. **it stops at device slot 127, committed resource creation:** its own assertion,
-      `int3` at `game_scarlett_master.exe+0x247af2d`, because no memory went through its
-      `XMemAlloc` hooks.
+  10. D3D12.X: device, queues, fences, command lists, DXGI view, descriptor heaps and views,
+      back buffers (committed resources), the BVH builder's root signatures and compute
+      pipelines, 6.1 GiB of physical pages mapped (M2.4);
+  11. **it stops at `xg_xs.dll`** (`XGSuggestSwizzleMode`, `XGCreateTextureComputer`): the
+      console's texture layouts.
 * **Memory facts** (PLAN.md, section 11, "M2.1", has the full table):
   * XMem's reference pages on learn.microsoft.com are NDA-only: read the game's code instead;
   * allocation type bit 29 means 2 MiB pages, bits 29 + 22 mean 64 KiB pages;
@@ -232,16 +238,16 @@ method the game calls.
 
 DirectStorage and files are done (PLAN.md section 11, "M2.3").
 
-1. **Resources (the current stop): device slot 127**, committed resource creation, `(heap
-   properties, heap flags, description, initial state, clear value, protected session, riid,
-   out)`.
-   * The memory must come through the title's `XMemAlloc` hooks, as on the console:
-     `__XMemAllocationHooks__`, reached through `hle/xmem.cpp` / `memory/default_alloc`. The
-     game counts its budgets there.
-   * GPU virtual address = CPU address (unified memory).
-   * The resource object needs `Map` / `Unmap` / `GetGPUVirtualAddress` / `GetDesc`. Learn
-     their slots from the probes, guided by `ID3D12Resource`'s order.
-   * Placed resources and heaps follow the same way.
+1. **Texture layouts (the current stop): `xg_xs.dll`.** The game imports
+   `XGSuggestSwizzleMode` and `XGCreateTextureComputer` only. The computer object answers a
+   texture's size, alignment and per-mip offsets; the game places its textures with them and
+   copies their data from disk, laid out for the console GPU. So the layouts must be the
+   console GPU's own (RDNA 2 swizzle modes), not ours: learn the object's methods from the
+   game's calls (probes, as for the device), and the layout rules from AMD's open address
+   library documentation.
+   * Resources so far: committed only (slot 127; D3D12's `CreateCommittedResource` at slot 27
+     is probed next to it). Placed resources and heaps follow, with slot 74 (the game hands
+     it its 6.1 GiB of physical pages) a likely heap creation.
 2. **The rest of D3D12.X with the null back end**, slot by slot as the game reaches them.
    * `report.json`'s `graphics` section and the `d3d12x: #N ... not implemented` log lines
      name each one with its arguments; D3D12's slot order is the first hypothesis.
@@ -360,6 +366,14 @@ RDNA 2 decoder decodes all 26,084 programs by control flow, checked against LLVM
   the text "AES-NI". `make_object` in `d3d12x/object.h` keeps our state in a header in front of
   the object.
 * **`small` is a macro in the Windows headers** (`#define small char`); don't use it as a name.
+* **Learn a console call's shape from its call site.** Slot 127 looked like
+  `CreateCommittedResource1` in the probe's log (7 arguments shown) but takes ten, like
+  `CreateCommittedResource3`: the extra ones are on the stack. Log `_ReturnAddress()` and a few
+  stack arguments once, then read the call site with `llvm-objdump`.
+* **Never commit memory the title only maps.** The game maps far more physical pages than it
+  touches early; a fault handler commits each page on first touch (`memory/title_memory.cpp`).
+  The kernel cannot fault pages in, so host calls that read or write title buffers in the
+  kernel (`ReadFile`, `WriteFile`, later the GPU's heaps) commit them first (`commit_range`).
 * **PowerShell after `. .\scripts\env.ps1`:** the script sets `$ErrorActionPreference = 'Stop'`
   for the session, so a native program writing to stderr ends the command. Run programs that
   log to stderr (the tests, `americas.exe`) through `cmd /c "... 2>nul"` or with redirects.

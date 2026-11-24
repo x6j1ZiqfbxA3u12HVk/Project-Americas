@@ -33,6 +33,8 @@ struct Record {
 };
 static_assert(sizeof(Record) == 16);
 
+uint64_t align_up(uint64_t v, uint64_t a) { return (v + a - 1) / a * a; }
+
 void write_record(uint64_t dest, ViewKind kind, uint32_t format, uint64_t resource) {
   if (!dest) return;
   Record r{kRecordMagic, kind, static_cast<uint16_t>(format), resource};
@@ -101,7 +103,33 @@ void WINAPI copy_descriptors_simple(Object*, UINT count, uint64_t dest, uint64_t
   std::memmove(reinterpret_cast<void*>(dest), reinterpret_cast<const void*>(src), uint64_t{count} * descriptor_size(type));
 }
 
-uint64_t align_up(uint64_t v, uint64_t a) { return (v + a - 1) / a * a; }
+// Slot 25: GetResourceAllocationInfo(visible mask, count, descriptions): struct return.
+D3D12_RESOURCE_ALLOCATION_INFO* WINAPI get_resource_allocation_info(uint64_t a0, uint64_t a1, UINT, UINT count,
+                                                                    const D3D12_RESOURCE_DESC* descs) {
+  D3D12_RESOURCE_ALLOCATION_INFO* out = reinterpret_cast<D3D12_RESOURCE_ALLOCATION_INFO*>(is_object(reinterpret_cast<void*>(a1)) ? a0 : a1);
+  uint64_t size = 0, alignment = 0;
+  for (UINT i = 0; descs && i < count; ++i) {
+    const D3D12_RESOURCE_ALLOCATION_INFO r = allocation_info(descs[i]);
+    if (r.SizeInBytes == UINT64_MAX) {
+      size = UINT64_MAX;
+      break;
+    }
+    alignment = std::max<uint64_t>(alignment, r.Alignment);
+    size = align_up(size, r.Alignment) + r.SizeInBytes;
+  }
+  *out = {size, alignment};
+  static std::atomic<int> logged{0};
+  if (logged.fetch_add(1) < 24 && descs && count) {
+    logf("d3d12x: GetResourceAllocationInfo(dim %u, %llux%u x%u, %u mips, format %u, %u samples, flags 0x%x, alignment %llu) = %llu bytes, alignment %llu",
+         descs[0].Dimension, static_cast<unsigned long long>(descs[0].Width), descs[0].Height, descs[0].DepthOrArraySize,
+         descs[0].MipLevels, descs[0].Format, descs[0].SampleDesc.Count, descs[0].Flags,
+         static_cast<unsigned long long>(descs[0].Alignment), static_cast<unsigned long long>(size),
+         static_cast<unsigned long long>(alignment));
+  }
+  return out;
+}
+
+}  // namespace
 
 // The bytes and alignment one resource needs, by D3D12's rules: buffers in 64 KiB units; textures
 // at 64 KiB (4 MiB when multisampled), or 4 KiB when the caller asks for it and the texture is
@@ -140,34 +168,6 @@ D3D12_RESOURCE_ALLOCATION_INFO allocation_info(const D3D12_RESOURCE_DESC& d) {
   if (d.Alignment == k4K && !target && samples == 1 && total <= k64K) alignment = k4K;
   return {align_up(total, alignment), alignment};
 }
-
-// Slot 25: GetResourceAllocationInfo(visible mask, count, descriptions): struct return.
-D3D12_RESOURCE_ALLOCATION_INFO* WINAPI get_resource_allocation_info(uint64_t a0, uint64_t a1, UINT, UINT count,
-                                                                    const D3D12_RESOURCE_DESC* descs) {
-  D3D12_RESOURCE_ALLOCATION_INFO* out = reinterpret_cast<D3D12_RESOURCE_ALLOCATION_INFO*>(is_object(reinterpret_cast<void*>(a1)) ? a0 : a1);
-  uint64_t size = 0, alignment = 0;
-  for (UINT i = 0; descs && i < count; ++i) {
-    const D3D12_RESOURCE_ALLOCATION_INFO r = allocation_info(descs[i]);
-    if (r.SizeInBytes == UINT64_MAX) {
-      size = UINT64_MAX;
-      break;
-    }
-    alignment = std::max<uint64_t>(alignment, r.Alignment);
-    size = align_up(size, r.Alignment) + r.SizeInBytes;
-  }
-  *out = {size, alignment};
-  static std::atomic<int> logged{0};
-  if (logged.fetch_add(1) < 24 && descs && count) {
-    logf("d3d12x: GetResourceAllocationInfo(dim %u, %llux%u x%u, %u mips, format %u, %u samples, flags 0x%x, alignment %llu) = %llu bytes, alignment %llu",
-         descs[0].Dimension, static_cast<unsigned long long>(descs[0].Width), descs[0].Height, descs[0].DepthOrArraySize,
-         descs[0].MipLevels, descs[0].Format, descs[0].SampleDesc.Count, descs[0].Flags,
-         static_cast<unsigned long long>(descs[0].Alignment), static_cast<unsigned long long>(size),
-         static_cast<unsigned long long>(alignment));
-  }
-  return out;
-}
-
-}  // namespace
 
 void add_view_methods(std::vector<Method>& out) {
   out.insert(out.end(), {

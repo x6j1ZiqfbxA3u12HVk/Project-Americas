@@ -98,8 +98,10 @@ TEST_CASE(memory_physical_pages_alias_and_unmap) {
   CHECK(pages[0] != pages[1] && pages[1] != pages[2] && pages[2] != pages[3]);
 
   CHECK(memory.map_pages(a, 4, pages) == a);
-  CHECK(state(a) == MEM_COMMIT);
+  CHECK(state(a) == MEM_RESERVE);  // mapped, committed on first touch
+  *at(a, 0) = 1;
   std::memset(at(a, 2 * kPage64K), 0x5A, kPage64K);
+  CHECK(state(a) == MEM_COMMIT && state(at(a, 2 * kPage64K)) == MEM_COMMIT && state(at(a, kPage64K)) == MEM_RESERVE);
   // The same physical page at a second address shows the same bytes.
   CHECK(memory.map_pages(b, 1, pages + 2) == b);
   CHECK(*at(b, 0) == 0x5A && *at(b, kPage64K - 1) == 0x5A);
@@ -114,6 +116,7 @@ TEST_CASE(memory_physical_pages_alias_and_unmap) {
   void* where[2] = {at(a, kPage64K), at(a, 3 * kPage64K)};
   const uint64_t scatter[2] = {pages[3], 0};
   CHECK(memory.map_pages_scatter(where, 2, scatter));
+  CHECK(*at(a, kPage64K) == 0);  // a page never touched reads as zero
   CHECK(state(at(a, kPage64K)) == MEM_COMMIT && state(at(a, 3 * kPage64K)) == MEM_RESERVE);
 
   uint64_t too_many[16] = {};
@@ -165,15 +168,54 @@ TEST_CASE(memory_large_pages_low_memory_and_release_size) {
   CHECK(!memory.allocate_pages(0, 1, &page));
 }
 
+// A touch the fault handler declines stays a fault.
+bool touch_faults(volatile uint8_t* p) {
+  __try {
+    *p = 1;
+    return false;
+  } __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
+    return true;
+  }
+}
+
 TEST_CASE(memory_commit_cap_refuses_cleanly) {
   TitleMemory memory({4 * kPage64K, 1});  // a cap no commit fits under
   void* a = memory.allocate(request(0, kMiB, 0x20402000, 0x21, PAGE_READWRITE));
   uint64_t page = 0;
   CHECK(a && memory.allocate_pages(0, 1, &page));
-  CHECK(memory.map_pages(a, 1, &page) == nullptr);
+  CHECK(memory.map_pages(a, 1, &page) == a);  // mapping costs nothing
+  CHECK(!memory.commit_range(a, 16));
   CHECK(GetLastError() == ERROR_COMMITMENT_LIMIT);
-  CHECK(state(a) == MEM_RESERVE);  // still a placeholder, ready for a later mapping
+  CHECK(touch_faults(at(a, 8)));
+  CHECK(state(a) == MEM_RESERVE);
   CHECK(memory.free(a, 0, MEM_RELEASE));
+}
+
+TEST_CASE(memory_physical_pages_commit_on_first_touch) {
+  TitleMemory memory({8 * kPage64K, 0});
+  void* a = memory.allocate(request(0, kMiB, 0x20402000, 0x21, PAGE_READWRITE));
+  void* b = memory.allocate(request(0, kMiB, 0x20402000, 0x21, PAGE_READWRITE));
+  uint64_t pages[3] = {};
+  CHECK(a && b && memory.allocate_pages(0, 3, pages));
+  CHECK(memory.map_pages(a, 3, pages) == a);
+  CHECK(memory.in_physical_view(at(a, 2 * kPage64K + 5)) && !memory.in_physical_view(at(a, 3 * kPage64K)));
+  CHECK(memory.stats().physical_committed == 0);
+
+  // A write commits its page only.
+  *at(a, kPage64K + 7) = 0x33;
+  CHECK(memory.stats().physical_committed == kPage64K);
+  // A page touched through one view is committed in every view of it, at once.
+  CHECK(memory.map_pages(b, 1, pages + 1) == b);
+  CHECK(state(b) == MEM_COMMIT && *at(b, 7) == 0x33);
+
+  // What the kernel will touch is committed up front: here pages 0 and 2, not 1 again.
+  CHECK(memory.commit_range(at(a, kPage64K - 1), kPage64K + 2));
+  CHECK(state(a) == MEM_COMMIT && state(at(a, 2 * kPage64K)) == MEM_COMMIT);
+  CHECK(memory.stats().physical_committed == 3 * kPage64K);
+  CHECK(memory.commit_range(at(a, 5 * kPage64K), 100));  // outside every view: nothing to do
+
+  CHECK(memory.free(a, 0, MEM_RELEASE) && memory.free(b, 0, MEM_RELEASE));
+  CHECK(memory.free_pages(3, pages));
 }
 
 TEST_CASE(memory_default_allocator) {

@@ -9,6 +9,7 @@
 
 #include "runtime/d3d12x/d3d12x.h"
 #include "runtime/d3d12x/object.h"
+#include "runtime/d3d12x/root_signature.h"
 #include "test.h"
 
 using namespace am::rt::d3d12x;
@@ -134,4 +135,102 @@ TEST_CASE(d3d12x_queue_signals_fence_at_once) {
   CHECK(WaitForSingleObject(event, 0) == WAIT_OBJECT_0);
   CloseHandle(event);
   CHECK(slot<ULONG(WINAPI*)(void*)>(fence, 2)(fence) == 0);  // released and freed
+}
+
+TEST_CASE(d3d12x_committed_resource_memory) {
+  void* device = make_device();
+  D3D12_HEAP_PROPERTIES heap{};
+  heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+  D3D12_RESOURCE_DESC desc{};
+  desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+  desc.Width = 3840;
+  desc.Height = 2160;
+  desc.DepthOrArraySize = 1;
+  desc.MipLevels = 1;
+  desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+  desc.SampleDesc.Count = 1;
+  desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+  using CreateFn = HRESULT(WINAPI*)(void*, const D3D12_HEAP_PROPERTIES*, UINT, const D3D12_RESOURCE_DESC*, UINT,
+                                    const D3D12_CLEAR_VALUE*, void*, UINT, const DXGI_FORMAT*, const GUID*, void**);
+  void* resource = nullptr;
+  CHECK(slot<CreateFn>(device, 127)(device, &heap, D3D12_HEAP_FLAG_ALLOW_DISPLAY, &desc, 3, nullptr, nullptr, 0, nullptr,
+                                     nullptr, &resource) == S_OK);
+  CHECK(resource != nullptr);
+
+  // Unified memory: the GPU address is where Map puts the CPU.
+  const uint64_t gpu = slot<uint64_t(WINAPI*)(void*)>(resource, 11)(resource);
+  void* cpu = nullptr;
+  CHECK(slot<HRESULT(WINAPI*)(void*, UINT, const D3D12_RANGE*, void**)>(resource, 8)(resource, 0, nullptr, &cpu) == S_OK);
+  CHECK(gpu != 0 && reinterpret_cast<uint64_t>(cpu) == gpu && gpu % 65536 == 0);
+  CHECK(static_cast<const uint8_t*>(cpu)[33177600 - 1] == 0);  // zeroed, and as large as it says
+
+  D3D12_RESOURCE_DESC back{};
+  slot<D3D12_RESOURCE_DESC*(WINAPI*)(D3D12_RESOURCE_DESC*, void*)>(resource, 10)(&back, resource);
+  CHECK(back.Width == 3840 && back.Height == 2160 && back.Format == DXGI_FORMAT_R8G8B8A8_UNORM);
+  CHECK(slot<ULONG(WINAPI*)(void*)>(resource, 2)(resource) == 0);
+
+  // The attributes the title's hooks dispatch on: the graphics runtime's allocator, large pages
+  // for big resources, the alignment as a power of two.
+  const uint64_t big = resource_attributes(33226752, 65536);
+  CHECK(((big >> 16) & 0xFF) == 128 && ((big >> 14) & 3) == 2 && ((big >> 24) & 0x1F) == 16);
+  const uint64_t medium = resource_attributes(65536, 65536);
+  CHECK(((medium >> 14) & 3) == 1);
+  CHECK(((resource_attributes(4096, 4096) >> 14) & 3) == 0);
+}
+
+TEST_CASE(d3d12x_root_signature_round_trip) {
+  // A 1.1 root signature: a table of two ranges, root constants, a root UAV, a static sampler,
+  // and a console flag bit, which must pass through.
+  D3D12_DESCRIPTOR_RANGE1 ranges[2] = {
+      {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 4, 0, 1, D3D12_DESCRIPTOR_RANGE_FLAG_DATA_STATIC, 0},
+      {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 2, 3, 0, D3D12_DESCRIPTOR_RANGE_FLAG_NONE, D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND},
+  };
+  D3D12_ROOT_PARAMETER1 params[3] = {};
+  params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+  params[0].DescriptorTable = {2, ranges};
+  params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+  params[1].Constants = {5, 0, 12};
+  params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+  params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+  params[2].Descriptor = {7, 2, D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE};
+  D3D12_STATIC_SAMPLER_DESC sampler{};
+  sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+  sampler.MaxLOD = 1000.0f;
+  sampler.ShaderRegister = 9;
+  D3D12_VERSIONED_ROOT_SIGNATURE_DESC desc{};
+  desc.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
+  desc.Desc_1_1 = {3, params, 1, &sampler, static_cast<D3D12_ROOT_SIGNATURE_FLAGS>(0x3000000)};
+
+  void* blob = nullptr;
+  void* error = reinterpret_cast<void*>(1);
+  CHECK(serialize_versioned_root_signature(&desc, &blob, &error) == S_OK);
+  CHECK(blob != nullptr && error == nullptr);
+  const void* data = slot<void*(WINAPI*)(void*)>(blob, 3)(blob);
+  const SIZE_T size = slot<SIZE_T(WINAPI*)(void*)>(blob, 4)(blob);
+  // 24 header + 3 x 12 parameters + (8 + 2 x 24) table + 12 constants + 12 descriptor + 52 sampler
+  CHECK(size == 24 + 36 + 56 + 12 + 12 + 52);
+
+  RootSignatureDesc back;
+  CHECK(parse_root_signature(data, size, back));
+  CHECK(back.version == 2 && back.flags == 0x3000000);
+  CHECK(back.parameters.size() == 3 && back.samplers.size() == 1);
+  CHECK(back.parameters[0].ranges.size() == 2 && back.parameters[0].ranges[1].base_register == 3);
+  CHECK(back.parameters[0].ranges[1].table_offset == D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND);
+  CHECK(back.parameters[0].ranges[0].flags == D3D12_DESCRIPTOR_RANGE_FLAG_DATA_STATIC);
+  CHECK(back.parameters[1].constants == 12 && back.parameters[1].visibility == D3D12_SHADER_VISIBILITY_PIXEL);
+  CHECK(back.parameters[2].shader_register == 7 && back.parameters[2].space == 2);
+  CHECK(back.samplers[0].ShaderRegister == 9 && back.samplers[0].MaxLOD == 1000.0f);
+
+  // The device takes the blob back.
+  void* device = make_device();
+  void* rs = nullptr;
+  CHECK(slot<HRESULT(WINAPI*)(void*, UINT, const void*, SIZE_T, const GUID*, void**)>(device, 16)(device, 1, data, size,
+                                                                                               nullptr, &rs) == S_OK);
+  CHECK(rs != nullptr);
+  CHECK(slot<ULONG(WINAPI*)(void*)>(blob, 2)(blob) == 0);
+
+  // A bad description fails with an error blob.
+  desc.Version = static_cast<D3D_ROOT_SIGNATURE_VERSION>(9);
+  CHECK(serialize_versioned_root_signature(&desc, &blob, &error) == E_INVALIDARG);
+  CHECK(blob == nullptr && error != nullptr);
 }
