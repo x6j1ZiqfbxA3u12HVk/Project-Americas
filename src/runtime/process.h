@@ -31,6 +31,7 @@ struct RunOptions {
   bool allow_missing_cpu_features = false;  // start even if the title needs instructions this CPU lacks
   std::filesystem::path logs_dir;
   std::filesystem::path cache_dir;
+  void* image_window = nullptr;  // the launcher's hold on the executable's range, released to map it
 };
 
 class TitleProcess {

@@ -8,6 +8,8 @@ Registry::Registry() {
   add_identity(functions_);
   add_system(functions_);
   add_network(functions_);
+  add_memory(functions_);
+  add_graphics(functions_);
 }
 
 const Function* Registry::find(std::string_view module, std::string_view name) const {

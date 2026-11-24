@@ -35,6 +35,9 @@ extern "C" __declspec(allocate(".CRT$XLB")) const PIMAGE_TLS_CALLBACK am_tls_cal
 
 int wmain(int argc, wchar_t** argv) {
   g_title_tls[0] = 0;  // keeps the carrier in the image
+  // First, before any DLL of ours loads: hold the range title executables are mapped at.
+  void* window = VirtualAlloc(reinterpret_cast<void*>(am::rt::kImageWindow), am::rt::kImageWindowSize, MEM_RESERVE,
+                              PAGE_NOACCESS);
 
   wchar_t self[MAX_PATH * 2];
   GetModuleFileNameW(nullptr, self, static_cast<DWORD>(std::size(self)));
@@ -53,5 +56,6 @@ int wmain(int argc, wchar_t** argv) {
   info.thread_hook = &g_thread_hook;
   info.argc = argc;
   info.argv = argv;
+  info.image_window = window;
   return launch(&info);
 }

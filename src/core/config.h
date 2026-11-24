@@ -12,6 +12,7 @@ struct Config {
   std::filesystem::path ini_path;  // <root>\americas.ini
   bool ini_found = false;
   std::filesystem::path game_dir;  // the unpacked game; read-only; empty when not configured
+  std::string console = "auto";    // auto, series_s or series_x
 
   std::filesystem::path logs_dir() const { return root / L"logs"; }
   std::filesystem::path cache_dir() const { return root / L"cache"; }

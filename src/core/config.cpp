@@ -44,6 +44,10 @@ Config load_config(std::vector<std::string>& warnings) {
 
     if (key == "game_dir") {
       config.game_dir = std::filesystem::path(widen(value));
+    } else if (key == "console") {
+      const std::string v = to_lower_ascii(value);
+      if (v == "auto" || v == "series_s" || v == "series_x") config.console = v;
+      else warnings.push_back(where + ":" + std::to_string(line_no) + ": console must be auto, series_s or series_x");
     } else {
       warnings.push_back(where + ":" + std::to_string(line_no) + ": unknown key '" + key + "'");
     }

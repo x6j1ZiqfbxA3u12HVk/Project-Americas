@@ -1,6 +1,6 @@
-// Threads, memory and system information. For now these forward to the host unchanged and are
-// marked `passthrough`: memory still lacks the console's flags and physical pages, and threads
-// and topology still lack the console-to-host processor mapping (plan, sections 5.2 and 5.3).
+// Threads and system information. For now these forward to the host unchanged and are marked
+// `passthrough`: threads and topology still lack the console-to-host processor mapping, and the
+// memory status still reports the host's (plan, section 5.3). Memory is in xmem.cpp.
 // Thread start and exit already reach title modules through the launcher's TLS callback.
 
 #include <windows.h>
@@ -17,9 +17,7 @@ void add_system(std::vector<Function>& out) {
       AM_PASS(_endthreadex), AM_PASS(SetThreadAffinityMask), AM_PASS(SetThreadGroupAffinity),
       AM_PASS(GetThreadGroupAffinity), AM_PASS(SetThreadIdealProcessor), AM_PASS(SetThreadIdealProcessorEx),
       AM_PASS(GetThreadIdealProcessorEx), AM_PASS(SetThreadSelectedCpuSets), AM_PASS(SetProcessAffinityMask),
-      AM_PASS(GetProcessAffinityMask), AM_PASS(VirtualAlloc), AM_PASS(VirtualAllocEx), AM_PASS(VirtualFree),
-      AM_PASS(VirtualFreeEx), AM_PASS(VirtualQuery), AM_PASS(VirtualQueryEx), AM_PASS(VirtualProtect),
-      AM_PASS(VirtualProtectEx), AM_PASS(GlobalMemoryStatusEx), AM_PASS(GetLogicalProcessorInformation),
+      AM_PASS(GetProcessAffinityMask), AM_PASS(GlobalMemoryStatusEx), AM_PASS(GetLogicalProcessorInformation),
       AM_PASS(GetLogicalProcessorInformationEx), AM_PASS(GetSystemInfo), AM_PASS(GetNativeSystemInfo),
       AM_PASS(GetSystemCpuSetInformation), AM_PASS(GetActiveProcessorCount), AM_PASS(GetMaximumProcessorCount),
   });

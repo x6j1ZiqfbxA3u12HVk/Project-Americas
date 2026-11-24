@@ -178,10 +178,13 @@ fewer or slower cores, the CPU itself, not our layer, sets the frame rate in bus
 * **Title allocations.** `XMemAlloc`, `XMemVirtualAlloc` and `VirtualAlloc` with console flags
   (graphics memory, 64 KB / 2 MB pages, cache modes) map onto host memory. Memory budget answers
   match the selected console (S or X).
-* **Physical pages.** `XMemAllocatePhysicalPages` and `XMemMapPhysicalPages(Scatter)` use
-  page-file-backed sections plus placeholder reservations (`VirtualAlloc2` + `MapViewOfFile3`).
-  One physical page can then appear at several addresses, as on the console. Memory is committed
-  only when touched.
+* **Address range.** Title memory lies where the console keeps it: from 4 GiB (the low 4 GiB stay
+  free for requests that need a 32-bit address) up to 2^40, the GPU's address width. Title images
+  the loader has to move go there too.
+* **Physical pages.** `XMemAllocatePhysicalPages` and `XMemMapPhysicalPages(Scatter)` use one
+  page-file-backed section plus placeholder reservations (`VirtualAlloc2` + `MapViewOfFile3`).
+  One physical page can then appear at several addresses, as on the console. A page is committed
+  when it is first mapped; pages never mapped cost nothing.
 * **GPU visibility (the key design).** On the console, CPU and GPU see the same addresses. Each
   GPU-visible range gets a GPU home by class:
   * **A: GPU-produced** (render targets, depth, UAV textures and buffers). Lives in VRAM only.
@@ -378,7 +381,7 @@ Each milestone ends in a result that can be checked.
 |---|---|---|
 | M0 ✅ | **Foundations.** CMake + Ninja + MSVC (VS 2022), C++20; build tree under `C:\Project Americas\build`; `.gitignore` for build output; an asset-policy pre-commit check; `am-probe` (host GPU features incl. GPU upload heaps / Resizable BAR, SM level, wave64, mesh shaders, CPU instruction support, memory / page file); `am-inspect` (PE + import census with each import's planned route). | `am-inspect` lists all 587 imports with a route; `am-probe` reports the host. **Done**, see section 11. |
 | M1 ✅ | **CPU census and loader.** M1.1: disassembly census of Zen 2-only instructions in the exe and DLLs. Then mapping, binding, TLS carrier, exception tables, CPU patch pass, crash reports. A synthetic "console title" built from our own code exercises the loader in tests. | The game's code runs past CRT start-up into its own initialisation, with a full call census. **Done**, see section 11. |
-| M2 | **Boot to a frame loop.** Kernel, memory, files, threads; XGameRuntime core (user, package, system, task queue / async); D3D12.X device and presentation with a null GPU backend (commands accepted and dropped); GameInput. | The window opens and the game's frame loop runs at its own 30 fps pacing. |
+| M2 | **Boot to a frame loop.** Kernel, memory (done: M2.1, section 11), files, threads; XGameRuntime core (user, package, system, task queue / async); D3D12.X device and presentation with a null GPU backend (commands accepted and dropped); GameInput. | The window opens and the game's frame loop runs at its own 30 fps pacing. |
 | M3 | **Shader recompiler v1.** Decoder, IR, structuring, HLSL emit, DXC, cache; pack survey; precompile tool. | Pack translation rate tracked against a goal of 100 %; cache filled under `C:\Project Americas\cache\shaders`. |
 | M4 | **Menus render.** Command list translation (graphics + compute), descriptors, pipelines, tiled textures, memory classes A / B / C, Bink video. | The intro video and menus are visible. |
 | M5 | **Audio.** AcpHal / XApu / XDsp in software, XMA2 / Opus, WASAPI. | Menus and video have sound. |
@@ -632,6 +635,76 @@ Patch plan for the 41 sites:
   the console's `XDAT` block, then an `XBCH` block, and ends with a dummy 4-byte "bitcode".
   The RDNA2 machine code is inside the console blocks; mapping them is M3's first task.
 
+### M2.1: memory (done)
+
+Microsoft's XMem reference pages are closed to the public (an NDA program), so the facts come
+from the game's own code: its 23 `XMemVirtualAlloc` call sites, its other `xmem` calls, the BVH
+builder's `XMemVirtualQuery` calls, and the arguments logged at run time.
+
+* **What the game asks for at start-up** (Dev PC 1):
+
+  | Allocation | Type | XMem flags | Protection | What it is |
+  |---|---|---|---|---|
+  | two 24 GiB reservations of 64 KiB pages (16 GiB on another branch) | `0x20402000` | `0x21`, `0x3` | CPU read-write; CPU and GPU no access (`0x801`) | the CPU and GPU views of its physical memory; `D3D12ConfigureVirtualMemoryX` is called just before |
+  | four commits of 2 MiB pages: 1.1 GiB, 2.1 GiB, 563 MiB, 596 MiB | `0x20003000` | `0x183`, `0x283` | read-write plus GPU read-write, coherent (`0x22004`) or write-combined (`0x2404`) | its large heaps: 4.4 GiB of commit, which costs no RAM until touched |
+  | a 20 MiB commit of 64 KiB pages | `0x20403000` | `0x181` | read-write | |
+  | elsewhere in its code: its own placeholder below 4 GiB, split into pieces made physical-page reservations | `0x42000`, then `0x20406000` | `7`, `0x27` | GPU read-only, GPU execute | apparently GPU code and constants |
+
+* **Console bits** (`runtime/memory/console_flags`). Allocation type bit 29 selects 2 MiB
+  pages, bits 29 + 22 select 64 KiB pages (on the host they would mean large pages and AWE). The
+  protection carries the GPU's access in bits `0x800`–`0x40000` (the SDK's `PAGE_GRAPHICS_*`),
+  kept for the graphics layer. Write-combined and uncached CPU access are dropped, because our
+  layer reads that memory on the CPU. XMem flags: the low two bits are 1 for CPU memory and 3 for
+  memory the GPU maps too, and bit 2 asks for an address below 4 GiB. The other bits seen (5,
+  7–9) are recorded, not acted on.
+* **Physical pages** (`runtime/memory/title_memory`): one page-file-backed section the size of
+  the console's title memory, reserved, not committed. Each run of consecutive pages becomes
+  one view over a placeholder. A 64 KiB-page reservation without a commit is kept as a
+  placeholder, so pages can be mapped into it. Page numbers count 4 KiB frames (multiples of
+  16) and stay below 2^25, because the game stores them shifted right by 4 in 21 bits.
+  * Unmapping returns the range to placeholders.
+  * Releasing a reservation releases its views and every placeholder piece.
+  * A page is committed when first mapped.
+  * Commit failures name the system's commit and point at the page file.
+* **`XMemAlloc`** goes to the executable's allocation hooks, its only export
+  (`__XMemAllocationHooks__`), which dispatch on the allocator id at attribute bits 16–23.
+  `XMemAllocDefault` is ours: large blocks get their own allocation, small ones come from size
+  classes in 2 MiB arenas, all below 2^40. The alignment is a power of two at bits 24–28.
+* **`XMemVirtualQuery`** returns `MEMORY_BASIC_INFORMATION` plus the allocation's flags at `+0x30`.
+  The BVH builder checks State, Protect and the flags' low two bits.
+* **The console's `VirtualAlloc` / `VirtualFree` / `VirtualProtect`** take the same bits.
+  `MEM_RELEASE` with the allocation's own size is accepted, as the console does.
+* **Budget.** `XMemGetWorkingSetStatistics` reports the profile's title memory and, as used, our
+  private commit plus the physical pages held. There is no tools memory (`XMemIsToolsMemAvailable`
+  is false; `XMemTransferMemory` is refused).
+  * The console profile (`console = auto | series_s | series_x` in `americas.ini`, or
+    `--console`) picks Series X on hosts with 24 GB of RAM, Series S otherwise; Dev PC 1 gets
+    Series S.
+  * `--memory-limit` now also caps the physical pool's commit, which a job's limit does not
+    count.
+* **Loader fixes found on the way:**
+  * the launcher now holds `0x140000000`–`0x180000000` from its first instruction and hands it to
+    the runtime, because a random allocation sometimes took the executable's range and forced a
+    relocation above 2^40;
+  * images that must move go into title memory.
+* **Tests:**
+  * 9 unit cases: flag translation on the game's call shapes, pages aliased at two addresses,
+    partial unmapping, scatter mapping, release of a split placeholder, the title's own
+    placeholder pieces, 2 MiB alignment, 32-bit placement, the commit cap, the default
+    allocator, the console choice;
+  * 14 more fixture checks run through the loader. The fixture has 35 now.
+* **The game now** (`--memory-limit 8192 --timeout 120`):
+  1. it configures GPU virtual memory and makes its seven start-up allocations;
+  2. `GetFileAttributesW` is refused;
+  3. it calls `xgameruntime!InitializeApiImplEx2` and `QueryApiImpl`;
+  4. the stub's 0 reads as `S_OK`, so the game calls through the null interface it was not given,
+     at `+0x55de020`.
+
+  XGameRuntime is the next blocker.
+* **Not done yet:**
+  * large pages for the 2 MiB-page heaps (an M8 option);
+  * the GPU memory classes, which the recorded GPU access will feed (M4).
+
 ### Local tools (in `C:\Project Americas\tools`, never in the repository)
 
 | Tool | Version, source | Use | Note |
@@ -650,7 +723,7 @@ each needing a further download:
 * the AMD HIP SDK for Windows, whose LLVM includes the target (a large install).
 
 Next, in parallel:
-* **M2.** Memory (`xmem`, console `VirtualAlloc` flags, physical pages), then files (console
-  paths), threads and topology, XGameRuntime, D3D12.X device and presentation.
+* **M2.** XGameRuntime (`InitializeApiImplEx2`, `QueryApiImpl`: the current stop), files
+  (console paths), threads and topology, D3D12.X device and presentation.
 * **M3.** The console blocks' layout, the RDNA2 decoder (with an assembler / disassembler as a
   test oracle), the survey, then translation and `am-shaders precompile`.

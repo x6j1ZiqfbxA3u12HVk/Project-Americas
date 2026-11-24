@@ -7,6 +7,8 @@
 
 #include "core/file_view.h"
 #include "core/text.h"
+#include "runtime/log.h"
+#include "runtime/memory/title_memory.h"
 
 namespace am::rt {
 namespace {
@@ -110,12 +112,26 @@ std::optional<MappedImage> map_image(const std::filesystem::path& path, const Ma
   void* want = options.force_relocation ? nullptr : reinterpret_cast<void*>(m.info.image_base);
   void* block = nullptr;
   if (want) block = VirtualAlloc(want, m.size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+  if (want && !block) {
+    // Say what holds the preferred range: the first allocation in it.
+    const DWORD why = GetLastError();
+    MEMORY_BASIC_INFORMATION mbi{};
+    uint64_t p = m.info.image_base;
+    while (p < m.info.image_base + m.size && VirtualQuery(reinterpret_cast<void*>(p), &mbi, sizeof mbi) == sizeof mbi &&
+           mbi.State == MEM_FREE) {
+      p = reinterpret_cast<uint64_t>(mbi.BaseAddress) + mbi.RegionSize;
+    }
+    rt::logf("%s: preferred base 0x%s taken (error %lu): allocation at 0x%s, type 0x%lx", m.name.c_str(),
+             hex(m.info.image_base).c_str(), why, hex(reinterpret_cast<uint64_t>(mbi.AllocationBase)).c_str(), mbi.Type);
+  }
   if (!block) {
     if (!m.info.dir(pe::Directory::BaseReloc).size) {
       error = "the preferred base 0x" + hex(m.info.image_base) + " is taken and the image has no relocations";
       return std::nullopt;
     }
-    block = VirtualAlloc(nullptr, m.size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    // Moved images stay in title memory, below the GPU's 2^40 address width like everything the
+    // title may hand the GPU.
+    block = mem::allocate_title_range(m.size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
   }
   if (!block) {
     error = "cannot allocate " + std::to_string(m.size) + " bytes: " + win32_error_text(GetLastError());

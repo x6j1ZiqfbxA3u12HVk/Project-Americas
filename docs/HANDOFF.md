@@ -6,9 +6,9 @@ no translation of its code. We supply the console libraries underneath it and a 
 The full design is [PLAN.md](PLAN.md); progress is its section 11. This file is what you need
 to start working: rules, setup, state, lessons learned, next steps.
 
-State as of 2026-11-24: **M0 and M1 are done; the M3 groundwork (the shader corpus) is done.**
-The loader runs the real game executable into its own initialization and stops at the first
-console service we do not provide yet (memory).
+State as of 2026-11-24: **M0 and M1 are done, the M3 groundwork (the shader corpus) is done,
+and M2's first step (memory) is done.** The loader runs the real game executable through its
+memory set-up. It stops at the next console service we do not provide yet: XGameRuntime.
 
 ## 1. Rules from the user (follow them exactly)
 
@@ -64,18 +64,25 @@ Set-Location "C:\Users\Admin\Documents\GitHub\Project Americas"; . .\scripts\env
 ```
 
 * Binaries land in `C:\Project Americas\build\release\bin`.
-* `ctest` runs 5 entries: 37 unit test cases, the probe, the inspector, and the loader running
-  the fixture title at its own base and relocated.
+* `ctest` runs 5 entries: 46 unit test cases, the probe, the inspector, and the loader running
+  the fixture title (35 checks) at its own base and relocated.
+* `C:\Project Americas\build\release\test-root\logs\run.log` is the last fixture run's log:
+  the relocated one.
 * `am_tests.exe <fragment>` runs a subset.
 * `/W4 /WX` is on: fix warnings, never silence them broadly.
 
 ### Run the game (safe, unattended)
 
 ```powershell
-& "C:\Project Americas\build\release\bin\americas.exe" --memory-limit 6144 --timeout 120
+& "C:\Project Americas\build\release\bin\americas.exe" --memory-limit 8192 --timeout 120
 ```
 
 * Without `--title`, it runs the executable `MicrosoftGame.Config` names.
+* `--memory-limit` caps private commit (a job object) and, separately, the physical page pool's
+  commit, which a job does not count. The game commits about 4.4 GiB at start-up (no RAM until
+  touched), so 6144 is now too tight.
+* `--console auto|series_s|series_x` overrides `americas.ini`'s `console`. Auto gives Series S
+  on this 16 GB PC.
 * Logs go to `C:\Project Americas\logs`:
   * `run.log`;
   * `report.json`: modules, stubs with call counts, CPU patches, emulation hits;
@@ -95,6 +102,7 @@ Set-Location "C:\Users\Admin\Documents\GitHub\Project Americas"; . .\scripts\env
 | `src/formats` | DEFLATE (raw and zlib) |
 | `src/shader` | shader pack reader (records found by their framing), DXBC container parser |
 | `src/runtime` | the runtime DLL, below |
+| `src/runtime/memory` | title memory: console flag translation, physical pages, the XMemAlloc default allocator |
 | `src/launcher` | `americas.exe`: TLS slot 0 for the title, a TLS callback, nothing else |
 | `src/tls_carrier` | `am_tls_1..4.dll`: one TLS slot each for title DLLs |
 | `src/tools/*` | `am-probe`, `am-inspect`, `am-cpuscan`, `am-shaders` |
@@ -106,12 +114,16 @@ Set-Location "C:\Users\Admin\Documents\GitHub\Project Americas"; . .\scripts\env
 | File | Role |
 |---|---|
 | `process.*` | the title process: maps modules, binds imports by the policy, maps title DLLs on demand, initializes them in dependency order, forwards thread start/exit, runs the entry point, crash filter, `report.json` |
+| `console.*` | the console profile (Series S / X): title memory budget, chosen from the host's RAM or the settings |
+| `memory/console_flags.*` | the console's allocation, protection and XMem flag bits, and the host request each becomes (pure, unit-tested) |
+| `memory/title_memory.*` | allocations with their console attributes; the physical page pool (one section); views over placeholders; release, query, commit cap |
+| `memory/default_alloc.*` | `XMemAllocDefault`: size classes in 2 MiB arenas, large blocks on their own, all below 2^40 |
 | `image.*` | maps a PE, relocations, export lookup, protection, `RtlAddFunctionTable` |
 | `tls.*` | carrier slots: the title's template is copied over the carrier's, existing threads' blocks are filled, the title's TLS index is set |
 | `stubs.*` | reporting stubs for unimplemented imports |
 | `cpu_compat.*` | census cache (`cache\cpu`), same-length patches, the illegal-instruction emulator |
 | `host_patch.*` | redirects `RtlPcToFileHeader` in host DLLs' import tables, so C++ exceptions work in title code |
-| `hle/` | our implementations: `identity.cpp`, `system.cpp`, `network.cpp`; `registry.cpp` lists them |
+| `hle/` | our implementations: `identity.cpp`, `system.cpp`, `network.cpp`, `xmem.cpp` (xmem.dll and the console `VirtualAlloc` family), `d3d12x.cpp` (`D3D12ConfigureVirtualMemoryX` so far); `registry.cpp` lists them |
 
 ## 4. What exists and what it showed
 
@@ -131,9 +143,22 @@ Set-Location "C:\Users\Admin\Documents\GitHub\Project Americas"; . .\scripts\env
   2. TLS slot 0 holds 5,248 bytes;
   3. 12 CPU sites are patched and 29 left to the emulator;
   4. the C runtime starts and the game's global initializers run;
-  5. **it stops at `xmem!XMemVirtualAlloc` (stub returns 0), at the game's own `int3`,
-     `game_scarlett_master.exe+0x1e1d01b`.** `d3d12_xs!D3D12ConfigureVirtualMemoryX` was
-     called just before.
+  5. memory: `D3D12ConfigureVirtualMemoryX`, two 24 GiB reservations of 64 KiB pages, four
+     2 MiB-page heaps (4.4 GiB) and a 20 MiB commit (PLAN.md, section 11, "M2.1");
+  6. `GetFileAttributesW` is refused (files are not done);
+  7. **it stops after `xgameruntime!InitializeApiImplEx2` and `QueryApiImpl`.** The stub's 0
+     reads as `S_OK`, so the game calls through the interface pointer it never got, at
+     `game_scarlett_master.exe+0x55de020` (its helper at `+0x55de048` asks for the interface
+     whose GUID is at `0x145F41040`).
+* **Memory facts** (PLAN.md, section 11, "M2.1", has the full table):
+  * XMem's reference pages on learn.microsoft.com are NDA-only: read the game's code instead;
+  * allocation type bit 29 means 2 MiB pages, bits 29 + 22 mean 64 KiB pages;
+  * protection bits `0x800`-`0x40000` are the GPU's access;
+  * the low two XMem flag bits are 1 for CPU memory and 3 for GPU-mapped memory; bit 2 asks for
+    an address below 4 GiB;
+  * `XMemAlloc` goes to the executable's export `__XMemAllocationHooks__` (allocate, free);
+  * physical page numbers must be multiples of 16 below 2^25;
+  * title memory, and title images, stay in [4 GiB, 2^40).
 * **Shader corpus** (`am-shaders index`): in `C:\Project Americas\cache\shaders\pack`.
   * 26,503 records, 25,889 distinct (234 MB), plus `index.json`.
   * Kinds: 12,101 pixel, 9,282 mesh, 2,689 compute, 2,236 vertex, 195 geometry.
@@ -152,33 +177,34 @@ Set-Location "C:\Users\Admin\Documents\GitHub\Project Americas"; . .\scripts\env
 M2 and M3 go in parallel (PLAN.md, "Order of work"): M3's batch jobs need hours of machine
 time, which the PC can spend while M2's code is written.
 
-### M2: from the first memory call to a frame loop
+### M2: from memory to a frame loop
 
-1. **Memory (`xmem`, then the memory wrappers).**
-   * Find what the game asks of `XMemVirtualAlloc`: the call site just before
-     `+0x1e1d01b` (`dumpbin /disasm:nobytes /range:<va>,<va>` on the executable, output kept
-     in the scratchpad), and the arguments at run time (log them in a first implementation).
-   * Microsoft's public GDK documentation (learn.microsoft.com) describes the `XMem*` API
-     contracts: use it for facts; do not copy headers.
-   * Then implement them, as designed in PLAN.md section 5.2:
-     * console allocation flags translated;
-     * physical pages over page-file-backed sections with placeholder reservations
-       (`VirtualAlloc2` + `MapViewOfFile3`);
-     * `XMemAlloc` / `XMemFree` through the title's allocator hooks;
-     * `D3D12ConfigureVirtualMemoryX`.
-   * Replace the pass-through memory wrappers in `hle/system.cpp`. Rerun the game after each
-     step and follow `report.json`'s called stubs.
+Memory is done (PLAN.md, section 11, "M2.1"). The method that worked:
+* find each console function's call sites in the executable: a small read-only Python scan for
+  `call`/`jmp` to its import thunk;
+* read the argument set-up with `dumpbin /disasm:nobytes /range:<va>,<va>`, output kept in the
+  scratchpad;
+* log the arguments at run time;
+* rerun the game after each step and follow `report.json`'s called stubs.
+
+1. **XGameRuntime (the current stop).** The game gets it through `QueryApiImpl` from
+   `xgameruntime.dll`, which `LoadLibrary` returns as a pseudo handle.
+   * Learn `InitializeApiImplEx2`'s and `QueryApiImpl`'s arguments from their call sites, and
+     which interfaces (GUIDs) the game asks for. The first is at `0x145F41040`.
+   * Then give it an offline user, package, system (Series S/X from `runtime/console`), and task
+     queue / async.
+   * Until an interface exists, `QueryApiImpl` must fail with `E_NOINTERFACE` and a null out
+     pointer, not return the stub's 0 (`S_OK`).
 2. **Files.** Console paths (the game root, `S:\` persistent storage, `T:\` temp) mapped to
    the read-only dump and `C:\Project Americas\userdata`. Deny by default, and refuse any
    write that resolves into the dump: check the final path of the opened handle too.
    * The functions are listed under "console paths" in `src/loader/import_policy.cpp`.
    * Until then they stay refused stubs, which is what keeps runs safe.
+   * The game already calls `GetFileAttributesW`. Its refused stub returns 0, which means "a
+     file with no attributes", not `INVALID_FILE_ATTRIBUTES`.
 3. **Threads and topology.** Console affinity masks mapped onto the host's processors;
    decide what topology the game sees (PLAN.md section 5.1).
-4. **XGameRuntime.** The game gets it through `QueryApiImpl` from `xgameruntime.dll`, which
-   `LoadLibrary` returns as a pseudo handle. Offline user, package, system, task queue /
-   async.
-5. **D3D12.X device** with a null back end (commands accepted and dropped), `PresentX`, frame
+4. **D3D12.X device** with a null back end (commands accepted and dropped), `PresentX`, frame
    pacing, a window. GameInput.
 
 ### M3: shader recompiler
@@ -204,9 +230,13 @@ time, which the PC can spend while M2's code is written.
   stub. CLZERO (3 bytes) moves into a stub together with the instruction after it, taking
   care with branch targets. The exception handler stays only as the safety net for
   unconfirmed sites.
+* **Refused stubs return 0, and 0 is success for some functions** (`S_OK`, a `NULL` handle that
+  is not `INVALID_HANDLE_VALUE`, "attributes 0"). A per-function failure value for refused
+  wrappers would make runs more predictable.
 * **Decisions the user still owns** (PLAN.md section 10):
   * graphics back end (D3D12 recommended);
-  * default console profile;
+  * default console profile (implemented as recommended: chosen from the host's RAM, with an
+    override);
   * licence;
   * page file size;
   * a source for the BCPack tables (PLAN.md section 9).
@@ -257,3 +287,12 @@ time, which the PC can spend while M2's code is written.
   * GitHub's API redirects `facebook/zstd` to `meta/zstd` (`curl -L`).
 * **`MicrosoftGame.Config`** has `Name=` inside other attribute names (`OverrideDisplayName`):
   match `" Name=\""` with the space.
+* **Placeholders** (`VirtualAlloc2`, `MapViewOfFile3`, `UnmapViewOfFile2`) are only in the
+  umbrella import libraries (`onecore.lib`, `mincore.lib`), which must not be mixed with
+  `kernel32.lib`. We resolve them from `kernelbase.dll` at run time. Their declarations need
+  `NTDDI_VERSION` of Windows 10 1803 or later; the build sets 2004.
+* **The executable's base can be taken.** A random allocation sometimes sat in
+  `0x140000000`+176 MiB. The launcher now holds that window from its first instruction. When an
+  image must move anyway, it goes into title memory, never above 2^40.
+* **Commit in `--memory-limit` runs.** A job's memory limit counts private commit only, not
+  commit of page-file-backed sections. That is why the physical pool checks the cap itself.

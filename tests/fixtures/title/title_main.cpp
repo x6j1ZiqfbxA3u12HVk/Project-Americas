@@ -12,8 +12,21 @@
 
 extern "C" IMAGE_DOS_HEADER __ImageBase;
 
-// From xmem.dll (a console module we do not implement yet: the loader binds a stub returning 0).
+// Console modules: our implementations, bound by the loader.
 extern "C" __declspec(dllimport) void* XMemAlloc(size_t size, unsigned long long attributes);
+extern "C" __declspec(dllimport) void XMemFree(void* address, unsigned long long attributes);
+extern "C" __declspec(dllimport) void* XMemVirtualAlloc(void* address, size_t size, unsigned long type,
+                                                       unsigned long long flags, unsigned long protect);
+extern "C" __declspec(dllimport) int XMemVirtualQuery(HANDLE process, const void* address, void* info);
+extern "C" __declspec(dllimport) int XMemAllocatePhysicalPages(unsigned long long flags, unsigned long long* count,
+                                                               unsigned long long* pages);
+extern "C" __declspec(dllimport) int XMemFreePhysicalPages(unsigned long long count, const unsigned long long* pages);
+extern "C" __declspec(dllimport) void* XMemMapPhysicalPages(void* address, unsigned long long count,
+                                                           const unsigned long long* pages);
+extern "C" __declspec(dllimport) int XMemGetWorkingSetStatistics(unsigned long which, void* out);
+extern "C" __declspec(dllimport) long D3D12ConfigureVirtualMemoryX(void* config);
+// A console function we do not implement: the loader binds a stub returning 0.
+extern "C" __declspec(dllimport) void* AcpHalCreate(void* a, void* b);
 // From the title DLL beside this executable.
 extern "C" __declspec(dllimport) int am_fixture_dll_value();
 extern "C" __declspec(dllimport) int am_fixture_dll_tls_on_new_thread();
@@ -50,6 +63,46 @@ bool seh_catches_access_violation() {
 [[noreturn]] void throw_deep(int depth) {
   if (depth == 0) throw std::runtime_error("deep");
   throw_deep(depth - 1);
+}
+
+// The game's memory set-up in small: a CPU range and a GPU range of 64 KiB pages, physical pages
+// mapped into both, plus the console's VirtualAlloc flags.
+void check_console_memory() {
+  constexpr unsigned long kPages64K = 0x20400000, kPages2M = 0x20000000;
+  constexpr size_t kRange = 4u << 20;
+  check(D3D12ConfigureVirtualMemoryX(nullptr) < 0, "D3D12ConfigureVirtualMemoryX refuses no block");
+  unsigned config[8] = {0, 3, 0, 0, 0, 0, 0, 0};
+  check(D3D12ConfigureVirtualMemoryX(config) == 0, "D3D12ConfigureVirtualMemoryX accepts the game's block");
+  auto* cpu = static_cast<unsigned char*>(XMemVirtualAlloc(nullptr, kRange, kPages64K | MEM_RESERVE, 0x21, PAGE_READWRITE));
+  auto* gpu = static_cast<unsigned char*>(XMemVirtualAlloc(nullptr, kRange, kPages64K | MEM_RESERVE, 3, 0x801));
+  const auto low = [](const void* p) { return reinterpret_cast<uintptr_t>(p) >> 40 == 0; };
+  check(cpu && gpu && low(cpu) && low(gpu), "XMemVirtualAlloc: 64 KiB page ranges below 2^40");
+  unsigned long long count = 3, pages[3] = {};
+  check(XMemAllocatePhysicalPages(0x380, &count, pages) && count == 3, "XMemAllocatePhysicalPages");
+  check(XMemMapPhysicalPages(cpu, 3, pages) == cpu, "XMemMapPhysicalPages");
+  cpu[2 * 65536 + 7] = 0x77;
+  // The GPU range shows the same page; the CPU may not touch it there (PAGE_NOACCESS).
+  check(XMemMapPhysicalPages(gpu, 1, pages + 2) == gpu, "XMemMapPhysicalPages: a second address");
+  DWORD old = 0;
+  check(VirtualProtect(gpu, 65536, PAGE_READONLY, &old) && gpu[7] == 0x77, "physical page seen at both addresses");
+  unsigned char info[0x40] = {};
+  check(XMemVirtualQuery(GetCurrentProcess(), cpu, info) && *reinterpret_cast<DWORD*>(info + 0x20) == MEM_COMMIT &&
+            *reinterpret_cast<unsigned long long*>(info + 0x30) == 0x21,
+        "XMemVirtualQuery: committed, with the allocation's flags");
+  check(VirtualFree(cpu, 0, MEM_RELEASE) && VirtualFree(gpu, 0, MEM_RELEASE), "VirtualFree releases mapped ranges");
+  check(XMemFreePhysicalPages(3, pages), "XMemFreePhysicalPages");
+
+  // VirtualAlloc with console bits: 2 MiB pages and a GPU protection.
+  void* big = VirtualAlloc(nullptr, 1 << 20, kPages2M | MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE | 0x2000);
+  check(big && reinterpret_cast<uintptr_t>(big) % (2 << 20) == 0, "VirtualAlloc: console 2 MiB pages");
+  check(VirtualFree(big, 2 << 20, MEM_RELEASE), "VirtualFree: MEM_RELEASE with the allocation's size");
+
+  void* block = XMemAlloc(64, 12ull << 24);
+  check(block && reinterpret_cast<uintptr_t>(block) % 4096 == 0, "XMemAlloc: aligned block (default allocator)");
+  XMemFree(block, 12ull << 24);
+  unsigned long long stats[15] = {};
+  check(XMemGetWorkingSetStatistics(0x20000001, stats) && stats[0] > stats[1] && stats[1] > 0,
+        "XMemGetWorkingSetStatistics: a budget above what is used");
 }
 
 }  // namespace
@@ -101,7 +154,8 @@ int main(int argc, char** argv) {
   _mm_clwb(&f);
   check(true, "CLWB");
 
-  check(XMemAlloc(64, 0) == nullptr, "unimplemented console import returns 0");
+  check(AcpHalCreate(nullptr, nullptr) == nullptr, "unimplemented console import returns 0");
+  check_console_memory();
   check(am_fixture_dll_value() == 1234, "title DLL export");
   check(am_fixture_dll_attach_count() == 1, "title DLL: DllMain process attach, once");
   check(am_fixture_dll_tls_on_new_thread() == 99, "title DLL: static TLS on a new thread");

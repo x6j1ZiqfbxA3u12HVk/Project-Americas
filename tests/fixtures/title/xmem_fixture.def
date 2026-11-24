@@ -1,5 +1,12 @@
-; Import library for the fixture: one function of the console's xmem.dll, which the loader routes
-; to our implementation (or, while there is none, to a stub).
+; Import library for the fixture: functions of the console's xmem.dll, which the loader routes to
+; our implementation.
 LIBRARY xmem.dll
 EXPORTS
     XMemAlloc
+    XMemFree
+    XMemVirtualAlloc
+    XMemVirtualQuery
+    XMemAllocatePhysicalPages
+    XMemFreePhysicalPages
+    XMemMapPhysicalPages
+    XMemGetWorkingSetStatistics

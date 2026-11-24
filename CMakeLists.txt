@@ -28,7 +28,9 @@ add_library(am_options INTERFACE)
 target_compile_options(am_options INTERFACE
   /W4 /WX /permissive- /utf-8 /Zc:__cplusplus /Zc:preprocessor /Zc:inline /EHsc /diagnostics:caret)
 target_compile_definitions(am_options INTERFACE
-  UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX _WIN32_WINNT=0x0A00)
+  UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX _WIN32_WINNT=0x0A00
+  # Windows 10 2004: the floor that declares placeholders (VirtualAlloc2, MapViewOfFile3).
+  NTDDI_VERSION=0x0A000008)
 target_link_options(am_options INTERFACE /DEBUG $<$<CONFIG:Release>:/OPT:REF /OPT:ICF>)
 
 add_subdirectory(src/core)

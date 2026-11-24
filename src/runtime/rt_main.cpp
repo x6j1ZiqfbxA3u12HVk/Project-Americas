@@ -1,11 +1,12 @@
 // americas_rt.dll: parses the launcher's command line, loads the title and runs it.
 //
 //   americas [--title <exe>] [--force-relocation] [--unimplemented zero|trap]
-//            [--allow-missing-cpu-features] [--memory-limit <MiB>] [--timeout <seconds>]
-//            [-- <title arguments>]
+//            [--allow-missing-cpu-features] [--console auto|series_s|series_x]
+//            [--memory-limit <MiB>] [--timeout <seconds>] [-- <title arguments>]
 //
-// --memory-limit caps the process's committed memory (a job object); --timeout ends the run
-// after that many seconds, report written. Both are for unattended test runs.
+// --memory-limit caps the process's committed memory (a job object, which counts private memory;
+// the physical page pool holds itself to the same cap); --timeout ends the run after that many
+// seconds, report written. Both are for unattended test runs. --console overrides americas.ini.
 //
 // Without --title it runs the executable MicrosoftGame.Config names in game_dir (americas.ini).
 
@@ -18,8 +19,11 @@
 
 #include "core/config.h"
 #include "core/text.h"
+#include "host/system.h"
+#include "runtime/console.h"
 #include "runtime/launcher_api.h"
 #include "runtime/log.h"
+#include "runtime/memory/title_memory.h"
 #include "runtime/process.h"
 
 // The TLS carriers (runtime/tls.h): imported, so Windows loads them with their slots.
@@ -35,7 +39,8 @@ using namespace am;
 int usage() {
   std::fprintf(stderr,
                "usage: americas [--title <exe>] [--force-relocation] [--unimplemented zero|trap]\n"
-               "                [--allow-missing-cpu-features] [-- <title arguments>]\n");
+               "                [--allow-missing-cpu-features] [--console auto|series_s|series_x]\n"
+               "                [--memory-limit <MiB>] [--timeout <seconds>] [-- <title arguments>]\n");
   return 2;
 }
 
@@ -83,7 +88,7 @@ DWORD WINAPI watchdog(void* seconds) {
 }  // namespace
 
 extern "C" __declspec(dllexport) int am_launch(const rt::LauncherInfo* info) {
-  if (!info || info->version != 1) return 2;
+  if (!info || info->version != 2) return 2;
   volatile void* carriers[] = {am_tls_carrier_1(), am_tls_carrier_2(), am_tls_carrier_3(), am_tls_carrier_4()};
   (void)carriers;
   std::vector<std::string> warnings;
@@ -91,12 +96,16 @@ extern "C" __declspec(dllexport) int am_launch(const rt::LauncherInfo* info) {
 
   rt::RunOptions options;
   uint64_t memory_limit_mib = 0, timeout_s = 0;
+  std::string console_setting = config.console;
   options.logs_dir = config.logs_dir();
   options.cache_dir = config.cache_dir();
+  options.image_window = info->image_window;
   for (int i = 1; i < info->argc; ++i) {
     const std::wstring a = info->argv[i];
     if (a == L"--title" && i + 1 < info->argc) {
       options.title = info->argv[++i];
+    } else if (a == L"--console" && i + 1 < info->argc) {
+      console_setting = narrow(info->argv[++i]);
     } else if (a == L"--force-relocation") {
       options.force_relocation = true;
     } else if (a == L"--allow-missing-cpu-features") {
@@ -137,6 +146,22 @@ extern "C" __declspec(dllexport) int am_launch(const rt::LauncherInfo* info) {
     if (!limit_memory(memory_limit_mib)) rt::logf("cannot limit memory: error %lu", GetLastError());
     else rt::logf("memory limited to %llu MiB", static_cast<unsigned long long>(memory_limit_mib));
   }
+  if (!rt::mem::host_supports_placeholders()) {
+    rt::logf("this Windows lacks placeholder memory (VirtualAlloc2, MapViewOfFile3): Windows 10 1803 or later is needed");
+    return 1;
+  }
+  const host::MemoryInfo host_memory = host::memory_info();
+  rt::Console console = rt::Console::SeriesS;
+  if (!rt::choose_console(console_setting, host_memory.total_physical, &console)) return usage();
+  rt::set_console(console);
+  const rt::ConsoleProfile& profile = rt::current_console();
+  rt::mem::MemoryOptions memory;
+  memory.physical_bytes = profile.title_memory;
+  memory.commit_cap = memory_limit_mib << 20;
+  rt::mem::configure_title_memory(memory);
+  rt::logf("console %s (setting %s): title memory %s; host RAM %s, commit limit %s", profile.name,
+           console_setting.c_str(), format_bytes(profile.title_memory).c_str(),
+           format_bytes(host_memory.total_physical).c_str(), format_bytes(host_memory.commit_limit).c_str());
   if (timeout_s) {
     CloseHandle(CreateThread(nullptr, 0, &watchdog, reinterpret_cast<void*>(static_cast<uintptr_t>(timeout_s)), 0, nullptr));
   }

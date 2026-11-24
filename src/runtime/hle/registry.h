@@ -31,5 +31,7 @@ class Registry {
 void add_identity(std::vector<Function>& out);
 void add_system(std::vector<Function>& out);
 void add_network(std::vector<Function>& out);
+void add_memory(std::vector<Function>& out);
+void add_graphics(std::vector<Function>& out);
 
 }  // namespace am::rt::hle

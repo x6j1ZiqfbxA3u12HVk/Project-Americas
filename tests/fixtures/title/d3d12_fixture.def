@@ -1,0 +1,4 @@
+; Import library for the fixture: the console's Direct3D 12.X.
+LIBRARY d3d12_xs.dll
+EXPORTS
+    D3D12ConfigureVirtualMemoryX

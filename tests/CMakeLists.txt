@@ -4,6 +4,7 @@ add_executable(am_tests
   cpu_emulation_tests.cpp
   cpu_tests.cpp
   inflate_tests.cpp
+  memory_tests.cpp
   pe_tests.cpp
   policy_tests.cpp
   shader_pack_tests.cpp

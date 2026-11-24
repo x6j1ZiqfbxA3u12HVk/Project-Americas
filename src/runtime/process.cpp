@@ -8,8 +8,11 @@
 
 #include "core/json.h"
 #include "core/text.h"
+#include "runtime/console.h"
 #include "runtime/host_patch.h"
+#include "runtime/launcher_api.h"
 #include "runtime/log.h"
+#include "runtime/memory/title_memory.h"
 
 namespace am::rt {
 namespace {
@@ -108,6 +111,12 @@ bool TitleProcess::load(std::string& error) {
 
   MapOptions map_options;
   map_options.force_relocation = options_.force_relocation;
+  if (options_.image_window) {
+    VirtualFree(options_.image_window, 0, MEM_RELEASE);
+    options_.image_window = nullptr;
+  } else {
+    logf("the launcher could not hold 0x%s: the executable may have to move", hex(kImageWindow).c_str());
+  }
   auto exe = map_image(options_.title, map_options, error);
   if (!exe) return false;
   if (exe->info.is_dll()) {
@@ -482,6 +491,13 @@ void TitleProcess::write_report() const {
     j.begin_object().field("at", const_cast<TitleProcess*>(this)->describe_address(h.address)).field("count", h.count).end_object();
   }
   j.end_array();
+  j.end_object();
+  const mem::MemoryStats ms = mem::title_memory().stats();
+  j.key("memory").begin_object();
+  j.field("console", std::string(current_console().name)).field("physical_capacity", ms.physical_capacity)
+      .field("physical_allocated", ms.physical_allocated).field("physical_peak", ms.physical_peak)
+      .field("physical_committed", ms.physical_committed).field("views", ms.views).field("map_calls", ms.map_calls)
+      .field("reservations", ms.reservations).field("regions", ms.regions).field("refused", ms.refused);
   j.end_object();
   j.key("passthrough").begin_array();
   for (const hle::Function& f : registry_.all()) {
