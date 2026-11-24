@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 // d3d12_xs.dll's entry points (plan, section 5.5).
 
@@ -27,7 +27,7 @@ Object* create_dxgi_device(Object* device);
 uint32_t descriptor_size(uint32_t type);
 
 struct Method;
-// views.cpp: device slots 17-25 (views, descriptor copies, GetResourceAllocationInfo).
+// views.cpp: device slots 17-25 and 108 (views, descriptor copies, allocation sizes).
 void add_view_methods(std::vector<Method>& out);
 
 // views.cpp: the bytes and alignment a resource needs (GetResourceAllocationInfo's rules).
@@ -37,12 +37,28 @@ D3D12_RESOURCE_ALLOCATION_INFO allocation_info(const D3D12_RESOURCE_DESC& d);
 HRESULT create_committed_resource(Object* device, const D3D12_HEAP_PROPERTIES* heap, uint32_t heap_flags,
                                   const D3D12_RESOURCE_DESC* desc, uint32_t initial_layout,
                                   const D3D12_CLEAR_VALUE* clear, const GUID* riid, void** out);
+// Device slot 133: a resource placed at a GPU virtual address of the title's (memory is
+// unified: no heap). The memory stays the title's.
+HRESULT create_placed_resource_at(Object* device, uint64_t address, const D3D12_RESOURCE_DESC* desc,
+                                  uint32_t initial_layout, const D3D12_CLEAR_VALUE* clear, const GUID* riid,
+                                  void** out);
 // The XMemAlloc attributes for a resource's memory of `size` bytes at `alignment`.
 uint64_t resource_attributes(uint64_t size, uint64_t alignment);
 
-// pipeline.cpp: compute pipelines (device slot 62; the two extra arguments are kept).
+// pipeline.cpp: compute pipelines (device slot 62; the two extra arguments are kept), stream
+// pipelines (slot 86), and the console's own pipeline creations (slots 55, 57, 67), whose
+// descriptions are not read yet.
 HRESULT create_compute_pipeline(const D3D12_COMPUTE_PIPELINE_STATE_DESC* desc, uint64_t extra0, uint64_t extra1,
                                 const GUID* riid, void** out);
+HRESULT create_pipeline_from_stream(const D3D12_PIPELINE_STATE_STREAM_DESC* desc, const GUID* riid, void** out);
+HRESULT create_console_pipeline(const char* how, const void* desc, const GUID* riid, void** out);
+
+// xg.cpp: xg_xs.dll, the console's texture layout library.
+HRESULT WINAPI xg_suggest_swizzle_mode(const D3D12_RESOURCE_DESC* desc, UINT flags, UINT* layout);
+HRESULT WINAPI xg_create_texture_computer(const D3D12_RESOURCE_DESC* desc, void** out);
+
+// frame.cpp: device slots 78-80, the frame interval and frame events.
+void add_frame_methods(std::vector<Method>& out);
 
 // descriptor_heap.cpp: the console's description (D3D12's, then memory address and size).
 HRESULT create_descriptor_heap(const void* desc, const GUID* riid, void** out);

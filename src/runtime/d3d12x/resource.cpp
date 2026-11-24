@@ -29,14 +29,15 @@ struct Resource : Object {
   D3D12_RESOURCE_DESC desc{};
   D3D12_HEAP_PROPERTIES heap{};
   uint32_t heap_flags = 0;
-  uint32_t initial_layout = 0;  // a D3D12_BARRIER_LAYOUT
+  uint32_t initial_layout = 0;  // a D3D12_BARRIER_LAYOUT (slot 127) or D3D12_RESOURCE_STATES (slot 27)
   uint64_t address = 0;     // CPU and GPU address
   uint64_t size = 0;        // bytes reserved for it
   uint64_t attributes = 0;  // XMemAlloc's, for the free
+  bool owned = false;       // false: placed in the title's memory, which stays the title's
   Object* device = nullptr;
 
   ~Resource() {
-    if (address) hle::xmem_free(reinterpret_cast<void*>(address), attributes);
+    if (owned && address) hle::xmem_free(reinterpret_cast<void*>(address), attributes);
   }
 };
 
@@ -137,6 +138,7 @@ HRESULT create_committed_resource(Object* device, const D3D12_HEAP_PROPERTIES* h
   r->address = reinterpret_cast<uint64_t>(memory);
   r->size = info.SizeInBytes;
   r->attributes = attributes;
+  r->owned = true;
   r->device = device;
   static std::atomic<int> logged{0};
   if (logged.fetch_add(1, std::memory_order_relaxed) < 64) {
@@ -145,6 +147,32 @@ HRESULT create_committed_resource(Object* device, const D3D12_HEAP_PROPERTIES* h
          desc->Dimension, static_cast<unsigned long long>(desc->Width), desc->Height, desc->DepthOrArraySize,
          desc->MipLevels, desc->Format, desc->Flags, heap->Type, heap_flags, initial_layout, static_cast<void*>(r),
          format_bytes(r->size).c_str(), hex(r->address).c_str(), hex(attributes).c_str());
+  }
+  *out = r;
+  return S_OK;
+}
+
+HRESULT create_placed_resource_at(Object* device, uint64_t address, const D3D12_RESOURCE_DESC* desc,
+                                  uint32_t initial_layout, const D3D12_CLEAR_VALUE* /*clear*/, const GUID* /*riid*/,
+                                  void** out) {
+  if (!desc) return E_INVALIDARG;
+  const D3D12_RESOURCE_ALLOCATION_INFO info = allocation_info(*desc);
+  if (info.SizeInBytes == UINT64_MAX || !info.SizeInBytes) return E_INVALIDARG;
+  if (!out) return S_FALSE;
+  *out = nullptr;
+  auto* r = make_object<Resource>(resource_kind());
+  r->desc = *desc;
+  r->heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+  r->initial_layout = initial_layout;
+  r->address = address;
+  r->size = info.SizeInBytes;
+  r->device = device;
+  static std::atomic<int> logged{0};
+  if (logged.fetch_add(1, std::memory_order_relaxed) < 64) {
+    logf("d3d12x: placed resource (dim %u, %llux%u x%u, %u mips, format %u, layout 0x%x, flags 0x%x; at 0x%s, %s) = %p",
+         desc->Dimension, static_cast<unsigned long long>(desc->Width), desc->Height, desc->DepthOrArraySize,
+         desc->MipLevels, desc->Format, static_cast<uint32_t>(desc->Layout), desc->Flags, hex(address).c_str(),
+         format_bytes(r->size).c_str(), static_cast<void*>(r));
   }
   *out = r;
   return S_OK;

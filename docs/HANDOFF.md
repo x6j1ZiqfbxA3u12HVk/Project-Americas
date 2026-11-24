@@ -35,9 +35,12 @@ serializes its root signatures through `d3d12_xs!D3D12SerializeVersionedRootSign
 and creates its 40 compute pipelines (slot 62). Physical pages now commit on first touch: the
 game maps 6.1 GiB of them at once, which eager commit could not hold in a 16 GB PC.
 
-**It now stops at the console texture layout library**, `xg_xs.dll`: `XGSuggestSwizzleMode`
-and `XGCreateTextureComputer`, not implemented, so it reads through a null texture computer
-at `+0x16f71fb`.
+**The frame loop (2026-11-24, late night):** with the console texture layouts (`xg_xs.dll`,
+`d3d12x/layout.h`), resources placed at the title's own addresses (slot 133), pipelines
+(slots 55, 57, 67, 86), the console's queue slot order (Signal at 16), fence value addresses
+and frame pacing (slots 78-80), **the game runs its frame loop at its own 30 fps** for the
+whole run: it records command lists and presents once a frame (queue slot 32, still a probe),
+with the null back end. No crash in 120 s.
 
 **M3:** the RDNA 2 decoder is done and decodes all 26,084 console GPU programs of the corpus,
 checked against LLVM (100 % on 2.8 M instructions). Next there: the translator.
@@ -192,8 +195,8 @@ Set-Location "C:\Users\Admin\Documents\GitHub\Project Americas"; . .\scripts\env
   10. D3D12.X: device, queues, fences, command lists, DXGI view, descriptor heaps and views,
       back buffers (committed resources), the BVH builder's root signatures and compute
       pipelines, 6.1 GiB of physical pages mapped (M2.4);
-  11. **it stops at `xg_xs.dll`** (`XGSuggestSwizzleMode`, `XGCreateTextureComputer`): the
-      console's texture layouts.
+  11. texture layouts (XG), placed resources, graphics pipelines, frame pacing;
+  12. **its frame loop, at 30 fps**: command lists, `PresentX` (a probe) once a frame.
 * **Memory facts** (PLAN.md, section 11, "M2.1", has the full table):
   * XMem's reference pages on learn.microsoft.com are NDA-only: read the game's code instead;
   * allocation type bit 29 means 2 MiB pages, bits 29 + 22 mean 64 KiB pages;
@@ -238,16 +241,18 @@ method the game calls.
 
 DirectStorage and files are done (PLAN.md section 11, "M2.3").
 
-1. **Texture layouts (the current stop): `xg_xs.dll`.** The game imports
-   `XGSuggestSwizzleMode` and `XGCreateTextureComputer` only. The computer object answers a
-   texture's size, alignment and per-mip offsets; the game places its textures with them and
-   copies their data from disk, laid out for the console GPU. So the layouts must be the
-   console GPU's own (RDNA 2 swizzle modes), not ours: learn the object's methods from the
-   game's calls (probes, as for the device), and the layout rules from AMD's open address
-   library documentation.
-   * Resources so far: committed only (slot 127; D3D12's `CreateCommittedResource` at slot 27
-     is probed next to it). Placed resources and heaps follow, with slot 74 (the game hands
-     it its 6.1 GiB of physical pages) a likely heap creation.
+1. **Present into a window (the next step).** Queue slot 32 is called once a frame as
+   `(1, planes, parameters)`: the console's `PresentX`. Read the plane parameters (which
+   resource, its region) from the game's calls, then show that resource in a window. Until
+   the GPU back end exists that needs a CPU path: the back buffers are linear inside their
+   padded layout (`d3d12x/layout.h`), but nothing draws into them yet, so expect black.
+   * The other per-frame probes: device 70 (writes 32-byte descriptors into the big heap:
+     probably the console's own view creation from a GPU address) and 81, queue 35 (twice a
+     frame), and the command list's slots (9, 12, 20-25, 32-36, 44-52, 70-75, 126, 139-146).
+     Each probe line names its call site now.
+   * Texture layouts: our model pads mips to whole blocks and keeps texels linear. The
+     console's real addressing (RDNA swizzle equations, mip tails) is needed once textures
+     come from disk pre-tiled; the texture headers carry the mode the data uses.
 2. **The rest of D3D12.X with the null back end**, slot by slot as the game reaches them.
    * `report.json`'s `graphics` section and the `d3d12x: #N ... not implemented` log lines
      name each one with its arguments; D3D12's slot order is the first hypothesis.

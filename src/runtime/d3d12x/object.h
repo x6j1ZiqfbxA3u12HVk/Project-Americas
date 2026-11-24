@@ -29,6 +29,10 @@ namespace am::rt::d3d12x {
 
 constexpr int kMaxSlots = 512;
 
+// A Method whose function is kProbe keeps the slot a probe (for kinds without IUnknown's first
+// three slots).
+inline void* const kProbe = reinterpret_cast<void*>(uintptr_t{1});
+
 struct Method {
   int slot;
   const char* name;

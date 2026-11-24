@@ -23,6 +23,8 @@ add_library(am_runtime STATIC
   d3d12x/device.cpp
   d3d12x/dxgi.cpp
   d3d12x/formats.cpp
+  d3d12x/frame.cpp
+  d3d12x/layout.cpp
   d3d12x/list.cpp
   d3d12x/object.cpp
   d3d12x/pipeline.cpp
@@ -30,6 +32,7 @@ add_library(am_runtime STATIC
   d3d12x/resource.cpp
   d3d12x/root_signature.cpp
   d3d12x/views.cpp
+  d3d12x/xg.cpp
   hle/files.cpp
   input/game_input.cpp
   hle/identity.cpp

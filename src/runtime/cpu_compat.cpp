@@ -6,7 +6,9 @@
 #include <atomic>
 #include <cstring>
 #include <fstream>
+#include <iterator>
 #include <mutex>
+#include <vector>
 
 #include "core/file_view.h"
 #include "core/text.h"
@@ -141,6 +143,80 @@ bool patch_in_place(uint8_t* p, const Instruction& d, CpuFeature f) {
     default:
       return false;
   }
+}
+
+// ---- stubs ----
+
+// Code the patches jump to, within a rel32 jump of the image: one 64 KiB block after its end.
+class StubArena {
+ public:
+  uint8_t* take(const MappedImage& image, size_t size) {
+    if (!block_) {
+      const uint64_t start = (reinterpret_cast<uint64_t>(image.base) + image.size + 0xFFFF) & ~0xFFFFull;
+      for (uint64_t at = start; at < start + (1ull << 30) && !block_; at += 0x10000) {
+        block_ = static_cast<uint8_t*>(
+            VirtualAlloc(reinterpret_cast<void*>(at), kBlock, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE));
+      }
+      if (!block_) return nullptr;
+    }
+    if (used_ + size > kBlock) return nullptr;
+    uint8_t* p = block_ + used_;
+    used_ = (used_ + size + 15) & ~size_t{15};
+    return p;
+  }
+  void finish() {
+    if (!block_) return;
+    DWORD old = 0;
+    VirtualProtect(block_, kBlock, PAGE_EXECUTE_READ, &old);
+    FlushInstructionCache(GetCurrentProcess(), block_, kBlock);
+  }
+
+ private:
+  static constexpr size_t kBlock = 0x10000;
+  uint8_t* block_ = nullptr;
+  size_t used_ = 0;
+};
+
+bool fits_rel32(const uint8_t* from_end, const uint8_t* to) {
+  const int64_t d = to - from_end;
+  return d >= INT32_MIN && d <= INT32_MAX;
+}
+
+void put_rel32(uint8_t* at, const uint8_t* from_end, const uint8_t* to) {
+  const int32_t d = static_cast<int32_t>(to - from_end);
+  std::memcpy(at, &d, 4);
+}
+
+// The game's clearing loops, `clzero; add rax, 64; cmp rax, reg; jb loop`: the first 7 bytes
+// become a jump to a stub that clears the line with eight stores (rcx saved on the stack; the
+// flags it changes are set again by the add and the cmp), adds 64 and jumps back to the cmp.
+bool is_clzero_loop(const uint8_t* p) {
+  return p[0] == 0x0F && p[1] == 0x01 && p[2] == 0xFC && p[3] == 0x48 && p[4] == 0x83 && p[5] == 0xC0 &&
+         p[6] == 0x40 && (p[7] & 0xFB) == 0x48 && p[8] == 0x39 && (p[9] & 0xC7) == 0xC0 && p[10] == 0x72 &&
+         static_cast<int8_t>(p[11]) == -12;
+}
+
+bool patch_clzero_loop(const MappedImage& image, uint8_t* p, StubArena& stubs) {
+  std::vector<uint8_t> stub = {0x51, 0x48, 0x89, 0xC1, 0x48, 0x83, 0xE1, 0xC0};  // push rcx; mov rcx, rax; and rcx, -64
+  const uint8_t first[] = {0x48, 0xC7, 0x01, 0, 0, 0, 0};                       // mov qword [rcx], 0
+  stub.insert(stub.end(), std::begin(first), std::end(first));
+  for (uint8_t off = 8; off < 64; off += 8) {
+    const uint8_t next[] = {0x48, 0xC7, 0x41, off, 0, 0, 0, 0};  // mov qword [rcx + off], 0
+    stub.insert(stub.end(), std::begin(next), std::end(next));
+  }
+  const uint8_t tail[] = {0x59, 0x48, 0x83, 0xC0, 0x40, 0xE9, 0, 0, 0, 0};  // pop rcx; add rax, 64; jmp back
+  stub.insert(stub.end(), std::begin(tail), std::end(tail));
+  uint8_t* code = stubs.take(image, stub.size());
+  if (!code) return false;
+  uint8_t* back = p + 7;
+  if (!fits_rel32(code + stub.size(), back) || !fits_rel32(p + 5, code)) return false;
+  std::memcpy(code, stub.data(), stub.size());
+  put_rel32(code + stub.size() - 4, code + stub.size(), back);
+  p[0] = 0xE9;
+  put_rel32(p + 1, p + 5, code);
+  p[5] = 0x66;  // a two-byte NOP, never reached
+  p[6] = 0x90;
+  return true;
 }
 
 // ---- emulation ----
@@ -293,11 +369,57 @@ bool emulate(CONTEXT* c, const Instruction& d, const uint8_t* code) {
   }
 }
 
+bool guarded_zero(uint64_t address, uint64_t size) {
+  __try {
+    std::memset(reinterpret_cast<void*>(address), 0, size);
+    return true;
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    return false;
+  }
+}
+
+// The flags `cmp a, b` leaves.
+uint32_t compare_flags(uint32_t eflags, uint64_t a, uint64_t b) {
+  const uint64_t r = a - b;
+  uint32_t f = eflags & ~0x8D5u;  // CF PF AF ZF SF OF
+  if (a < b) f |= 0x1;
+  if (!(__popcnt(static_cast<uint32_t>(r & 0xFF)) & 1)) f |= 0x4;
+  if ((a ^ b ^ r) & 0x10) f |= 0x10;
+  if (r == 0) f |= 0x40;
+  if (r >> 63) f |= 0x80;
+  if (((a ^ b) & (a ^ r)) >> 63) f |= 0x800;
+  return f;
+}
+
+// The game clears memory with loops of `clzero; add rax, 64; cmp rax, reg; jb back`: one trap
+// per cache line would cost millions of exceptions. A trap on such a loop's CLZERO runs the
+// whole loop: it clears the lines, leaves rax and the flags as the loop would, and continues
+// after the branch.
+bool run_clzero_loop(CONTEXT* c, const uint8_t* code, size_t n) {
+  if (n < 12 || code[0] != 0x0F || code[1] != 0x01 || code[2] != 0xFC) return false;
+  if (code[3] != 0x48 || code[4] != 0x83 || code[5] != 0xC0 || code[6] != 0x40) return false;  // add rax, 64
+  if ((code[7] & 0xFB) != 0x48 || code[8] != 0x39 || (code[9] & 0xC7) != 0xC0) return false;   // cmp rax, reg
+  if (code[10] != 0x72 || static_cast<int8_t>(code[11]) != -12) return false;                  // jb to the clzero
+  const int reg = ((code[9] >> 3) & 7) | ((code[7] & 4) ? 8 : 0);
+  const uint64_t limit = *gpr(c, reg);
+  uint64_t lines = 1;  // the loop runs its body before the test
+  if (c->Rax + 64 < limit) lines = (limit - c->Rax + 63) / 64;
+  if (!guarded_zero(c->Rax & ~63ull, lines * 64)) return false;
+  c->Rax += lines * 64;
+  c->EFlags = compare_flags(c->EFlags, c->Rax, limit);
+  c->Rip += 12;
+  return true;
+}
+
 LONG CALLBACK on_illegal_instruction(EXCEPTION_POINTERS* info) {
   if (info->ExceptionRecord->ExceptionCode != EXCEPTION_ILLEGAL_INSTRUCTION) return EXCEPTION_CONTINUE_SEARCH;
   CONTEXT* c = info->ContextRecord;
   uint8_t code[16] = {};
   const size_t n = read_code(reinterpret_cast<const uint8_t*>(c->Rip), code);
+  if (const uint64_t at = c->Rip; run_clzero_loop(c, code, n)) {
+    count_hit(at);
+    return EXCEPTION_CONTINUE_EXECUTION;
+  }
   Instruction d;
   if (x86::decode(std::span<const uint8_t>(code, n), d) != x86::DecodeStatus::Ok) return EXCEPTION_CONTINUE_SEARCH;
   if (!emulate(c, d, code)) return EXCEPTION_CONTINUE_SEARCH;
@@ -320,6 +442,15 @@ std::vector<EmulationHit> emulation_hits() {
     if (a) hits.push_back({a, g_hit_count[i].load(std::memory_order_relaxed)});
   }
   return hits;
+}
+
+bool patch_clzero_loop_at(MappedImage& image, uint32_t rva) {
+  if (rva + 12 > image.size || !is_clzero_loop(image.base + rva)) return false;
+  StubArena stubs;
+  const bool ok = patch_clzero_loop(image, image.base + rva, stubs);
+  stubs.finish();
+  FlushInstructionCache(GetCurrentProcess(), image.base + rva, 12);
+  return ok;
 }
 
 bool apply_cpu_compat(MappedImage& image, const std::filesystem::path& cache_dir, bool allow_missing,
@@ -350,9 +481,15 @@ bool apply_cpu_compat(MappedImage& image, const std::filesystem::path& cache_dir
     logf("cpu: %s; continuing anyway", what.c_str());
   }
 
+  StubArena stubs;
   for (const x86::Site& s : census.sites) {
     if (host::has_feature(cpu, s.feature)) continue;
     uint8_t* p = image.base + s.rva;
+    if (s.feature == CpuFeature::CLZERO && s.confidence == x86::Confidence::Confirmed && s.rva + 12 <= image.size &&
+        is_clzero_loop(p) && patch_clzero_loop(image, p, stubs)) {
+      ++result.patched;
+      continue;
+    }
     Instruction d;
     if (s.confidence != x86::Confidence::Confirmed ||
         x86::decode(std::span<const uint8_t>(p, s.length), d) != x86::DecodeStatus::Ok || d.length != s.length ||
@@ -362,6 +499,7 @@ bool apply_cpu_compat(MappedImage& image, const std::filesystem::path& cache_dir
     }
     ++result.patched;
   }
+  stubs.finish();
   logf("cpu: %s: %zu site(s) patched, %zu left to emulation%s", image.name.c_str(), result.patched, result.emulated,
        result.from_cache ? " (census from cache)" : "");
   return true;

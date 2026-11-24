@@ -848,21 +848,33 @@ The device's slots, as learned so far:
 | 15 | GetDescriptorHandleIncrementSize | 32 for resource views, 16 for samplers, 64 for render-target and depth (ours) |
 | 16 | CreateRootSignature | D3D12's; reads blobs in D3D12's serialized layout (raw, or a container's RTS0 part) |
 | 17–24 | the view creators, CopyDescriptors(Simple) | D3D12's order. Views write a tagged record into their descriptor slot; copies move memory |
-| 25 | GetResourceAllocationInfo | D3D12's sizing rules, including 4 KiB alignment for small textures |
+| 25 | GetResourceAllocationInfo | sizes from the texture layout model (`d3d12x/layout.h`) |
 | 26 | GetCustomHeapProperties | the answers for a unified-memory adapter |
+| 27 | CreateCommittedResource | D3D12's (the game's readback buffers) |
 | 36 | CreateFence | D3D12's |
 | 48 | CreateCommandQueueX | the console's own: 4 compute queues |
+| 55, 57, 67 | pipeline creations | the console's own; `ID3D12PipelineState` objects, descriptions not read yet. 55 is `(0, count, descriptions, riid, out)` and the game passes counts of 2 |
 | 62 | compute pipeline creation | `(D3D12_COMPUTE_PIPELINE_STATE_DESC, 0, 0, riid, out)`: the BVH builder's 40 pipelines |
 | 73 | CreateCommandListX | 16-byte description, allocator, initial pipeline, riid |
+| 78 | SetFrameIntervalX | `(output, microseconds, period, flags)`: the game asks for 33,333 us (30 fps) |
+| 79 | ScheduleFrameEventX | `(type, offset in microseconds, ?, flags)` |
+| 80 | WaitFrameEventX | `(type, timeout, ?, flags, &frame token)`: the render loop waits here; frames start every interval, each event type sees each frame once |
+| 86 | CreatePipelineState | D3D12's stream description: root signature and shaders kept |
+| 108 | GetResourceAllocationInfo2 | struct return, `(mask, count, D3D12_RESOURCE_DESC1s, per-resource info)`; the game asks with 4 KiB alignment first |
 | 127 | committed resource creation | shaped like `CreateCommittedResource3`: heap properties, flags, description, initial barrier layout, clear value, protected session, castable formats (count, list), riid, out |
-| 27, 39, 41 | CreateCommittedResource, CreateQueryHeap, CreateCommandSignature | D3D12's order (seen in probes; not implemented yet) |
-| 61, 70, 74, 78, 79, 86, 133 | not identified | probes; the game accepts their 0. 74 takes the 6.1 GiB of physical pages the game maps (address, page count, out, protection) |
+| 133 | CreatePlacedResourceX | `(GPU virtual address, description, initial layout, clear value, riid, out)`: a resource in the title's own memory, no heap |
+| 39, 41 | CreateQueryHeap, CreateCommandSignature | D3D12's order (probes) |
+| 61, 70, 74, 81 | not identified | probes; the game accepts their 0. 70 and 81 run once a frame (70 writes 32-byte descriptors in the big heap); 74 takes the 6.1 GiB of physical pages the game maps |
 
 Other objects:
 * **The DXGI view** (`IDXGIDevice`): adapter and output (the host's main display, reported at
   60 Hz). The output's slot 21 is the console's `GetDisplayModeList1`.
-* **Command queue:** Signal, Wait, GetTimestampFrequency, ExecuteCommandLists.
-* **Fence:** D3D12's slots 8–10.
+* **Command queue:** two slots later than D3D12's from Signal on: Signal 16, Wait 17,
+  GetTimestampFrequency 18 (our first guess, D3D12's 16, wrote the frequency over a fence's
+  vtable). Slot 32 is called once a frame as `(1, planes, parameters)`: `PresentX` (a probe
+  still); slot 35 twice a frame.
+* **Fence:** D3D12's slots 8–10; slot 12 gives the address of the fence's 64-bit value, which
+  the game's wait loop reads directly (the GPU's memory word on the console).
 * **Command allocator.**
 * **Command list:** 4 KiB of console fields; the game calls its slots 9, 131 and 132 after
   creating it.
@@ -876,7 +888,20 @@ Other objects:
 * **Root signatures:** `d3d12_xs!D3D12SerializeVersionedRootSignature` writes D3D12's
   serialized layout (versions 1.0 to 1.2); the console's own flag bits (`0x3000000` in the BVH
   builder's) pass through.
-* **Pipeline state:** keeps its root signature and a copy of the console shader container.
+* **Pipeline state:** keeps its root signature and copies of the console shader containers.
+* **Descriptor heaps:** the game also passes D3D12's plain 16-byte description, with stack
+  junk where the console's memory fields would be; those fields count only when the size fits
+  the heap and the memory is committed.
+* **Texture layouts and XG** (`d3d12x/layout.h`, `d3d12x/xg.cpp`): the description's Layout
+  field is `0x100` plus an RDNA swizzle mode (0 linear; 4 KiB blocks 4-7, 20-23; 64 KiB blocks
+  8-11, 16-19, 24-27). The game's texture headers name the mode; `XGSuggestSwizzleMode` picks
+  one for the others (Z / R / S by usage, 4 KiB blocks for small textures). One layout model
+  answers every size: each mip a grid of whole blocks shaped as on the GPU, layers one after
+  another, no mip tail, so sizes are never below the console's; texels are linear inside the
+  padded grid for now. The XG texture computer has no IUnknown (0 AddRef, 1 Release); slot 8
+  is CopyIntoSubresource.
+* **Probes log their call site** (`module+offset`), so each unknown slot leads to the code that
+  calls it.
 
 Null back end: queues finish work at once and fences reach their value when signalled.
 
@@ -887,10 +912,16 @@ handler when first touched; `XMemVirtualQuery` and `VirtualQuery` show mapped pa
 committed; title `ReadFile` / `WriteFile` (the kernel cannot fault pages in) commit their
 buffers first.
 
-**Where the game stops now.** The console texture layout library, `xg_xs.dll`:
-`XGSuggestSwizzleMode` and `XGCreateTextureComputer` (its address computer object). The game
-sizes and places its textures with it, so the layouts must be the console GPU's own (the
-texture data on disk is laid out for them).
+**CLZERO clearing loops run native.** The game clears memory with
+`clzero; add rax, 64; cmp rax, reg; jb loop`, called about 10,000 times a second; emulating
+each CLZERO cost millions of exceptions a minute. At load such loops now jump to a stub next to
+the image that clears the line with eight stores (18 of the executable's 41 Zen 2-only sites
+are patched, 23 left to emulation, none of them hot so far).
+
+**Where the game is now: its frame loop, at 30 fps, with the null back end.** It records
+command lists, presents once a frame (queue slot 32) and waits for frame events between
+frames, for the whole 120 s of a run without a crash. Next: `PresentX` into a window, the
+per-frame probes (device 70 and 81, queue 35, the command list's slots), then the GPU back end.
 
 ### Local tools (in `C:\Project Americas\tools`, never in the repository)
 
@@ -905,8 +936,8 @@ texture data on disk is laid out for them).
 
 
 Next, in parallel:
-* **M2.** The D3D12.X device (M2.4): the console texture layouts (`xg_xs.dll`, the current
-  stop), then the rest of the device and command list slots the game reaches, `PresentX`,
+* **M2.** The D3D12.X device (M2.4): `PresentX` into a window and the per-frame probes, then
+  the rest of the device and command list slots the game reaches, `PresentX`,
   frame pacing and a window; threads and topology, GameInput devices, and the remaining
   XGameRuntime areas (XPackage, XPersistentLocalStorage, XDisplay HDR) as the game reaches
   them.

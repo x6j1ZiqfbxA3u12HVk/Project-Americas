@@ -83,6 +83,51 @@ TEST_CASE(cpu_emulation_clzero_clears_one_aligned_line) {
   CHECK(third);
 }
 
+TEST_CASE(cpu_emulation_clzero_loop_runs_whole) {
+  am::rt::install_cpu_emulation();
+  // The game's clearing loop:
+  //   mov rax, rcx ; mov r10, rdx
+  //   loop: clzero ; add rax, 64 ; cmp rax, r10 ; jb loop
+  //   setb cl ; movzx ecx, cl ; shl rcx, 32 ; or rax, rcx ; ret   (rax, and CF in bit 32)
+  const Fn f = assemble({0x48, 0x89, 0xC8, 0x49, 0x89, 0xD2,                    //
+                         0x0F, 0x01, 0xFC, 0x48, 0x83, 0xC0, 0x40, 0x4C, 0x39, 0xD0, 0x72, 0xF4,  //
+                         0x0F, 0x92, 0xC1, 0x0F, 0xB6, 0xC9, 0x48, 0xC1, 0xE1, 0x20, 0x48, 0x09, 0xC8, 0xC3});
+  alignas(64) uint8_t buf[64 * 8];
+  std::memset(buf, 0xAA, sizeof buf);
+  const uint64_t start = reinterpret_cast<uint64_t>(buf + 64);
+  const uint64_t r = f(start, start + 64 * 5 - 8);  // lines 1 to 5
+  CHECK(r == start + 64 * 5);                        // rax past the last line; CF clear
+  bool before = buf[63] == 0xAA, cleared = true, after = buf[64 * 6] == 0xAA;
+  for (int i = 64; i < 64 * 6; ++i) cleared = cleared && buf[i] == 0;
+  CHECK(before);
+  CHECK(cleared);
+  CHECK(after);
+  // A limit below the start still clears one line, as the loop does.
+  std::memset(buf, 0xAA, sizeof buf);
+  CHECK(f(start, start) == start + 64);
+  CHECK(buf[64] == 0 && buf[127] == 0 && buf[128] == 0xAA);
+}
+
+TEST_CASE(cpu_patch_clzero_loop_with_native_stub) {
+  // The same loop as above, patched as at load: it must clear the same lines without CLZERO.
+  const Fn f = assemble({0x48, 0x89, 0xC8, 0x49, 0x89, 0xD2,                    //
+                         0x0F, 0x01, 0xFC, 0x48, 0x83, 0xC0, 0x40, 0x4C, 0x39, 0xD0, 0x72, 0xF4,  //
+                         0x0F, 0x92, 0xC1, 0x0F, 0xB6, 0xC9, 0x48, 0xC1, 0xE1, 0x20, 0x48, 0x09, 0xC8, 0xC3});
+  am::rt::MappedImage image;
+  image.base = reinterpret_cast<uint8_t*>(f);
+  image.size = 4096;
+  CHECK(am::rt::patch_clzero_loop_at(image, 6));
+  CHECK(image.base[6] == 0xE9);  // now a jump to the stub
+  CHECK(!am::rt::patch_clzero_loop_at(image, 0));
+  alignas(64) uint8_t buf[64 * 8];
+  std::memset(buf, 0xAA, sizeof buf);
+  const uint64_t start = reinterpret_cast<uint64_t>(buf + 64 + 8);  // inside line 1
+  CHECK(f(start, start + 64 * 3) == start + 64 * 3);
+  bool cleared = true;
+  for (int i = 64; i < 64 * 4; ++i) cleared = cleared && buf[i] == 0;
+  CHECK(cleared && buf[63] == 0xAA && buf[64 * 4] == 0xAA);
+}
+
 TEST_CASE(cpu_emulation_clwb_monitorx_rdpid_rdpru_continue) {
   am::rt::install_cpu_emulation();
   // clwb [rcx] ; mov rax, rcx ; xor ecx, ecx ; xor edx, edx ; monitorx ; mov eax, 7 ; ret

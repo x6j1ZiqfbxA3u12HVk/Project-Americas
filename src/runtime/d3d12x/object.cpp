@@ -1,16 +1,19 @@
 #include "runtime/d3d12x/object.h"
 
 #include <windows.h>
+#include <intrin.h>
 
 #include <algorithm>
 #include <array>
 #include <cstdio>
 #include <mutex>
 #include <shared_mutex>
+#include <string>
 #include <unordered_set>
 #include <utility>
 
 #include "runtime/log.h"
+#include "runtime/process.h"
 
 namespace am::rt::d3d12x {
 
@@ -34,9 +37,23 @@ std::vector<Kind*>& kinds() {
 std::atomic<uint64_t> g_sequence{0};
 
 // The first calls of a slot we do not implement: logged with the integer arguments.
+// "module+offset" for a code address in a title module (where a probe was called from).
+std::string caller_text(const void* address) {
+  char text[96];
+  if (TitleProcess* p = process()) {
+    if (const MappedImage* m = p->module_containing(address)) {
+      std::snprintf(text, sizeof text, "%s+0x%llx", m->name.c_str(),
+                    static_cast<unsigned long long>(static_cast<const uint8_t*>(address) - m->base));
+      return text;
+    }
+  }
+  std::snprintf(text, sizeof text, "%p", address);
+  return text;
+}
+
 template <int N>
-uint64_t probe(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6,
-               uint64_t a7) {
+__declspec(noinline) uint64_t probe(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5,
+                                    uint64_t a6, uint64_t a7) {
   Object* self = nullptr;
   bool struct_return = false;
   if (is_object(reinterpret_cast<void*>(a0))) {
@@ -55,11 +72,12 @@ uint64_t probe(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, 
   if (calls < 3) {
     const uint64_t seq = g_sequence.fetch_add(1);
     const char* name = kind->slot_name(N);
-    logf("d3d12x: #%llu %s slot %d%s%s%s not implemented: %s%llx %llx %llx %llx %llx %llx %llx",
+    logf("d3d12x: #%llu %s slot %d%s%s%s not implemented (from %s): %s%llx %llx %llx %llx %llx %llx %llx",
          static_cast<unsigned long long>(seq), kind->name(), N, name ? " (" : "", name ? name : "", name ? ")" : "",
-         struct_return ? "[struct return] " : "", static_cast<unsigned long long>(a0), static_cast<unsigned long long>(a1),
-         static_cast<unsigned long long>(a2), static_cast<unsigned long long>(a3), static_cast<unsigned long long>(a4),
-         static_cast<unsigned long long>(a5), static_cast<unsigned long long>(a6));
+         caller_text(_ReturnAddress()).c_str(), struct_return ? "[struct return] " : "",
+         static_cast<unsigned long long>(a0), static_cast<unsigned long long>(a1), static_cast<unsigned long long>(a2),
+         static_cast<unsigned long long>(a3), static_cast<unsigned long long>(a4), static_cast<unsigned long long>(a5),
+         static_cast<unsigned long long>(a6));
   }
   (void)a7;
   return 0;
@@ -92,7 +110,8 @@ Kind::Kind(const char* name, int slots, std::vector<Method> methods) : name_(nam
   for (const Method& m : methods) {
     if (m.slot < 0 || m.slot >= slots) continue;
     names_[static_cast<size_t>(m.slot)] = m.name;
-    if (m.function) table_[static_cast<size_t>(m.slot)] = m.function;
+    if (m.function == kProbe) table_[static_cast<size_t>(m.slot)] = p[static_cast<size_t>(m.slot)];
+    else if (m.function) table_[static_cast<size_t>(m.slot)] = m.function;
   }
   register_kind(this);
 }

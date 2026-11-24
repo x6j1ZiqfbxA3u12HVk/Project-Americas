@@ -6,6 +6,10 @@
 //
 // and checks that the heap's CPU start is that address. Without an address the heap's memory is
 // ours (zeroed). CPU and GPU handles are the same address: the console's memory is unified.
+//
+// The game also passes D3D12's own 16-byte description, with whatever its stack holds after it.
+// So the memory fields count only when they describe the heap: a size that fits it (not much
+// more), and committed memory there. Anything else gets memory of ours.
 
 #include <windows.h>
 #include <d3d12.h>
@@ -82,6 +86,18 @@ const Kind& heap_kind() {
 
 }  // namespace
 
+// Whether the description's memory fields name memory for this heap.
+bool names_heap_memory(const HeapDescX& d, uint64_t needed) {
+  if (!d.address || d.address % 16 || !needed || d.size < needed || d.size > needed + 65536) return false;
+  for (const uint64_t at : {d.address, d.address + needed - 1}) {
+    MEMORY_BASIC_INFORMATION mbi;
+    if (VirtualQuery(reinterpret_cast<const void*>(at), &mbi, sizeof mbi) != sizeof mbi) return false;
+    // Mapped physical pages may not be committed until touched; they count.
+    if (mbi.State != MEM_COMMIT && !(mbi.State == MEM_RESERVE && mbi.Type == MEM_MAPPED)) return false;
+  }
+  return true;
+}
+
 HRESULT create_descriptor_heap(const void* desc_in, const GUID* riid, void** out) {
   if (!out || !desc_in) return E_POINTER;
   *out = nullptr;
@@ -89,7 +105,7 @@ HRESULT create_descriptor_heap(const void* desc_in, const GUID* riid, void** out
   std::memcpy(&d, desc_in, sizeof d);
   const uint64_t needed = uint64_t{d.count} * descriptor_size(d.type);
   auto* h = make_object<DescriptorHeap>(heap_kind());
-  if (!d.address) {
+  if (!names_heap_memory(d, needed)) {
     h->owned = VirtualAlloc(nullptr, needed ? needed : 1, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
     if (!h->owned) {
       release(h);
@@ -97,9 +113,6 @@ HRESULT create_descriptor_heap(const void* desc_in, const GUID* riid, void** out
     }
     d.address = reinterpret_cast<uint64_t>(h->owned);
     d.size = needed;
-  } else if (d.size && d.size < needed) {
-    logf("d3d12x: descriptor heap memory of %llu bytes holds fewer than %u descriptors", static_cast<unsigned long long>(d.size),
-         d.count);
   }
   h->desc = d;
   static std::atomic<int> logged{0};

@@ -8,6 +8,7 @@
 #include <windows.h>
 #include <d3d12.h>
 
+#include <atomic>
 #include <cstring>
 #include <mutex>
 #include <utility>
@@ -22,10 +23,12 @@ namespace {
 
 // ---- fence ----
 
+// The fence's value is a 64-bit word in memory, as on the console, where the GPU writes it and
+// title code reads it directly (slot 12 gives its address).
 struct Fence : Object {
   explicit Fence(uint64_t initial) : value(initial) {}
   std::mutex lock;
-  uint64_t value;
+  std::atomic<uint64_t> value;
   std::vector<std::pair<uint64_t, HANDLE>> waits;  // events to set when the value is reached
 
   void signal(uint64_t v) {
@@ -46,9 +49,15 @@ struct Fence : Object {
   }
 };
 
-UINT64 WINAPI fence_get_completed_value(Fence* self) {
-  std::lock_guard g(self->lock);
-  return self->value;
+static_assert(sizeof(std::atomic<uint64_t>) == sizeof(uint64_t));
+
+UINT64 WINAPI fence_get_completed_value(Fence* self) { return self->value.load(); }
+
+// Slot 12: the address of the fence's value. The game's wait loop reads it until the value it
+// waits for arrives.
+const volatile uint64_t* WINAPI fence_value_address(Fence* self) {
+  trace(self, 12, "value address", reinterpret_cast<uint64_t>(&self->value), 0, 0);
+  return reinterpret_cast<const volatile uint64_t*>(&self->value);
 }
 
 HRESULT WINAPI fence_set_event_on_completion(Fence* self, UINT64 value, HANDLE event) {
@@ -77,6 +86,7 @@ const Kind& fence_kind() {
       {8, "GetCompletedValue", reinterpret_cast<void*>(&fence_get_completed_value)},
       {9, "SetEventOnCompletion", reinterpret_cast<void*>(&fence_set_event_on_completion)},
       {10, "Signal", reinterpret_cast<void*>(&fence_signal)},
+      {12, "value address", reinterpret_cast<void*>(&fence_value_address)},
   });
   return k;
 }
@@ -91,18 +101,18 @@ struct Queue : Object {
 };
 
 HRESULT WINAPI queue_signal(Queue* self, Object* fence, UINT64 value) {
-  trace(self, 14, "Signal", reinterpret_cast<uint64_t>(fence), value, 0);
+  trace(self, 16, "Signal", reinterpret_cast<uint64_t>(fence), value, 0);
   if (Object* f = object_of_kind(fence, fence_kind())) static_cast<Fence*>(f)->signal(value);
   return S_OK;
 }
 
 HRESULT WINAPI queue_wait(Queue* self, Object* fence, UINT64 value) {
-  trace(self, 15, "Wait", reinterpret_cast<uint64_t>(fence), value, 0);
+  trace(self, 17, "Wait", reinterpret_cast<uint64_t>(fence), value, 0);
   return S_OK;  // the null back end has nothing to wait for
 }
 
 HRESULT WINAPI queue_get_timestamp_frequency(Queue* self, UINT64* frequency) {
-  trace(self, 16, "GetTimestampFrequency", reinterpret_cast<uint64_t>(frequency), 0, 0);
+  trace(self, 18, "GetTimestampFrequency", reinterpret_cast<uint64_t>(frequency), 0, 0);
   if (!frequency) return E_POINTER;
   LARGE_INTEGER f;
   QueryPerformanceFrequency(&f);
@@ -117,9 +127,11 @@ void WINAPI queue_execute_command_lists(Queue* self, UINT count, void* const* li
 const Kind& queue_kind() {
   static const Kind k("command queue", 64, {
       {10, "ExecuteCommandLists", reinterpret_cast<void*>(&queue_execute_command_lists)},
-      {14, "Signal", reinterpret_cast<void*>(&queue_signal)},
-      {15, "Wait", reinterpret_cast<void*>(&queue_wait)},
-      {16, "GetTimestampFrequency", reinterpret_cast<void*>(&queue_get_timestamp_frequency)},
+      // D3D12's Signal, Wait and GetTimestampFrequency, two slots later than in D3D12: the game
+      // signals fences through slot 16 and asks the frequency through 18.
+      {16, "Signal", reinterpret_cast<void*>(&queue_signal)},
+      {17, "Wait", reinterpret_cast<void*>(&queue_wait)},
+      {18, "GetTimestampFrequency", reinterpret_cast<void*>(&queue_get_timestamp_frequency)},
   });
   return k;
 }

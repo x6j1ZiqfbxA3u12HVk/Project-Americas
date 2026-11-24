@@ -106,6 +106,42 @@ HRESULT WINAPI create_compute_pipeline_x(Device*, const D3D12_COMPUTE_PIPELINE_S
   return create_compute_pipeline(desc, extra0, extra1, riid, out);
 }
 
+// Slot 86: CreatePipelineState(stream description, riid, out), as in D3D12.
+HRESULT WINAPI create_pipeline_state(Device*, const D3D12_PIPELINE_STATE_STREAM_DESC* desc, const GUID* riid,
+                                     void** out) {
+  return create_pipeline_from_stream(desc, riid, out);
+}
+
+// Slots 57 and 67: console pipeline creations, (description, riid, out, ...). Slot 55: (0,
+// count, descriptions, riid, out); the game passes a count of 1.
+HRESULT WINAPI create_pipeline_57(Device*, const void* desc, const GUID* riid, void** out) {
+  return create_console_pipeline("pipeline (slot 57)", desc, riid, out);
+}
+HRESULT WINAPI create_pipeline_67(Device*, const void* desc, const GUID* riid, void** out) {
+  return create_console_pipeline("pipeline (slot 67)", desc, riid, out);
+}
+HRESULT WINAPI create_pipeline_55(Device*, uint64_t, UINT count, const void* desc, const GUID* riid, void** out) {
+  if (count != 1) logf("d3d12x: slot 55 with %u descriptions: only the first is answered", count);
+  return create_console_pipeline("pipeline (slot 55)", desc, riid, out);
+}
+
+// Slot 27: CreateCommittedResource(heap properties, heap flags, description, initial state,
+// clear value, riid, out), as in D3D12.
+HRESULT WINAPI create_committed_resource_slot(Device* self, const D3D12_HEAP_PROPERTIES* heap, UINT heap_flags,
+                                              const D3D12_RESOURCE_DESC* desc, UINT initial_state,
+                                              const D3D12_CLEAR_VALUE* clear, const GUID* riid, void** out) {
+  return create_committed_resource(self, heap, heap_flags, desc, initial_state, clear, riid, out);
+}
+
+// Slot 133: the console's placed resource creation at a GPU virtual address: (address,
+// description, initial layout, clear value, riid, out). The game passes layout 0xFFFFFFFF
+// (D3D12_BARRIER_LAYOUT_UNDEFINED).
+HRESULT WINAPI create_placed_resource_x(Device* self, uint64_t address, const D3D12_RESOURCE_DESC* desc,
+                                        UINT initial_layout, const D3D12_CLEAR_VALUE* clear, const GUID* riid,
+                                        void** out) {
+  return create_placed_resource_at(self, address, desc, initial_layout, clear, riid, out);
+}
+
 // Slot 127: committed resource creation, shaped like D3D12's CreateCommittedResource3: (heap
 // properties, heap flags, description, initial barrier layout, clear value, protected session,
 // castable format count, castable formats, riid, out). The game asks for ID3D12Resource.
@@ -126,13 +162,20 @@ std::vector<Method> device_methods() {
       {15, "GetDescriptorHandleIncrementSize", reinterpret_cast<void*>(&get_descriptor_handle_increment_size)},
       {16, "CreateRootSignature", reinterpret_cast<void*>(&create_root_signature_slot)},
       {26, "GetCustomHeapProperties", reinterpret_cast<void*>(&get_custom_heap_properties)},
+      {27, "CreateCommittedResource", reinterpret_cast<void*>(&create_committed_resource_slot)},
       {36, "CreateFence", reinterpret_cast<void*>(&create_fence_slot)},
       {48, "CreateCommandQueueX", reinterpret_cast<void*>(&create_command_queue_x)},
+      {55, "CreatePipelineX (55)", reinterpret_cast<void*>(&create_pipeline_55)},
+      {57, "CreatePipelineX (57)", reinterpret_cast<void*>(&create_pipeline_57)},
       {62, "CreateComputePipelineStateX", reinterpret_cast<void*>(&create_compute_pipeline_x)},
+      {67, "CreatePipelineX (67)", reinterpret_cast<void*>(&create_pipeline_67)},
       {73, "CreateCommandListX", reinterpret_cast<void*>(&create_command_list_x)},
+      {86, "CreatePipelineState", reinterpret_cast<void*>(&create_pipeline_state)},
       {127, "CreateCommittedResourceX", reinterpret_cast<void*>(&create_committed_resource_x)},
+      {133, "CreatePlacedResourceX", reinterpret_cast<void*>(&create_placed_resource_x)},
   };
   add_view_methods(m);
+  add_frame_methods(m);
   return m;
 }
 

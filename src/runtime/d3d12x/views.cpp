@@ -1,5 +1,5 @@
 // Views and descriptor copies (device slots 17-25, which follow D3D12's order), and resource
-// allocation sizes.
+// allocation sizes (slots 25 and 108).
 //
 // On the console a descriptor is memory the title owns: its own code copies descriptors and the
 // GPU reads them. Each view therefore writes a small record into its descriptor slot (which view,
@@ -13,7 +13,7 @@
 #include <cstring>
 
 #include "runtime/d3d12x/d3d12x.h"
-#include "runtime/d3d12x/formats.h"
+#include "runtime/d3d12x/layout.h"
 #include "runtime/d3d12x/object.h"
 #include "runtime/log.h"
 
@@ -129,44 +129,50 @@ D3D12_RESOURCE_ALLOCATION_INFO* WINAPI get_resource_allocation_info(uint64_t a0,
   return out;
 }
 
+// Slot 108: GetResourceAllocationInfo2(visible mask, count, D3D12_RESOURCE_DESC1 array,
+// D3D12_RESOURCE_ALLOCATION_INFO1 array or null): struct return. The game asks with 4 KiB
+// alignment first and again without when the answer's alignment differs.
+D3D12_RESOURCE_ALLOCATION_INFO* WINAPI get_resource_allocation_info2(uint64_t a0, uint64_t a1, UINT, UINT count,
+                                                                     const D3D12_RESOURCE_DESC1* descs,
+                                                                     D3D12_RESOURCE_ALLOCATION_INFO1* each) {
+  D3D12_RESOURCE_ALLOCATION_INFO* out = reinterpret_cast<D3D12_RESOURCE_ALLOCATION_INFO*>(is_object(reinterpret_cast<void*>(a1)) ? a0 : a1);
+  uint64_t size = 0, alignment = 0;
+  for (UINT i = 0; descs && i < count; ++i) {
+    D3D12_RESOURCE_DESC d{};
+    std::memcpy(&d, &descs[i], sizeof d);  // DESC1 begins with DESC's fields
+    const D3D12_RESOURCE_ALLOCATION_INFO r = allocation_info(d);
+    if (r.SizeInBytes == UINT64_MAX) {
+      size = UINT64_MAX;
+      if (each) each[i] = {UINT64_MAX, 0, UINT64_MAX};
+      break;
+    }
+    alignment = std::max<uint64_t>(alignment, r.Alignment);
+    const uint64_t offset = align_up(size, r.Alignment);
+    if (each) each[i] = {offset, r.Alignment, r.SizeInBytes};
+    size = offset + r.SizeInBytes;
+  }
+  *out = {size, alignment};
+  static std::atomic<int> logged{0};
+  if (logged.fetch_add(1) < 24 && descs && count) {
+    logf("d3d12x: GetResourceAllocationInfo2(dim %u, %llux%u x%u, %u mips, format %u, layout 0x%x, flags 0x%x, alignment %llu) = %llu bytes, alignment %llu",
+         descs[0].Dimension, static_cast<unsigned long long>(descs[0].Width), descs[0].Height, descs[0].DepthOrArraySize,
+         descs[0].MipLevels, descs[0].Format, static_cast<uint32_t>(descs[0].Layout), descs[0].Flags,
+         static_cast<unsigned long long>(descs[0].Alignment), static_cast<unsigned long long>(size),
+         static_cast<unsigned long long>(alignment));
+  }
+  return out;
+}
+
 }  // namespace
 
-// The bytes and alignment one resource needs, by D3D12's rules: buffers in 64 KiB units; textures
-// at 64 KiB (4 MiB when multisampled), or 4 KiB when the caller asks for it and the texture is
-// small enough (64 KiB or less, not a render target or depth buffer).
+// The bytes and alignment one resource needs: buffers in 64 KiB units, textures by our layout
+// model (layout.h), which the console's XG library answers with too.
 D3D12_RESOURCE_ALLOCATION_INFO allocation_info(const D3D12_RESOURCE_DESC& d) {
-  constexpr uint64_t k4K = 4096, k64K = 65536, k4M = 4u << 20;
+  constexpr uint64_t k64K = 65536;
   if (d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) return {align_up(d.Width, k64K), k64K};
-  if (d.Dimension == D3D12_RESOURCE_DIMENSION_UNKNOWN) return {UINT64_MAX, 0};
-  FormatSize f = format_size(d.Format);
-  if (!f.bytes) {
-    static std::atomic<int> logged{0};
-    if (logged.fetch_add(1) < 8) logf("d3d12x: no size for format %u; assuming 4 bytes per texel", d.Format);
-    f = {4, 1};
-  }
-  const bool is_3d = d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
-  const uint32_t layers = is_3d ? 1 : std::max<uint32_t>(d.DepthOrArraySize, 1);
-  uint32_t mips = d.MipLevels;
-  if (mips == 0) {
-    uint64_t largest = std::max<uint64_t>({d.Width, d.Height, is_3d ? d.DepthOrArraySize : 1u});
-    while (largest) {
-      ++mips;
-      largest >>= 1;
-    }
-  }
-  const uint32_t samples = std::max<uint32_t>(d.SampleDesc.Count, 1);
-  uint64_t layer_bytes = 0;
-  for (uint32_t m = 0; m < mips; ++m) {
-    const uint64_t w = std::max<uint64_t>(d.Width >> m, 1), h = std::max<uint64_t>(d.Height >> m, 1);
-    const uint64_t depth = is_3d ? std::max<uint64_t>(uint64_t{d.DepthOrArraySize} >> m, 1) : 1;
-    const uint64_t bw = (w + f.block - 1) / f.block, bh = (h + f.block - 1) / f.block;
-    layer_bytes += align_up(bw * f.bytes, 256) * bh * depth * samples;
-  }
-  const uint64_t total = layer_bytes * layers;
-  const bool target = (d.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)) != 0;
-  uint64_t alignment = samples > 1 ? k4M : k64K;
-  if (d.Alignment == k4K && !target && samples == 1 && total <= k64K) alignment = k4K;
-  return {align_up(total, alignment), alignment};
+  TextureLayout layout;
+  if (!texture_layout(d, layout)) return {UINT64_MAX, 0};
+  return {layout.size, layout.alignment};
 }
 
 void add_view_methods(std::vector<Method>& out) {
@@ -180,6 +186,7 @@ void add_view_methods(std::vector<Method>& out) {
       {23, "CopyDescriptors", reinterpret_cast<void*>(&copy_descriptors)},
       {24, "CopyDescriptorsSimple", reinterpret_cast<void*>(&copy_descriptors_simple)},
       {25, "GetResourceAllocationInfo", reinterpret_cast<void*>(&get_resource_allocation_info)},
+      {108, "GetResourceAllocationInfo2", reinterpret_cast<void*>(&get_resource_allocation_info2)},
   });
 }
 

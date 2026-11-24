@@ -1,5 +1,5 @@
-// d3d12_xs.dll: Direct3D 12.X. D3D12ConfigureVirtualMemoryX here; the device, its objects and the
-// root signature serializer in runtime/d3d12x.
+// d3d12_xs.dll (Direct3D 12.X) and xg_xs.dll (texture layouts). D3D12ConfigureVirtualMemoryX
+// here; the device, its objects, the root signature serializer and XG in runtime/d3d12x.
 
 #include <windows.h>
 
@@ -32,6 +32,9 @@ void add_graphics(std::vector<Function>& out) {
   out.push_back(Function{"d3d12_xs.dll", "D3D12XboxCreateDevice", reinterpret_cast<void*>(&d3d12x::create_device)});
   out.push_back(Function{"d3d12_xs.dll", "D3D12SerializeVersionedRootSignature",
                          reinterpret_cast<void*>(&d3d12x::serialize_versioned_root_signature)});
+  out.push_back(Function{"xg_xs.dll", "XGSuggestSwizzleMode", reinterpret_cast<void*>(&d3d12x::xg_suggest_swizzle_mode)});
+  out.push_back(
+      Function{"xg_xs.dll", "XGCreateTextureComputer", reinterpret_cast<void*>(&d3d12x::xg_create_texture_computer)});
 }
 
 }  // namespace am::rt::hle
