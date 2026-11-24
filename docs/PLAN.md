@@ -76,14 +76,45 @@ Windows API sets also exist on a PC, but some need console behaviour on top: mem
 `psm-appnotify` (app lifecycle), library loader (console DLL names), sysinfo (memory status),
 WER, WinHTTP / Winsock (network policy), and the `ext-ms-win-rtcore-ntuser` window functions.
 
-## 4. This machine, and what it means
+## 4. Hardware: any capable PC
 
-| Part | Found | Consequence |
+Project Americas is a program for anyone's PC, not for one machine. It detects what the host
+offers at start-up (the same checks `am-probe` prints) and takes the fastest path the hardware
+supports. Every optional feature has a working fallback; only true requirements stop it, with a
+message saying what is missing.
+
+### Requirements (provisional, tightened as milestones measure)
+
+| Part | Requirement | Why |
 |---|---|---|
-| CPU | Intel i7-7700K, 4 cores / 8 threads (Kaby Lake) | (a) Console code assumes Zen 2 and may use instructions this CPU lacks: `CLWB`, `CLZERO`, `RDPID`, `RDPRU`, `MONITORX`/`MWAITX`, SSE4a (`EXTRQ`/`INSERTQ`/`MOVNTSS`/`MOVNTSD`), SHA. A byte scan is inconclusive, so a proper disassembly census is task M1.1. (b) The game is built to keep ~7 Zen 2 cores busy at 30 fps. This CPU has roughly half that multithreaded capacity. **In busy scenes the CPU, not our layer, will likely set the frame rate.** Our job is to add as close to zero CPU cost as possible and to schedule the game's workers well over 8 logical processors. |
-| RAM | 16 GB, page file 16 GB (commit limit 31.9 GB, of which other programs held 23.4 GB during the M0 probe) | Series X title memory reaches ~13.5 GB, plus Windows and our process. **Start by presenting the console as a Series S**: the game then budgets itself to the Series S memory size, a mode it was built and tested for. Series X mode comes later, with a larger page file. |
-| GPU | AMD Radeon RX 9060 XT 16 GB (RDNA4): feature level 12_2, Shader Model 6.8, waves 32–64 lanes, mesh shaders, ray tracing 1.1, 64-bit atomics, enhanced barriers (measured by `am-probe`) | The target. RDNA4 helps a lot: the same vendor's wave semantics as the console, native wave64, mesh shaders, FSR 4. Adapter selection is explicit and rejects software adapters. (A GTX 1070 entry seen earlier was the leftover driver of a card no longer installed; it was removed.) |
-| Platform | Z270-era board: PCIe 3.0 x16 to the GPU. **Resizable BAR is unavailable: `am-probe` reports no GPU upload heaps.** | The CPU cannot write most of VRAM directly. So unified memory is emulated by keeping GPU data in VRAM and uploading only what changes (section 5.2). The design does not depend on Resizable BAR; where it exists, it is a bonus. |
+| OS | Windows 11 x64, or Windows 10 22H2 with the D3D12 Agility SDK | D3D12 Shader Model 6.6+, placeholder memory APIs |
+| CPU | x86-64 with the instruction sets the game uses too often to emulate. AVX2, FMA3, BMI1/2 and F16C are expected; the M1.1 census decides. | Console code uses Zen 2 features without checking; emulating hot instructions would be far too slow |
+| GPU | Direct3D 12, Shader Model 6.6, resource binding tier 3, mesh shaders | Console NGG geometry becomes mesh shaders; descriptors are heap-indexed |
+| Memory | 16 GB RAM and a page file large enough for the chosen console profile | The game budgets itself to the console's title memory |
+
+### Used when present, with a fallback when not
+
+| Feature | When present | When absent |
+|---|---|---|
+| Zen 2-only instructions (SSE4a, SHA, CLWB, CLZERO, RDPID, RDPRU, MONITORX/MWAITX) | The code runs unpatched | Patched in memory at load: a same-length equivalent or a jump to a stub; an exception handler catches the rest |
+| Resizable BAR (D3D12 GPU upload heaps) | Per-frame CPU-written GPU data (memory class C) and upload staging live in CPU-visible VRAM | That data lives in GPU-readable system memory, and changed ranges are uploaded into VRAM |
+| 64-lane waves (AMD) | Console wave64 programs run as wave64 | Wave64 programs are emulated on 32-lane waves (NVIDIA, Intel): correct but slower |
+| Hardware ray tracing (DXR 1.1) | Optional host DXR path for the game's ray tracing (M8) | BVH intersection emulated in shader code |
+| Host upscaler (FidelityFX SDK; vendor upscalers later) | The game's FSR call goes to the host upscaler | The console FSR DLL runs through the shader recompiler |
+| Enhanced barriers | Used for command translation | Legacy resource barriers |
+| Large pages + "Lock pages in memory" | The game's big heaps use 2 MB pages | 4 KB pages |
+| More cores and threads | The game's workers spread over more host processors | Workers are scheduled onto fewer processors |
+| More RAM and page file | Series X console profile | Series S console profile (smaller title memory) |
+| HDR display | HDR output | SDR output |
+
+**Performance note.** The game is built to keep ~7 Zen 2 cores busy at 30 fps. On hosts with
+fewer or slower cores, the CPU itself, not our layer, sets the frame rate in busy scenes.
+
+### Test machines
+
+| Machine | CPU | RAM | GPU | Notes (from `am-probe`) |
+|---|---|---|---|---|
+| Dev PC 1 | Intel i7-7700K, 4C/8T (Kaby Lake) | 16 GB + 16 GB page file | AMD RX 9060 XT 16 GB (RDNA4): FL 12_2, SM 6.8, waves 32–64, mesh shaders, DXR 1.1 | Lacks all 7 Zen 2-only instruction sets. No Resizable BAR (Z270, PCIe 3.0). The fallback paths get exercised here first. |
 
 ## 5. Architecture
 
@@ -103,7 +134,7 @@ WER, WinHTTP / Winsock (network policy), and the `ext-ms-win-rtcore-ntuser` wind
                ▼                             ▼                         │   shader (RDNA2 → DXIL)
         host Windows                  saves in userdata\               │       │
                                                                        ▼       ▼
-        audio (AcpHal/XApu/XDsp → WASAPI)  input (GameInput)      RX 9060 XT   cache\shaders
+        audio (AcpHal/XApu/XDsp → WASAPI)  input (GameInput)      host GPU     cache\shaders
         storage (DirectStorage, zlib, BCPack)
 ```
 
@@ -281,7 +312,7 @@ the 26,503 records of `shaders.rpf`.
    cache is warmed after it.
 7. **Tests.**
    * per-instruction GPU tests: our own small programs, assembled with an assembler used by the
-     tests only, run on the RX 9060 XT and checked against CPU reference semantics;
+     tests only, run on the host GPU and checked against CPU reference semantics;
    * a pack-wide survey: translate everything and count failures by reason.
 
 ### 5.7 DirectStorage (`src/storage`)
@@ -345,8 +376,8 @@ Each milestone ends in a result that can be checked.
 
 | # | Milestone | Done when |
 |---|---|---|
-| M0 ✅ | **Foundations.** CMake + Ninja + MSVC (VS 2022), C++20; build tree under `C:\Project Americas\build`; `.gitignore` for build output; an asset-policy pre-commit check; `am-probe` (host GPU features incl. GPU upload heaps / Resizable BAR, SM level, wave64, mesh shaders, CPU instruction support, memory / page file); `am-inspect` (PE + import census with each import's planned route). | `am-inspect` lists all 587 imports with a route; `am-probe` reports this machine. **Done**, see section 11. |
-| M1 | **CPU census and loader.** M1.1: disassembly census of Zen 2-only instructions in the exe and DLLs. Then mapping, binding, TLS carrier, exception tables, CPU patch pass, crash reports. A synthetic "console title" built from our own code exercises the loader in tests. | The game's code runs past CRT start-up into its own initialisation, with a full call census. |
+| M0 ✅ | **Foundations.** CMake + Ninja + MSVC (VS 2022), C++20; build tree under `C:\Project Americas\build`; `.gitignore` for build output; an asset-policy pre-commit check; `am-probe` (host GPU features incl. GPU upload heaps / Resizable BAR, SM level, wave64, mesh shaders, CPU instruction support, memory / page file); `am-inspect` (PE + import census with each import's planned route). | `am-inspect` lists all 587 imports with a route; `am-probe` reports the host. **Done**, see section 11. |
+| M1 ✅ | **CPU census and loader.** M1.1: disassembly census of Zen 2-only instructions in the exe and DLLs. Then mapping, binding, TLS carrier, exception tables, CPU patch pass, crash reports. A synthetic "console title" built from our own code exercises the loader in tests. | The game's code runs past CRT start-up into its own initialisation, with a full call census. **Done**, see section 11. |
 | M2 | **Boot to a frame loop.** Kernel, memory, files, threads; XGameRuntime core (user, package, system, task queue / async); D3D12.X device and presentation with a null GPU backend (commands accepted and dropped); GameInput. | The window opens and the game's frame loop runs at its own 30 fps pacing. |
 | M3 | **Shader recompiler v1.** Decoder, IR, structuring, HLSL emit, DXC, cache; pack survey; precompile tool. | Pack translation rate tracked against a goal of 100 %; cache filled under `C:\Project Americas\cache\shaders`. |
 | M4 | **Menus render.** Command list translation (graphics + compute), descriptors, pipelines, tiled textures, memory classes A / B / C, Bink video. | The intro video and menus are visible. |
@@ -371,8 +402,8 @@ Each milestone ends in a result that can be checked.
    minimise our own cost and schedule well; the rest is hardware.
 2. **16 GB RAM.** Risk of paging. Mitigations: Series S profile, lazy commit, and a page file of
    32 GB or more.
-3. **Resizable BAR is unavailable** on this machine (confirmed by `am-probe`). The design does
-   not depend on it.
+3. **Hosts differ.** Resizable BAR, wave64 and large pages are optional paths (section 4), and
+   each fallback must be tested too. Dev PC 1 has none of the three, so it covers the fallbacks.
 4. **Undocumented console behaviour** (command record layouts, descriptor and tiling bits, audio
    hardware semantics). We learn it from what the game's own code does: static analysis of its
    binaries and runtime tracing. It takes time but can be done.
@@ -392,7 +423,8 @@ Each milestone ends in a result that can be checked.
    the shader target. Vulkan's raw GPU pointers and descriptor buffers would fit the console
    memory model more directly. The shader IR stays backend-neutral so a SPIR-V backend remains
    possible.
-2. Default console profile: **Series S** (fits 16 GB RAM) or Series X.
+2. Default console profile: **chosen from the host's RAM and page file** (Series S on 16 GB
+   machines, Series X where memory allows), with an override.
 3. Licence for our code: **MIT** (or keep private).
 4. Page file: **raise to 32 GB or more** before the first in-world runs.
 
@@ -434,5 +466,125 @@ Each milestone ends in a result that can be checked.
   Executable identity: SHA-256 `e95020b2…a08993`, CodeView age 1. Its TLS template is 5.1 KiB
   with 2 callbacks.
 
-Next: **M1.** First the disassembly census of Zen 2-only instructions (adds Zydis), then the
-loader.
+### M1.1: CPU instruction census (done)
+
+* **Our own x86-64 decoder** (`src/x86`), written from the instruction-set rules; no third-party
+  disassembler. It gives instruction length, operand layout (ModRM, SIB, displacement, immediates,
+  RIP-relative), control flow, and the CPU feature each instruction needs.
+* **`am-cpuscan`** scans every executable section in two passes:
+  1. recursive descent from the exception table, entry point, exports and TLS callbacks
+     ("confirmed" code);
+  2. a linear sweep of whatever is left ("in function" or "outside", less certain).
+
+  The whole executable takes about 10 s.
+* **Checked against `dumpbin`** (Microsoft's disassembler) on 60 random 64 KiB chunks:
+  * 1,063,570 instruction boundaries agree, except 20 bytes of data where `dumpbin` cannot decode
+    EVEX;
+  * every feature label matches `dumpbin`'s mnemonic;
+  * all 41 census sites carry the mnemonic `dumpbin` gives them.
+* **Results for the executable** (23.5 M instructions, 96 % confirmed; 0 decode errors and 0
+  impossible encodings in confirmed code):
+
+  | Feature | Confirmed sites | Note |
+  |---|---|---|
+  | AVX | 2,864,244 | requirement |
+  | FMA3 | 198,018 | requirement |
+  | AVX2 | 114,583 | requirement |
+  | BMI1 | 58,967 | requirement |
+  | BMI2 | 14,395 | requirement |
+  | F16C | 3,149 | requirement |
+  | ADX | 2,611 | requirement: Haswell lacks it, Broadwell and later have it |
+  | AES-NI | 1,878 | requirement |
+  | PCLMULQDQ | 606 | requirement |
+  | MOVBE | 386 | requirement |
+  | SSE4a (INSERTQ, immediate form) | 17 (+2 unconfirmed) | **patched** |
+  | CLZERO | 10 | **patched**: counted zeroing loops |
+  | CLWB | 8 | **patched** |
+  | MONITORX / MWAITX | 4 | **patched** |
+  | SHA, RDPID, RDPRU | 0 | not used |
+
+  So the CPU requirement is roughly "Intel Broadwell / AMD Zen or newer". The 7 Zen 2-only
+  instruction sets appear at only **41 sites**, all in the executable.
+* **The DLLs** need nothing a PC lacks. `libHttpClient.GDK.dll` contains AVX-512 paths behind a
+  runtime CPU check, so they run only where the host has AVX-512.
+
+Patch plan for the 41 sites:
+* CLWB becomes a same-length NOP;
+* MONITORX becomes a NOP, MWAITX becomes PAUSE + NOP;
+* INSERTQ and CLZERO become jumps to per-site stubs. CLZERO's 3 bytes are too short for a jump,
+  so the following instruction moves into the stub with it;
+* an illegal-instruction handler emulates any site not patched.
+
+### M1.2: the loader (done)
+
+* **`americas.exe` (launcher) + `americas_rt.dll` (runtime) + `am_tls_1..4.dll` (TLS carriers).**
+  The launcher only holds what must live in the start executable: static TLS slot 0, given to
+  the title's executable, and a TLS callback that forwards every thread start and exit to the
+  title's modules. Each title DLL with TLS gets a carrier's slot. Carrier templates are
+  overwritten with the title's and existing threads' blocks are filled, so title TLS works with
+  no code patching.
+* **Mapping** at the preferred base (relocations when taken), section protection, and the
+  exception tables registered with `RtlAddFunctionTable`, so SEH, C++ exceptions and stack
+  walks work in title code.
+* **Binding by the import policy:**
+  * our implementations;
+  * wrapped host functions;
+  * host functions (System32 only);
+  * title DLLs, mapped on demand and initialized in dependency order;
+  * stubs that name the import and return 0, or with `--unimplemented trap`, raise an
+    exception.
+
+  Wrapped functions we do not implement yet are **refused**, never passed to the host. The
+  ones implemented so far:
+  * module identity (`GetModuleHandle*`, `GetModuleFileName*`, `LoadLibrary*`,
+    `GetProcAddress`, `RtlPcToFileHeader`);
+  * the command line and `argv`;
+  * the crash filter;
+  * app lifecycle;
+  * network refusal (loopback only);
+  * threads, memory and system information, as marked pass-throughs.
+* **`RtlPcToFileHeader`.** The C++ runtime finds a thrown object's type information through it.
+  Ours answers for title images and is also patched into the host DLLs' import tables, so
+  exceptions work whichever C++ runtime the title uses.
+* **CPU compatibility** (`runtime/cpu_compat`):
+  * the census runs once per build of an image and is cached in
+    `C:\Project Americas\cache\cpu`;
+  * confirmed sites with a same-length equivalent are patched in the mapped image;
+  * the rest are emulated by an illegal-instruction handler: CLZERO, EXTRQ / INSERTQ,
+    MOVNTSS / SD, RDPID, RDPRU, CLWB, MONITORX / MWAITX;
+  * a CPU that lacks a hard requirement (AVX2, say) gets a clear refusal.
+
+  On a CPU with all the console instruction sets, nothing is scanned or patched.
+* **Crash reports:** exception, faulting `module+offset`, registers and an unwound stack, in
+  `logs\crash.txt`. `logs\report.json` holds modules, stubs (with call counts), CPU patches
+  and emulation hits.
+* **Safety for unattended runs:** `--memory-limit <MiB>` (a job object) and `--timeout <s>`.
+  With file and network access refused, a run cannot change anything outside our process: the
+  game only reads the registry, and starts no processes.
+* **Tests:** a fixture title built from our own code runs through the loader at its preferred
+  base and relocated. Its 21 checks cover:
+  * static TLS on new threads, TLS callbacks;
+  * C++ exceptions through 8 frames, SEH;
+  * module identity, the title's argv, relocations;
+  * a title DLL's exports, DllMain and TLS;
+  * a stubbed console import;
+  * INSERTQ / EXTRQ / MOVNTSS / MOVNTSD / CLWB compiled into it.
+
+  Six unit tests check the emulated instructions on hand-assembled code. On Dev PC 1 they
+  really are emulated.
+
+**First run of the game (Dev PC 1)**, `americas --memory-limit 6144 --timeout 120`:
+
+1. The executable (176 MB) is mapped at `0x140000000`; `msvcp140`, `vcruntime140(_1)`,
+   `XboxBvhBuilder`, `amd_fidelityfx_loader_xbox`, `libHttpClient.GDK` and `Bink2Scarlett` are
+   mapped, relocated and initialized.
+2. TLS: the executable takes 5,248 bytes of slot 0; two DLLs take carrier slots.
+3. CPU: 12 sites patched, 29 left to emulation.
+4. The entry point runs, the C runtime starts, and the game's own global initializers run.
+5. Its first console call that needs a real answer, `xmem!XMemVirtualAlloc`, gets the stub's 0
+   and the game stops at its own assertion (`int3`).
+
+69 imports are stubs so far: 39 console functions and 30 refused wrappers.
+
+Next: **M2.** Memory (`xmem`, console `VirtualAlloc` flags, physical pages), then files
+(console paths), threads and topology, XGameRuntime, D3D12.X device and presentation.

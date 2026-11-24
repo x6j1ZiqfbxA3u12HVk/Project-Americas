@@ -35,6 +35,8 @@ enum class CpuFeature : uint8_t {
   RDTSCP, RDPID, RDPRU, MONITORX,
 };
 
+constexpr size_t kCpuFeatureCount = static_cast<size_t>(CpuFeature::MONITORX) + 1;
+
 struct CpuFeatureInfo {
   CpuFeature feature;
   const char* name;

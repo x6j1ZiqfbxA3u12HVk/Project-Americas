@@ -66,7 +66,7 @@ void parse_thunks(Image& img, const Bytes& b, uint32_t thunk_rva, ImportedModule
       if (hint_name && b.read(*hint_name, hint)) name = b.cstr(*hint_name + 2, 1024);
       if (!name) {
         img.warnings.push_back("an import name of " + mod.dll + " is unreadable");
-        continue;
+        name = "<unreadable>";  // keep the slot, so later entries stay aligned with the IAT
       }
       f.hint = hint;
       f.name = std::move(*name);
@@ -95,6 +95,7 @@ void parse_imports(Image& img, const Bytes& b) {
     const auto name_off = img.rva_to_offset(desc.Name);
     const auto name = name_off ? b.cstr(*name_off, 512) : std::nullopt;
     mod.dll = name ? *name : "<unreadable name>";
+    mod.iat_rva = desc.FirstThunk;
     parse_thunks(img, b, desc.OriginalFirstThunk ? desc.OriginalFirstThunk : desc.FirstThunk, mod);
     img.imports.push_back(std::move(mod));
   }
@@ -123,6 +124,8 @@ void parse_delay_imports(Image& img, const Bytes& b) {
     const auto name_off = img.rva_to_offset(fix(desc.DllNameRVA));
     const auto name = name_off ? b.cstr(*name_off, 512) : std::nullopt;
     mod.dll = name ? *name : "<unreadable name>";
+    mod.iat_rva = fix(desc.ImportAddressTableRVA);
+    mod.module_handle_rva = desc.ModuleHandleRVA ? fix(desc.ModuleHandleRVA) : 0;
     if (desc.ImportNameTableRVA) parse_thunks(img, b, fix(desc.ImportNameTableRVA), mod);
     img.imports.push_back(std::move(mod));
   }
@@ -383,6 +386,35 @@ std::optional<Image> parse(std::span<const uint8_t> file, std::string& error) {
   parse_relocations(img, b);
   img.exception_entries = img.dir(Directory::Exception).size / static_cast<uint32_t>(sizeof(RUNTIME_FUNCTION));
   return img;
+}
+
+std::vector<RuntimeFunction> read_function_table(const Image& img, std::span<const uint8_t> file) {
+  std::vector<RuntimeFunction> out;
+  const DataDirectory& d = img.dir(Directory::Exception);
+  if (!d.rva || !d.size) return out;
+  const auto off = img.rva_to_offset(d.rva);
+  if (!off) return out;
+  const Bytes b(file);
+  const size_t count = d.size / sizeof(RUNTIME_FUNCTION);
+  out.reserve(count);
+  for (size_t i = 0; i < count; ++i) {
+    RUNTIME_FUNCTION rf{};
+    if (!b.read(*off + i * sizeof(rf), rf)) break;
+    if (rf.EndAddress <= rf.BeginAddress) continue;
+    out.push_back({rf.BeginAddress, rf.EndAddress, rf.UnwindInfoAddress});
+  }
+  return out;
+}
+
+std::optional<std::span<const uint8_t>> bytes_at(const Image& img, std::span<const uint8_t> file, uint32_t rva,
+                                                 uint32_t size) {
+  const Section* s = img.section_of(rva);
+  if (!s) return std::nullopt;
+  const uint64_t delta = rva - s->rva;
+  if (delta + size > s->raw_size) return std::nullopt;
+  const uint64_t offset = uint64_t{s->raw_offset} + delta;
+  if (offset > file.size() || file.size() - offset < size) return std::nullopt;
+  return file.subspan(static_cast<size_t>(offset), size);
 }
 
 const char* machine_name(uint16_t machine) {

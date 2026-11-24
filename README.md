@@ -4,7 +4,9 @@ Runs the Xbox Series X|S build of Grand Theft Auto VI natively on Windows 11, fr
 the user supplies. The game's x86-64 code runs directly; this project supplies the console
 libraries and GPU layer underneath it. See [docs/PLAN.md](docs/PLAN.md).
 
-**Status:** milestone M0, foundations and analysis tools. Nothing runs the game yet.
+**Status:** milestone M1 done. The loader runs the game's executable into its own
+initialization; it stops at the first console service not implemented yet (memory). See
+[docs/PLAN.md](docs/PLAN.md), section 11.
 
 ## Rules
 
@@ -34,3 +36,5 @@ Binaries land in `C:\Project Americas\build\release\bin`.
 |---|---|
 | `am-probe [--json <file>]` | This PC's CPU instruction sets (against the console's), memory, GPUs and their D3D12 features, the GPU the runtime would pick, and the shader compiler. |
 | `am-inspect [<exe\|dll\|folder>] [--imports] [--exports] [--no-hash] [--json <file>]` | Read-only census of the game's executable and DLLs: build identity, layout, TLS, and the route every import will take (ours, wrapped host, host, title, unresolved). Without a path it reads `game_dir` from `americas.ini`. |
+| `am-cpuscan [<exe\|dll\|folder>] [--sites] [--json <file>]` | Read-only census of the CPU instruction sets the code uses, by confidence. `--sites` lists where it uses those this CPU lacks. `--boundaries <va>,<va>` prints a range's decoded instructions (a check against another disassembler). |
+| `americas [--title <exe>] [--unimplemented zero\|trap] [--memory-limit <MiB>] [--timeout <s>] [-- <args>]` | Runs the title. Without `--title`, it runs the executable `MicrosoftGame.Config` names in `game_dir`. Logs, `report.json` and `crash.txt` go to `C:\Project Americas\logs`. |

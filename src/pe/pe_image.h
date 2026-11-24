@@ -53,7 +53,9 @@ struct ImportedFunction {
 struct ImportedModule {
   std::string dll;
   bool delay_load = false;
-  std::vector<ImportedFunction> functions;
+  uint32_t iat_rva = 0;            // where the loader writes the addresses, one slot per function
+  uint32_t module_handle_rva = 0;  // delay-load only: where the module handle is kept
+  std::vector<ImportedFunction> functions;  // in IAT order (an unreadable name stays as "<unreadable>")
 };
 
 struct Export {
@@ -118,6 +120,21 @@ struct Image {
 // Parses a PE32+ image. Never reads outside `file`. Broken headers give an error; broken tables
 // give an image with what could be read and a note in `warnings`.
 std::optional<Image> parse(std::span<const uint8_t> file, std::string& error);
+
+// One entry of the exception directory: a function (or function fragment) with unwind data.
+// Leaf functions that need no unwinding have no entry.
+struct RuntimeFunction {
+  uint32_t begin = 0;
+  uint32_t end = 0;  // exclusive
+  uint32_t unwind_info = 0;
+};
+std::vector<RuntimeFunction> read_function_table(const Image& img, std::span<const uint8_t> file);
+
+// The file bytes of [rva, rva + size) when all of them lie in one section's raw data.
+std::optional<std::span<const uint8_t>> bytes_at(const Image& img, std::span<const uint8_t> file, uint32_t rva,
+                                                 uint32_t size);
+
+constexpr uint32_t kSectionExecute = 0x20000000;  // IMAGE_SCN_MEM_EXECUTE
 
 const char* machine_name(uint16_t machine);
 const char* subsystem_name(uint16_t subsystem);

@@ -56,6 +56,7 @@ constexpr std::string_view kModuleFunctions[] = {
     "LoadLibraryA", "LoadLibraryW", "LoadLibraryExA", "LoadLibraryExW", "LoadPackagedLibrary", "GetModuleHandleA",
     "GetModuleHandleW", "GetModuleHandleExA", "GetModuleHandleExW", "GetProcAddress", "FreeLibrary",
     "FreeLibraryAndExitThread", "GetModuleFileNameA", "GetModuleFileNameW", "DisableThreadLibraryCalls",
+    "RtlPcToFileHeader",
 };
 constexpr std::string_view kThreadFunctions[] = {
     "CreateThread", "_beginthread", "_beginthreadex", "ExitThread", "_endthreadex", "SetThreadAffinityMask",

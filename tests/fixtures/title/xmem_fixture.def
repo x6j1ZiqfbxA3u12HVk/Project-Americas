@@ -1,0 +1,5 @@
+; Import library for the fixture: one function of the console's xmem.dll, which the loader routes
+; to our implementation (or, while there is none, to a stub).
+LIBRARY xmem.dll
+EXPORTS
+    XMemAlloc
