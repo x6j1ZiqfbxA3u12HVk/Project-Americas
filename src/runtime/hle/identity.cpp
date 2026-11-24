@@ -3,6 +3,7 @@
 
 #include <windows.h>
 
+#include <atomic>
 #include <cstring>
 #include <string>
 
@@ -216,6 +217,43 @@ ULONG WINAPI my_RegisterAppConstrainedChangeNotification(void* routine, void* co
 }
 void WINAPI my_UnregisterAppConstrainedChangeNotification(void* /*registration*/) {}
 
+// ---- the title's own window ----
+//
+// On the console the title's top-level window is its screen. Here our presenter's window shows
+// the frames, so the title's is created as asked (the title keeps its handle, class and
+// messages) but never shown: one window, not two.
+
+std::atomic<HWND> g_title_window{nullptr};
+
+HWND WINAPI my_CreateWindowExW(DWORD ex_style, LPCWSTR cls, LPCWSTR name, DWORD style, int x, int y, int w, int h,
+                               HWND parent, HMENU menu, HINSTANCE instance, LPVOID param) {
+  const bool top_level = !parent;
+  HWND hwnd = CreateWindowExW(ex_style, cls, name, top_level ? style & ~WS_VISIBLE : style, x, y, w, h, parent, menu,
+                              instance, param);
+  if (hwnd && top_level) {
+    g_title_window = hwnd;
+    logf("window: the title's own window ('%s', %dx%d) stays hidden; frames show in ours",
+         name ? narrow(name).c_str() : "", w, h);
+  }
+  return hwnd;
+}
+HWND WINAPI my_CreateWindowExA(DWORD ex_style, LPCSTR cls, LPCSTR name, DWORD style, int x, int y, int w, int h,
+                               HWND parent, HMENU menu, HINSTANCE instance, LPVOID param) {
+  const bool top_level = !parent;
+  HWND hwnd = CreateWindowExA(ex_style, cls, name, top_level ? style & ~WS_VISIBLE : style, x, y, w, h, parent, menu,
+                              instance, param);
+  if (hwnd && top_level) {
+    g_title_window = hwnd;
+    logf("window: the title's own window ('%s', %dx%d) stays hidden; frames show in ours", name ? name : "", w, h);
+  }
+  return hwnd;
+}
+// Showing the title's window does nothing: it was not visible before, and is not after.
+BOOL WINAPI my_ShowWindow(HWND hwnd, int command) {
+  if (hwnd && hwnd == g_title_window.load()) return FALSE;
+  return ShowWindow(hwnd, command);
+}
+
 #define AM_WRAP(name) Function{nullptr, #name, reinterpret_cast<void*>(&my_##name)}
 
 }  // namespace
@@ -233,6 +271,7 @@ void add_identity(std::vector<Function>& out) {
       AM_WRAP(SetUnhandledExceptionFilter), AM_WRAP(UnhandledExceptionFilter), AM_WRAP(WerRegisterFile),
       AM_WRAP(RegisterAppStateChangeNotification), AM_WRAP(UnregisterAppStateChangeNotification),
       AM_WRAP(RegisterAppConstrainedChangeNotification), AM_WRAP(UnregisterAppConstrainedChangeNotification),
+      AM_WRAP(CreateWindowExW), AM_WRAP(CreateWindowExA), AM_WRAP(ShowWindow),
   });
 }
 

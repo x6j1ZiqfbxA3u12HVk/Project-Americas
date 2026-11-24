@@ -71,6 +71,7 @@ constexpr std::string_view kLifecycleFunctions[] = {
     "RegisterAppStateChangeNotification", "UnregisterAppStateChangeNotification",
     "RegisterAppConstrainedChangeNotification", "UnregisterAppConstrainedChangeNotification",
 };
+constexpr std::string_view kWindowFunctions[] = {"CreateWindowExA", "CreateWindowExW", "ShowWindow"};
 constexpr std::string_view kNetworkFunctions[] = {
     "connect", "WSAConnect", "WSAConnectByNameA", "WSAConnectByNameW", "sendto", "WSASendTo", "getaddrinfo",
     "GetAddrInfoW", "GetAddrInfoExW", "gethostbyname", "WinHttpOpen", "WinHttpConnect", "WinHttpSendRequest",
@@ -96,6 +97,7 @@ const Wrap kWraps[] = {
     {"threads and processors", kThreadFunctions},
     {"system information", kSystemFunctions},
     {"app lifecycle", kLifecycleFunctions},
+    {"the title's window", kWindowFunctions},
     {"network policy", kNetworkFunctions},
     {"crash handling", kCrashFunctions},
     {"command line", kCommandLineFunctions},

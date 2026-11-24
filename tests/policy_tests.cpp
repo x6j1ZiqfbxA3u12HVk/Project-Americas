@@ -25,7 +25,10 @@ TEST_CASE(policy_passes_plain_host_functions) {
   const ImportPolicy policy;
   CHECK(policy.route("api-ms-win-core-file-l1-1-0.dll", "ReadFile") == Route::Host);
   CHECK(policy.route("api-ms-win-crt-math-l1-1-0.dll", "sqrt") == Route::Host);
-  CHECK(policy.route("ext-ms-win-rtcore-ntuser-window-l1-1-0.dll", "ShowWindow") == Route::Host);
+  CHECK(policy.route("ext-ms-win-rtcore-ntuser-window-l1-1-0.dll", "DestroyWindow") == Route::Host);
+  // The title's own window is ours to hide: our presenter's window shows the frames.
+  CHECK(policy.route("ext-ms-win-rtcore-ntuser-window-l1-1-0.dll", "ShowWindow") == Route::Wrap);
+  CHECK(policy.route("ext-ms-win-rtcore-ntuser-window-ansi-l1-1-0.dll", "CreateWindowExA") == Route::Wrap);
   CHECK(policy.route("WS2_32.dll", "") == Route::Host);  // an ordinal nobody could name
 }
 

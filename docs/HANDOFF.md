@@ -351,6 +351,9 @@ RDNA 2 decoder decodes all 26,084 programs by control flow, checked against LLVM
 * **The executable's base can be taken.** A random allocation sometimes sat in
   `0x140000000`+176 MiB. The launcher now holds that window from its first instruction. When an
   image must move anyway, it goes into title memory, never above 2^40.
+* **The game creates its own window** ("Americas", class `sgaWindowClass`, 3840x2160) through
+  `CreateWindowExA`/`ShowWindow`. Our presenter's window shows the frames, so the title's is
+  created but kept hidden (`hle/identity.cpp`); otherwise two windows open.
 * **Thread start and exit run under the loader lock.** Code on that path (the launcher's TLS
   callback, `TitleProcess::on_thread`) must never wait on a lock of ours: a thread holding it
   may be loading a DLL. It deadlocked once.
