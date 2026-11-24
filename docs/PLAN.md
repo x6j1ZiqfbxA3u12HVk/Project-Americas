@@ -808,6 +808,71 @@ builder's `XMemVirtualQuery` calls, and the arguments logged at run time.
   * the control-flow scan;
   * a synthetic container through `read_console_shader`.
 
+### M2.3: console files and DirectStorage (done)
+
+* **Console paths** (`runtime/files`, `hle/files.cpp`):
+  * the title's folder (`G:\` and friends) maps to the read-only game folder;
+  * `S:\` (persistent local storage) and `T:\` (temp) map into `C:\Project Americas\userdata`;
+  * everything else is refused;
+  * writes that resolve into the game folder are refused too.
+* **The console's DirectStorage** (`runtime/storage/dstorage.cpp`) opens files and runs queued
+  reads into memory or physical pages, with zlib unpacking. BCPack and other transforms are
+  refused until the BCPack tables have a legitimate source.
+* **Result:** the game opens all its RPF archives through DirectStorage, and its crash handler
+  writes its dumps into our temp folder (the upload is refused).
+
+### M2.4: the D3D12.X device (in progress)
+
+`d3d12_xs!D3D12XboxCreateDevice(adapter = null, &parameters, riid, &device)` returns our
+device. The parameters are an 80-byte block: `0x20004` at `+0`, `0x100000` at `+8`, flags from
+the game's settings. The console's graphics objects are learned from the game's calls
+(`runtime/d3d12x`):
+
+* **Every object** is `[vtable][console-layout fields]`, with our bookkeeping in a 64-byte
+  header in front of it. Title code writes some objects' fields directly (the command list's
+  record buffer), so nothing of ours may sit at their offsets. They have no C++ virtual
+  functions, since a C++ vtable pointer would take offset 0.
+* **Unimplemented slots are probes.** Each logs its first calls with their arguments and returns
+  0. `report.json`'s `graphics` section lists every probe the game called.
+* **Struct-returning methods:** the console's callers pass the return buffer first and the
+  object second.
+
+The device's slots, as learned so far:
+
+| Slot | Method | Note |
+|---|---|---|
+| 0 | QueryInterface | D3D12 interfaces: the device; DXGI's (`IDXGIDevice`...): its DXGI view |
+| 8 | CreateCommandQueue | D3D12's; the game's 1 direct queue |
+| 9 | CreateCommandAllocator | D3D12's |
+| 14 | CreateDescriptorHeap | D3D12's description followed by the memory's address and size: on the console a heap is title memory, and its start handle must be that address |
+| 15 | GetDescriptorHandleIncrementSize | 32 for resource views, 16 for samplers, 64 for render-target and depth (ours) |
+| 17–24 | the view creators, CopyDescriptors(Simple) | D3D12's order. Views write a tagged record into their descriptor slot; copies move memory |
+| 25 | GetResourceAllocationInfo | D3D12's sizing rules, including 4 KiB alignment for small textures |
+| 26 | GetCustomHeapProperties | the answers for a unified-memory adapter |
+| 36 | CreateFence | D3D12's |
+| 48 | CreateCommandQueueX | the console's own: 4 compute queues |
+| 73 | CreateCommandListX | 16-byte description, allocator, initial pipeline, riid |
+| 127 | committed resource creation | heap properties, flags, description, state, clear value, protected session, riid, out: **next to implement** |
+| 70, 78, 79, 133 | not identified | probes; the game accepts their 0 |
+
+Other objects:
+* **The DXGI view** (`IDXGIDevice`): adapter and output (the host's main display, reported at
+  60 Hz). The output's slot 21 is the console's `GetDisplayModeList1`.
+* **Command queue:** Signal, Wait, GetTimestampFrequency, ExecuteCommandLists.
+* **Fence:** D3D12's slots 8–10.
+* **Command allocator.**
+* **Command list:** 4 KiB of console fields; the game calls its slots 9, 131 and 132 after
+  creating it.
+
+Null back end: queues finish work at once and fences reach their value when signalled.
+
+**Where the game stops now.** It creates its back buffers (3840×2160 RGBA8, render target and
+unordered access) inside a 64 MiB memory budget it tracks itself, then asserts that the budget
+was used. On the console, the graphics runtime gets a committed resource's memory through the
+game's `XMemAlloc` hooks, which do that accounting. So the next step is resources: slot 127,
+with memory through the title's hooks (`memory/default_alloc`, `hle/xmem.cpp`), GPU virtual
+addresses equal to CPU addresses (unified memory), Map / Unmap / GetGPUVirtualAddress.
+
 ### Local tools (in `C:\Project Americas\tools`, never in the repository)
 
 | Tool | Version, source | Use | Note |
@@ -821,8 +886,10 @@ builder's `XMemVirtualQuery` calls, and the arguments logged at run time.
 
 
 Next, in parallel:
-* **M2.** DirectStorage's factory (the current stop) and files (console paths), then
-  threads and topology, the D3D12.X device and presentation, GameInput devices, and the
-  remaining XGameRuntime areas as the game reaches them.
+* **M2.** The D3D12.X device (M2.4): resources through the title's memory hooks (the current
+  stop), then the rest of the device and command list slots the game reaches, `PresentX`,
+  frame pacing and a window; threads and topology, GameInput devices, and the remaining
+  XGameRuntime areas (XPackage, XPersistentLocalStorage, XDisplay HDR) as the game reaches
+  them.
 * **M3.** The translator: IR, structuring (and the indirect jumps), stage I/O from the FSSM
   records, resource tracing, HLSL emit through DXC. Then `am-shaders precompile`.

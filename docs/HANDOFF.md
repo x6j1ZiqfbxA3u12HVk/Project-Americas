@@ -15,11 +15,23 @@ console DirectStorage factory. File access is still refused.
 **Files and DirectStorage (2026-11-24, night):** console paths work (the title's folder
 read-only, `S:\`/`T:\` in `userdata`, the rest refused; `runtime/files`, `hle/files.cpp`), and
 the console DirectStorage (`runtime/storage/dstorage.cpp`) opens files and runs queued reads
-(zlib, memory or physical-page destinations; BCPack and other transforms refused). The game now
-opens all its RPF archives and **stops at `d3d12_xs!D3D12XboxCreateDevice`** (the stub's 0, then a
-null device at `+0x247870a`): the D3D12.X device is next. It also asks for XPackage,
-XPersistentLocalStorage and XDisplay HDR, not implemented yet (`gdk/catalog.cpp`). PLAN.md
-section 11 has no entry for files and DirectStorage yet.
+(zlib, memory or physical-page destinations; BCPack and other transforms refused). The game
+opens all its RPF archives (PLAN.md section 11, "M2.3"). It also asks for XPackage,
+XPersistentLocalStorage and XDisplay HDR, not implemented yet (`gdk/catalog.cpp`).
+
+**The D3D12.X device (2026-11-24, evening; PLAN.md section 11, "M2.4", has the slot table):**
+`D3D12XboxCreateDevice` returns our device (`runtime/d3d12x`). The game creates through it:
+* 1 direct queue and 4 console compute queues;
+* 5 fences;
+* command allocators and command lists;
+* the device's DXGI view (adapter, output);
+* 5 descriptor heaps, the big one in its own memory;
+* null views.
+
+**It now stops at device slot 127, committed resource creation**: it builds its back buffers
+inside a 64 MiB budget it tracks through its own `XMemAlloc` hooks, and asserts at
+`+0x247af2d` because nothing was allocated through them. Next: resources, with memory through
+the title's hooks.
 
 **M3:** the RDNA 2 decoder is done and decodes all 26,084 console GPU programs of the corpus,
 checked against LLVM (100 % on 2.8 M instructions). Next there: the translator.
@@ -170,9 +182,12 @@ Set-Location "C:\Users\Admin\Documents\GitHub\Project Americas"; . .\scripts\env
   7. XGameRuntime: `InitializeApiImplEx2`, task queues, XUser, XNetworking (PLAN.md,
      section 11, "M2.2");
   8. GameInput: its gamepad device callback (no devices yet);
-  9. **it stops at `XCRDAPI!DStorageGetFactory`:** the stub's 0 reaches the game's own
-     assertion, `int3` at `game_scarlett_master.exe+0x1d8e505`. Other threads already call
-     `CreateFileW` and `_wfopen`, refused.
+  9. files and DirectStorage: it opens all its RPF archives (M2.3);
+  10. D3D12.X: device, queues, fences, command lists, DXGI view, descriptor heaps and views
+      (M2.4);
+  11. **it stops at device slot 127, committed resource creation:** its own assertion,
+      `int3` at `game_scarlett_master.exe+0x247af2d`, because no memory went through its
+      `XMemAlloc` hooks.
 * **Memory facts** (PLAN.md, section 11, "M2.1", has the full table):
   * XMem's reference pages on learn.microsoft.com are NDA-only: read the game's code instead;
   * allocation type bit 29 means 2 MiB pages, bits 29 + 22 mean 64 KiB pages;
@@ -215,25 +230,27 @@ XGameRuntime's core is done too (PLAN.md, section 11, "M2.2"). Its remaining are
 as the game reaches them; `report.json`'s `runtime` section and the log name each missing
 method the game calls.
 
-1. **DirectStorage's factory (the current stop).** `XCRDAPI!DStorageGetFactory` must return
-   the console's factory interface.
-   * Learn its arguments and the interface's slots from the game's code (`vtable_calls.py`
-     on the getter that caches the factory).
-   * Queues and requests read through the file layer (step 2), so the two go together.
-   * Decompression (zlib through `src/formats/inflate`, BCPack later) is M6; requests may fail
-     cleanly until then.
-2. **Files.** Console paths (the game root, `S:\` persistent storage, `T:\` temp) mapped to
-   the read-only dump and `C:\Project Americas\userdata`. Deny by default, and refuse any
-   write that resolves into the dump: check the final path of the opened handle too.
-   * The functions are listed under "console paths" in `src/loader/import_policy.cpp`.
-   * Until then they stay refused stubs, which is what keeps runs safe.
-   * The game already calls `GetFileAttributesW`. Its refused stub returns 0, which means "a
-     file with no attributes", not `INVALID_FILE_ATTRIBUTES`.
+DirectStorage and files are done (PLAN.md section 11, "M2.3").
+
+1. **Resources (the current stop): device slot 127**, committed resource creation, `(heap
+   properties, heap flags, description, initial state, clear value, protected session, riid,
+   out)`.
+   * The memory must come through the title's `XMemAlloc` hooks, as on the console:
+     `__XMemAllocationHooks__`, reached through `hle/xmem.cpp` / `memory/default_alloc`. The
+     game counts its budgets there.
+   * GPU virtual address = CPU address (unified memory).
+   * The resource object needs `Map` / `Unmap` / `GetGPUVirtualAddress` / `GetDesc`. Learn
+     their slots from the probes, guided by `ID3D12Resource`'s order.
+   * Placed resources and heaps follow the same way.
+2. **The rest of D3D12.X with the null back end**, slot by slot as the game reaches them.
+   * `report.json`'s `graphics` section and the `d3d12x: #N ... not implemented` log lines
+     name each one with its arguments; D3D12's slot order is the first hypothesis.
+   * The command list's own fields: the game's code writes records into the list object.
+     Watch for crashes at small offsets from a list pointer.
+   * Then `PresentX`, frame pacing, a window.
 3. **Threads and topology.** Console affinity masks mapped onto the host's processors;
    decide what topology the game sees (PLAN.md section 5.1).
-4. **D3D12.X device** with a null back end (commands accepted and dropped), `PresentX`, frame
-   pacing, a window.
-5. **GameInput devices:** pads through XInput (or the host's GameInput), readings and device
+4. **GameInput devices:** pads through XInput (or the host's GameInput), readings and device
    callbacks. The interface exists already, with no devices (`runtime/input`).
 
 ### M3: shader recompiler
@@ -338,3 +355,11 @@ RDNA 2 decoder decodes all 26,084 programs by control flow, checked against LLVM
   class / interface GUIDs in `rcx` / `rdx` and the slot in the following `mov rax,[rax+slot*8]`.
 * **Commit in `--memory-limit` runs.** A job's memory limit counts private commit only, not
   commit of page-file-backed sections. That is why the physical pool checks the cap itself.
+* **Console graphics objects must never have C++ virtual functions.** A C++ vtable pointer takes
+  offset 0, where the title reads the console vtable. It happened once: the game jumped into
+  the text "AES-NI". `make_object` in `d3d12x/object.h` keeps our state in a header in front of
+  the object.
+* **`small` is a macro in the Windows headers** (`#define small char`); don't use it as a name.
+* **PowerShell after `. .\scripts\env.ps1`:** the script sets `$ErrorActionPreference = 'Stop'`
+  for the session, so a native program writing to stderr ends the command. Run programs that
+  log to stderr (the tests, `americas.exe`) through `cmd /c "... 2>nul"` or with redirects.

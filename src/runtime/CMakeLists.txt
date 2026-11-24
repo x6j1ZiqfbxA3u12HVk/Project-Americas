@@ -19,6 +19,14 @@ add_library(am_runtime STATIC
   memory/default_alloc.cpp
   memory/title_memory.cpp
   hle/d3d12x.cpp
+  d3d12x/descriptor_heap.cpp
+  d3d12x/device.cpp
+  d3d12x/dxgi.cpp
+  d3d12x/formats.cpp
+  d3d12x/list.cpp
+  d3d12x/object.cpp
+  d3d12x/queue.cpp
+  d3d12x/views.cpp
   hle/files.cpp
   input/game_input.cpp
   hle/identity.cpp

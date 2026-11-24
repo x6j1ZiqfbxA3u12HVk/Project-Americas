@@ -3,6 +3,7 @@ add_executable(am_tests
   core_tests.cpp
   cpu_emulation_tests.cpp
   cpu_tests.cpp
+  d3d12x_tests.cpp
   files_tests.cpp
   inflate_tests.cpp
   memory_tests.cpp

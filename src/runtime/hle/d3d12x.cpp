@@ -1,10 +1,11 @@
-// d3d12_xs.dll: Direct3D 12.X. The device comes with M2's graphics step; for now the function
-// the game calls before any graphics allocation.
+// d3d12_xs.dll: Direct3D 12.X. D3D12ConfigureVirtualMemoryX here; the device and its objects in
+// runtime/d3d12x.
 
 #include <windows.h>
 
 #include <cstdint>
 
+#include "runtime/d3d12x/d3d12x.h"
 #include "runtime/hle/registry.h"
 #include "runtime/log.h"
 
@@ -27,6 +28,7 @@ HRESULT WINAPI my_D3D12ConfigureVirtualMemoryX(const uint32_t* config) {
 void add_graphics(std::vector<Function>& out) {
   out.push_back(Function{"d3d12_xs.dll", "D3D12ConfigureVirtualMemoryX",
                          reinterpret_cast<void*>(&my_D3D12ConfigureVirtualMemoryX)});
+  out.push_back(Function{"d3d12_xs.dll", "D3D12XboxCreateDevice", reinterpret_cast<void*>(&d3d12x::create_device)});
 }
 
 }  // namespace am::rt::hle

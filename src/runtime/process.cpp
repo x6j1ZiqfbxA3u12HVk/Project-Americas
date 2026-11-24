@@ -10,6 +10,7 @@
 #include "core/json.h"
 #include "core/text.h"
 #include "runtime/console.h"
+#include "runtime/d3d12x/object.h"
 #include "runtime/gdk/runtime.h"
 #include "runtime/host_patch.h"
 #include "runtime/launcher_api.h"
@@ -573,6 +574,7 @@ void TitleProcess::write_report() const {
   storage::write_storage_report(j);
   j.key("runtime");
   gdk::write_runtime_report(j);
+  d3d12x::write_graphics_report(j);
   j.key("passthrough").begin_array();
   for (const hle::Function& f : registry_.all()) {
     if (f.passthrough) j.value(f.name);
