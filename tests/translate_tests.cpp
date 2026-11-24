@@ -10,6 +10,7 @@
 
 #include "gpu_runner.h"
 #include "host/dxc_compile.h"
+#include "shader/image_bindings.h"
 #include "shader/translate.h"
 #include "test.h"
 
@@ -20,7 +21,8 @@ using namespace am::shader;
 struct Result {
   bool ran = false;
   uint32_t nv = 0;
-  std::vector<uint32_t> dump, memory;
+  std::vector<uint32_t> dump, memory, bindings;
+  std::vector<std::vector<uint8_t>> textures;
   uint32_t s(int i) const { return dump[i]; }
   bool scc() const { return dump[128] != 0; }
   uint32_t v(int lane, int reg) const { return dump[kDumpLanes / 4 + lane * nv + reg]; }
@@ -28,7 +30,7 @@ struct Result {
 
 // One wave64 group of 64 threads (rsrc2: 2 user SGPRs, group id x), or as given.
 Result run(const std::vector<uint32_t>& code, std::vector<uint32_t> user = {}, std::vector<uint32_t> memory = {},
-           uint64_t base = 0, uint32_t rsrc2 = (2u << 1) | (1u << 7)) {
+           uint64_t base = 0, uint32_t rsrc2 = (2u << 1) | (1u << 7), const am::test::ImageSetup* images = nullptr) {
   Result r;
   TranslateInput in;
   in.code = code;
@@ -59,7 +61,7 @@ Result run(const std::vector<uint32_t>& code, std::vector<uint32_t> user = {}, s
   args[32] = static_cast<uint32_t>(base);
   args[33] = static_cast<uint32_t>(base >> 32);
   r.nv = t.vgpr_count;
-  const am::test::GpuRun g = am::test::run_compute(c.dxil, 1, args, memory, kDumpLanes / 4 + 64 * r.nv);
+  const am::test::GpuRun g = am::test::run_compute(c.dxil, 1, args, memory, kDumpLanes / 4 + 64 * r.nv, images);
   if (!g.ran) {
     std::printf("    skipped: %s\n", g.why.c_str());
     return r;
@@ -67,6 +69,8 @@ Result run(const std::vector<uint32_t>& code, std::vector<uint32_t> user = {}, s
   r.ran = true;
   r.dump = g.dump;
   r.memory = g.memory;
+  r.bindings = g.bindings;
+  r.textures = g.textures;
   return r;
 }
 
@@ -192,7 +196,7 @@ uint32_t half_of(uint32_t n) {
   while ((n >> (e + 1)) != 0) ++e;
   return (e + 15) << 10 | ((n << (10 - e)) & 0x3FF);
 }
-bool near(uint32_t got, float want) { return std::fabs(f(got) - want) <= 1e-6f; }
+bool close_to(uint32_t got, float want) { return std::fabs(f(got) - want) <= 1e-6f; }
 }  // namespace
 
 TEST_CASE(translate_typed_buffers) {
@@ -251,10 +255,10 @@ TEST_CASE(translate_typed_buffers) {
   bool ok = true;
   for (uint32_t l = 0; l < 64 && ok; ++l) {
     const float u = l / 255.0f, u2 = 2 * l / 255.0f;
-    ok = near(r.v(l, 4), u) && near(r.v(l, 5), u2) && f(r.v(l, 6)) == 1.0f && r.v(l, 7) == 0;
-    ok = ok && f(r.v(l, 8)) == 1.0f && near(r.v(l, 9), u2) && near(r.v(l, 10), u) && f(r.v(l, 11)) == 1.0f;
+    ok = close_to(r.v(l, 4), u) && close_to(r.v(l, 5), u2) && f(r.v(l, 6)) == 1.0f && r.v(l, 7) == 0;
+    ok = ok && f(r.v(l, 8)) == 1.0f && close_to(r.v(l, 9), u2) && close_to(r.v(l, 10), u) && f(r.v(l, 11)) == 1.0f;
     ok = ok && f(r.v(l, 12)) == static_cast<float>(l) && f(r.v(l, 13)) == -0.5f;
-    ok = ok && near(r.v(l, 14), 16 * l / 1023.0f) && f(r.v(l, 15)) == 1.0f && r.v(l, 16) == 0 && f(r.v(l, 17)) == 1.0f;
+    ok = ok && close_to(r.v(l, 14), 16 * l / 1023.0f) && f(r.v(l, 15)) == 1.0f && r.v(l, 16) == 0 && f(r.v(l, 17)) == 1.0f;
     ok = ok && f(r.v(l, 18)) == 1.0f && f(r.v(l, 19)) == 2.0f && f(r.v(l, 20)) == 0.5f;
     ok = ok && ((r.memory[0x500 + l / 4] >> (8 * (l % 4))) & 0xFF) == l;  // bytes from neighbouring lanes
     ok = ok && r.memory[0x600 + 2 * l] == (half_of(l) | 0x3C00u << 16) && r.memory[0x601 + 2 * l] == (0xC000u | 0x3800u << 16);
@@ -381,4 +385,248 @@ TEST_CASE(translate_buffer_and_global_atomics) {
   }
   CHECK(seen == ~0ull);
   CHECK(winners == 1 && others_ok && r.memory[2] >= 1 && r.memory[2] <= 64);
+}
+
+namespace {
+// A test's T# or S#: words that only have to be distinct (the host's table maps them).
+void descriptor(std::vector<uint32_t>& memory, size_t at, uint32_t id, int words, uint32_t* out) {
+  for (int k = 0; k < words; ++k) out[k] = memory[at + k] = 0xA0000000u | id << 8 | k;
+}
+// D3D's cube rules (the PC side's own): the face and the face coordinates of a direction.
+void cube_face(float x, float y, float z, int& face, float& u, float& v) {
+  const float ax = std::fabs(x), ay = std::fabs(y), az = std::fabs(z);
+  float sc, tc, ma;
+  if (ax >= ay && ax >= az) {
+    face = x > 0 ? 0 : 1;
+    sc = x > 0 ? -z : z;
+    tc = -y;
+    ma = ax;
+  } else if (ay >= az) {
+    face = y > 0 ? 2 : 3;
+    sc = x;
+    tc = y > 0 ? z : -z;
+    ma = ay;
+  } else {
+    face = z > 0 ? 4 : 5;
+    sc = z > 0 ? x : -x;
+    tc = -y;
+    ma = az;
+  }
+  u = (sc / ma + 1) / 2;
+  v = (tc / ma + 1) / 2;
+}
+std::vector<uint8_t> bytes_of(const std::vector<uint32_t>& v) {
+  std::vector<uint8_t> d(v.size() * 4);
+  std::memcpy(d.data(), v.data(), d.size());
+  return d;
+}
+template <typename F>
+std::vector<uint8_t> texels(uint32_t w, uint32_t h, F texel) {
+  std::vector<uint32_t> d(w * h);
+  for (uint32_t y = 0; y < h; ++y)
+    for (uint32_t x = 0; x < w; ++x) d[y * w + x] = texel(x, y);
+  return bytes_of(d);
+}
+uint32_t bits(float x) {
+  uint32_t u;
+  std::memcpy(&u, &x, 4);
+  return u;
+}
+}  // namespace
+
+TEST_CASE(translate_images) {
+  using am::test::TextureSpec;
+  namespace sh = am::shader;
+  const uint64_t base = 0x400000000ull;
+  std::vector<uint32_t> memory(512, 0);
+  std::vector<sh::ImageBinding> ib(6);
+  std::vector<sh::SamplerBinding> sb(2);
+  uint32_t missing[8];
+  // T#s at 0x00 .. 0x80 and 0xE0, S#s at 0xA0 and 0xB0, a T# the table lacks at 0xC0.
+  const size_t at[] = {0x00 / 4, 0x20 / 4, 0x40 / 4, 0x60 / 4, 0x80 / 4, 0xE0 / 4};
+  for (uint32_t i = 0; i < 6; ++i) {
+    descriptor(memory, at[i], i, 8, ib[i].words);
+    ib[i].srv = 3 * i;
+    ib[i].alt = 3 * i + 1;
+    ib[i].uav = 3 * i + 2;
+  }
+  descriptor(memory, 0xA0 / 4, 0x10, 4, sb[0].words);
+  descriptor(memory, 0xB0 / 4, 0x11, 4, sb[1].words);
+  descriptor(memory, 0xC0 / 4, 0x20, 8, missing);
+  sb[0].index = 0;
+  sb[1].index = 1;
+  sb[1].flags = sh::kSamplerCompare;
+  ib[1].flags = sh::kImageUint | sh::kImageHasUav | sh::kImageLoadUav;
+  ib[4].flags = sh::kImageUint | sh::kImageArray;
+  ib[5].flags = sh::kImageUint | sh::kImageHasUav | sh::kImageLoadUav;
+  // Per-lane directions for the cube, off the face centres.
+  for (uint32_t l = 0; l < 64; ++l) {
+    const float a = (l / 6) % 2 ? 0.4f : -0.4f, b = (l / 12) % 2 ? 0.3f : -0.3f;
+    float d[3];
+    switch (l % 6) {
+      case 0: d[0] = 1; d[1] = a; d[2] = b; break;
+      case 1: d[0] = -1; d[1] = a; d[2] = b; break;
+      case 2: d[0] = a; d[1] = 1; d[2] = b; break;
+      case 3: d[0] = a; d[1] = -1; d[2] = b; break;
+      case 4: d[0] = a; d[1] = b; d[2] = 1; break;
+      default: d[0] = a; d[1] = b; d[2] = -1; break;
+    }
+    std::memcpy(&memory[0x400 / 4 + 3 * l], d, 12);
+  }
+
+  am::test::ImageSetup setup;
+  TextureSpec t0;  // 4x4 RGBA8: (16 x, 16 y, 7, 255)
+  t0.width = t0.height = 4;
+  t0.data = {texels(4, 4, [](uint32_t x, uint32_t y) { return (16 * x) | (16 * y) << 8 | 7u << 16 | 255u << 24; })};
+  TextureSpec t1;  // 8x8 R32_UINT, written
+  t1.format = DXGI_FORMAT_R32_UINT;
+  t1.width = t1.height = 8;
+  t1.uav = true;
+  TextureSpec t2;  // 2x2 R32_FLOAT with two levels: 1.0, then 5.0
+  t2.format = DXGI_FORMAT_R32_FLOAT;
+  t2.width = t2.height = 2;
+  t2.mips = 2;
+  t2.data = {bytes_of({bits(1.0f), bits(1.0f), bits(1.0f), bits(1.0f)}), bytes_of({bits(5.0f)})};
+  TextureSpec t3;  // a cube of 2x2 faces: (40 face, 50 + 100 i, 50 + 100 j, 255)
+  t3.kind = TextureSpec::Cube;
+  t3.width = t3.height = 2;
+  t3.depth_or_layers = 6;
+  for (uint32_t face = 0; face < 6; ++face) {
+    t3.data.push_back(texels(2, 2, [face](uint32_t i, uint32_t j) { return (40 * face) | (50 + 100 * i) << 8 | (50 + 100 * j) << 16 | 255u << 24; }));
+  }
+  TextureSpec t4;  // 2x2x3 R32_UINT array: 1000 layer + 10 y + x + 1
+  t4.format = DXGI_FORMAT_R32_UINT;
+  t4.width = t4.height = 2;
+  t4.depth_or_layers = 3;
+  t4.array = true;
+  for (uint32_t z = 0; z < 3; ++z) t4.data.push_back(bytes_of({1000 * z + 1, 1000 * z + 2, 1000 * z + 11, 1000 * z + 12}));
+  TextureSpec t5;  // 1x1 R32_UINT for atomics
+  t5.format = DXGI_FORMAT_R32_UINT;
+  t5.uav = true;
+  setup.textures = {t0, t1, t2, t3, t4, t5};
+  D3D12_SAMPLER_DESC point{};
+  point.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
+  point.AddressU = point.AddressV = point.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+  point.MaxAnisotropy = 1;
+  point.MaxLOD = D3D12_FLOAT32_MAX;
+  D3D12_SAMPLER_DESC cmp = point;
+  cmp.Filter = D3D12_FILTER_COMPARISON_MIN_MAG_MIP_POINT;
+  cmp.ComparisonFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
+  setup.samplers = {point, cmp};
+  setup.bindings = sh::build_bindings(ib, sb, 8);
+  CHECK(!setup.bindings.empty());
+
+  const Result r = run(
+      {
+          0xF40C0200, 0xFA000000,              // s_load_dwordx8 s[8:15], s[0:1], 0x0     T0
+          0xF40C0400, 0xFA000020,              // s_load_dwordx8 s[16:23], s[0:1], 0x20   T1
+          0xF40C0600, 0xFA000040,              // s_load_dwordx8 s[24:31], s[0:1], 0x40   T2
+          0xF40C0800, 0xFA000060,              // s_load_dwordx8 s[32:39], s[0:1], 0x60   T3 (cube)
+          0xF40C0A00, 0xFA000080,              // s_load_dwordx8 s[40:47], s[0:1], 0x80   T4 (array)
+          0xF4080C00, 0xFA0000A0,              // s_load_dwordx4 s[48:51], s[0:1], 0xa0   S0 (point)
+          0xF4080D00, 0xFA0000B0,              // s_load_dwordx4 s[52:55], s[0:1], 0xb0   S1 (compare)
+          0xF40C0E00, 0xFA0000C0,              // s_load_dwordx8 s[56:63], s[0:1], 0xc0   not in the table
+          0xF40C1000, 0xFA0000E0,              // s_load_dwordx8 s[64:71], s[0:1], 0xe0   T5 (atomics)
+          0xBF8CC07F,                          // s_waitcnt lgkmcnt(0)
+          0x36020087,                          // v_and_b32 v1, 7, v0                   x
+          0x2C040083,                          // v_lshrrev_b32 v2, 3, v0               y
+          0x36060283,                          // v_and_b32 v3, 3, v1
+          0x36080483,                          // v_and_b32 v4, 3, v2
+          0xF0001F08, 0x00020503,              // image_load v[5:8], v[3:4], s[8:15] dmask:0xf dim:2D unorm
+          0x16120083,                          // v_mul_u32_u24 v9, 3, v0
+          0xF0201108, 0x00040901,              // image_store v9, v[1:2], s[16:23] dmask:0x1 dim:2D unorm
+          0xF0001108, 0x00040A01,              // image_load v10, v[1:2], s[16:23] dmask:0x1 dim:2D unorm
+          0x7E1602F0,                          // v_mov_b32 v11, 0.5
+          0x7E1802F0,                          // v_mov_b32 v12, 0.5
+          0x7E1A02F2,                          // v_mov_b32 v13, 1.0
+          0xF0900108, 0x01860E0B,              // image_sample_l v14, v[11:13], s[24:31], s[48:51] dmask:0x1 dim:2D
+          0xF09C0108, 0x01860F0B,              // image_sample_lz v15, v[11:12], s[24:31], s[48:51] dmask:0x1 dim:2D
+          0x7E2202F0,                          // v_mov_b32 v17, 0.5
+          0xF0BC010A, 0x01A61011, 0x00000C0B,  // image_sample_c_lz v16, [v17, v11, v12], s[24:31], s[52:55] dmask:0x1 dim:2D
+          0x162E008C,                          // v_mul_u32_u24 v23, 12, v0
+          0xDC3C8400, 0x14000017,              // global_load_dwordx3 v[20:22], v23, s[0:1] offset:1024
+          0xBF8C3F70,                          // s_waitcnt vmcnt(0)
+          0xD5470018, 0x045A2B14,              // v_cubema_f32 v24, v20, v21, v22
+          0xD5450019, 0x045A2B14,              // v_cubesc_f32 v25, v20, v21, v22
+          0xD546001A, 0x045A2B14,              // v_cubetc_f32 v26, v20, v21, v22
+          0xD544001B, 0x045A2B14,              // v_cubeid_f32 v27, v20, v21, v22
+          0xD5AA0118, 0x02010118,              // v_rcp_f32_e64 v24, |v24|
+          0x5A323119, 0x3FC00000,              // v_fmaak_f32 v25, v25, v24, 0x3fc00000   s = sc / |ma| + 1.5
+          0x5A34311A, 0x3FC00000,              // v_fmaak_f32 v26, v26, v24, 0x3fc00000
+          0xF09C0F18, 0x01881C19,              // image_sample_lz v[28:31], v[25:27], s[32:39], s[48:51] dmask:0xf dim:CUBE
+          0x2C460084,                          // v_lshrrev_b32 v35, 4, v0               layer 0..3 (3 is out of range)
+          0x36420281,                          // v_and_b32 v33, 1, v1
+          0x36440481,                          // v_and_b32 v34, 1, v2
+          0xF0001128, 0x000A2421,              // image_load v36, v[33:35], s[40:47] dmask:0x1 dim:2D_ARRAY unorm
+          0x7E520281,                          // v_mov_b32 v41, 1
+          0xF0381F08, 0x00062529,              // image_get_resinfo v[37:40], v41, s[24:31] dmask:0xf dim:2D unorm
+          0xF11C0208, 0x01822A0B,              // image_gather4_lz v[42:45], v[11:12], s[8:15], s[48:51] dmask:0x2 dim:2D
+          0xF0001108, 0x000E2E01,              // image_load v46, v[1:2], s[56:63] dmask:0x1 dim:2D unorm
+          0x7E5E0281,                          // v_mov_b32 v47, 1
+          0x7E600280,                          // v_mov_b32 v48, 0
+          0x7E620280,                          // v_mov_b32 v49, 0
+          0xF0443108, 0x00102F30,              // image_atomic_add v47, v[48:49], s[64:71] dmask:0x1 dim:2D unorm glc
+          0xBF8C3F70,                          // s_waitcnt vmcnt(0)
+          0xBF810000,                          // s_endpgm
+      },
+      {static_cast<uint32_t>(base), static_cast<uint32_t>(base >> 32)}, memory, base, (2u << 1) | (1u << 7), &setup);
+  if (!r.ran) return;
+  const auto unorm = [](uint32_t b) { return b / 255.0f; };
+  bool ok = true;
+  uint64_t seen = 0;
+  for (uint32_t l = 0; l < 64 && ok; ++l) {
+    const uint32_t x = l & 7, y = l >> 3;
+    ok = close_to(r.v(l, 5), unorm(16 * (x & 3))) && close_to(r.v(l, 6), unorm(16 * (y & 3))) && close_to(r.v(l, 7), unorm(7)) &&
+         f(r.v(l, 8)) == 1.0f;
+    if (!ok) std::printf("    lane %u: load %08x %08x %08x %08x\n", l, r.v(l, 5), r.v(l, 6), r.v(l, 7), r.v(l, 8));
+    ok = ok && r.v(l, 10) == 3 * l;
+    ok = ok && f(r.v(l, 14)) == 5.0f && f(r.v(l, 15)) == 1.0f && f(r.v(l, 16)) == 1.0f;
+    if (!ok) {
+      std::printf("    lane %u: uav load %u, sample_l %08x, lz %08x, compare %08x\n", l, r.v(l, 10), r.v(l, 14), r.v(l, 15),
+                  r.v(l, 16));
+    }
+    float d[3];
+    std::memcpy(d, &memory[0x400 / 4 + 3 * l], 12);
+    int face;
+    float u, v;
+    cube_face(d[0], d[1], d[2], face, u, v);
+    const uint32_t i = u >= 0.5f ? 1 : 0, j = v >= 0.5f ? 1 : 0;
+    const bool cube = close_to(r.v(l, 28), unorm(40 * face)) && close_to(r.v(l, 29), unorm(50 + 100 * i)) &&
+                      close_to(r.v(l, 30), unorm(50 + 100 * j));
+    if (!cube) {
+      std::printf("    lane %u: cube (%g %g %g) face %d texel %u,%u: got %08x %08x %08x\n", l, d[0], d[1], d[2], face, i, j,
+                  r.v(l, 28), r.v(l, 29), r.v(l, 30));
+    }
+    ok = ok && cube;
+    const uint32_t layer = l >> 4;
+    const uint32_t want = layer < 3 ? 1000 * layer + 10 * (y & 1) + (x & 1) + 1 : 0u;
+    ok = ok && r.v(l, 36) == want;
+    if (!ok) std::printf("    lane %u: array load %u, not %u\n", l, r.v(l, 36), want);
+    ok = ok && r.v(l, 37) == 1 && r.v(l, 38) == 1 && r.v(l, 39) == 1 && r.v(l, 40) == 2;
+    // Gather of green at the centre of the 4x4: texels (1,2) (2,2) (2,1) (1,1).
+    ok = ok && close_to(r.v(l, 42), unorm(32)) && close_to(r.v(l, 43), unorm(32)) && close_to(r.v(l, 44), unorm(16)) &&
+         close_to(r.v(l, 45), unorm(16));
+    if (!ok) {
+      std::printf("    lane %u: resinfo %u %u %u %u gather %08x %08x %08x %08x\n", l, r.v(l, 37), r.v(l, 38), r.v(l, 39),
+                  r.v(l, 40), r.v(l, 42), r.v(l, 43), r.v(l, 44), r.v(l, 45));
+    }
+    ok = ok && r.v(l, 46) == 0;
+    if (r.v(l, 47) < 64) seen |= 1ull << r.v(l, 47);
+  }
+  CHECK(ok);
+  CHECK(seen == ~0ull);
+  // What the store and the atomics left in the textures.
+  bool stored = r.textures.size() == 6 && r.textures[1].size() == 8 * 8 * 4;
+  for (uint32_t l = 0; stored && l < 64; ++l) {
+    uint32_t w;
+    std::memcpy(&w, &r.textures[1][4 * l], 4);
+    stored = w == 3 * l;
+  }
+  CHECK(stored);
+  uint32_t count = 0;
+  if (r.textures.size() == 6) std::memcpy(&count, r.textures[5].data(), 4);
+  CHECK(count == 64);
+  // The missing T# was queued for the host.
+  const uint32_t misses_at = r.bindings[4] / 4;
+  CHECK(r.bindings[6] >= 1 && r.bindings[misses_at] == 1 && std::memcmp(&r.bindings[misses_at + 4], missing, 32) == 0);
 }

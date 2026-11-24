@@ -848,6 +848,33 @@ builder's `XMemVirtualQuery` calls, and the arguments logged at run time.
   src0 with `WaveReadLaneAt` before any EXEC test, so every host lane takes part.
 * **Also:** `v_fma_mix*` (f16 or f32 per source), `v_permlane16` / `v_permlanex16`, the cube
   ops, `v_alignbit` / `v_alignbyte`, the 64-bit bit counts and finds, `s_bitset*`.
+* **Images** (`shader/image_bindings`): a T# or S# is a run-time value in SGPRs, so the host
+  keeps a table from its words to its own descriptors.
+  * The table is an open-addressed hash in one buffer (`am_bindings`), built by
+    `build_bindings` and probed by the program (FNV-1a, at most 16 probes).
+  * An entry gives the heap indices of the views: SRV, a 2D-array SRV of a cube's faces, UAV.
+    It also gives flags: the numeric class (float, uint, sint), array views, writable, loads
+    through the UAV.
+  * The program casts `ResourceDescriptorHeap` / `SamplerDescriptorHeap` (SM 6.6) to the type
+    the instruction's dimension and the flags call for.
+  * A descriptor the table lacks is queued in the buffer's miss list, once a wave, and the
+    access reads zero (a store is dropped). The host adds it for the next frame.
+  * Lookups happen where the instruction runs, outside any EXEC test (they are wave-uniform),
+    and are reused within a block while their SGPRs are unchanged.
+  * **Covered:**
+    * `image_load` (and `_mip`), `image_store`, `image_get_resinfo`, the atomics;
+    * `image_sample` (`_lz`, `_l`, `_b`, `_d`, `_c_lz`), `image_gather4` (`_lz`, `_o`);
+    * 1D, 2D, 3D, cube and arrays, MSAA loads; D16 data, A16 for loads and stores;
+    * NSA addressing.
+  * **Address order** (checked against LLVM's operand counts): offset, bias, compare value,
+    gradients, coordinates, lod or mip.
+  * **Cubes:** the console passes face coordinates (s, t in [1, 2], face + 8 x layer), as its
+    `v_cube*` code makes them. They become a direction again for D3D's cube sampling.
+  * **Implicit derivatives** (`image_sample` and `_b` in compute) come from the console's quads
+    of lanes (lanes 4i..4i+3, via `WaveReadLaneAt`) and go to `SampleGrad`.
+  * **Not yet:** `gather4_l`, `sample_o`, `sample_c` with implicit or explicit lod (D3D's forms
+    need SM 6.7 / 6.8), `get_lod`, A16 sampling, unnormalized S# coordinates, the ray-tracing
+    instructions (`image_bvh*`).
 * **Two binding models:** `Test` (memory at a GPU base address in one UAV, a register dump in
   another) for the tests; `Runtime` follows with M4.
 * **Host side:** `host/dxc_compile` loads `dxcompiler.dll` from the found DXC and compiles in
@@ -863,13 +890,20 @@ builder's `XMemVirtualQuery` calls, and the arguments logged at run time.
   * They check that the HLSL does what we read the ISA to say. They cannot check that reading
     itself, since no PC GPU runs this ISA: where AMD's text is thin (DPP's out-of-row lanes,
     typed stores of fewer channels than the format has), the choice is noted in the code.
-* **Survey** (`tsurvey`, 8 s for the corpus; DXC on a sample of 500):
+* **Survey** (`tsurvey`, 13 s for the corpus; `am-shaders images` lists the image forms):
   * the first: 69 of the 2,682 compute programs, all compiling;
-  * with typed buffers 149; with SDWA and DPP 174; with the ALU ops and atomics above **296
-    (11 %), and every one compiles**.
-  * What blocks the rest is now nearly all images (`image_store` 1,932, `image_load` 1,740,
-    `image_sample_lz` 1,599, `image_sample_l` 1,322, `image_gather4_lz` 962, ...). After them:
-    `ds_swizzle_b32` 113, LDS atomics, D16 buffer forms, the 16-bit and packed ALU ops.
+  * with typed buffers 149; with SDWA and DPP 174; with the ALU ops and atomics 296;
+  * **with images 2,070 (77 %)**. DXC compiles every one sampled (48 of 48 below 400 KiB of
+    HLSL; the tests' programs too).
+  * What still blocks compute: `ds_swizzle_b32` 113, LDS atomics and `st64` forms, D16 buffer
+    forms, 16-bit and packed ALU ops, ray tracing (`image_bvh*`, 56).
+* **Compile time is now the problem.** The translated HLSL is large (median 242 KiB, 90th
+  percentile 1.6 MiB), and DXC's time grows faster than its size:
+  * 42 KiB: 0.4 s; 242 KiB: 6 s; 1.6 MiB: 50 s even at `-O0`, 7 to 9 minutes at `-O3`.
+  * Most of it is LLVM's value propagation and GVN (`-ftime-report`): every register flows
+    through the dispatcher's loop header from every block (811 blocks in the largest).
+  * So structured control flow (step 4: `if` / loops from the CFG instead of
+    `switch (pc)`) comes next. It is also what the GPU wants at run time.
 
 ### M2.3: console files and DirectStorage (done)
 

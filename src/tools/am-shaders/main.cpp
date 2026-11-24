@@ -15,9 +15,11 @@
 //   am-shaders translate <hash prefix> [--out <dir>] [--raw <hlsl dir>]
 //       One container's programs through the shader translator; the HLSL goes to
 //       <cache>\shaders\hlsl and is compiled with DXC.
-//   am-shaders tsurvey [<programs to compile>] [--out <dir>]
+//   am-shaders tsurvey [<programs to compile>] [--out <dir>] [--raw <hlsl dir>]
 //       Every program through the translator: what translates, what holds the rest up, and DXC
 //       on a sample, in <cache>\shaders\translation.json.
+//   am-shaders images [--out <dir>]
+//       Every image instruction of the corpus by its form and stage.
 
 #include <windows.h>
 
@@ -54,7 +56,8 @@ int usage() {
                "       am-shaders survey [--out <dir>]\n"
                "       am-shaders disasm <hash prefix> [--out <dir>] [--raw <dir>]\n"
                "       am-shaders translate <hash prefix> [--out <dir>] [--raw <hlsl dir>]\n"
-               "       am-shaders tsurvey [<programs to compile>] [--out <dir>]\n");
+               "       am-shaders tsurvey [<programs to compile>] [--out <dir>] [--raw <hlsl dir>]\n"
+               "       am-shaders images [--out <dir>]\n");
   return 2;
 }
 
@@ -260,9 +263,10 @@ int wmain(int argc, wchar_t** argv) {
   if (command == L"translate" && positional.size() == 1) {
     return tools::translate(narrow(positional[0]), out, raw.empty() ? out.parent_path() / L"hlsl" : raw);
   }
+  if (command == L"images" && positional.empty()) return tools::image_survey(out);
   if (command == L"tsurvey" && positional.size() <= 1) {
     const size_t sample = positional.empty() ? 200 : std::stoul(positional[0]);
-    return tools::translation_survey(out, out.parent_path() / L"translation.json", sample);
+    return tools::translation_survey(out, out.parent_path() / L"translation.json", sample, raw);
   }
   return usage();
 }

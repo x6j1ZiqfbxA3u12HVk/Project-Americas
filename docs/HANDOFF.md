@@ -48,8 +48,9 @@ ends the run.
 **M3:** the RDNA 2 decoder is done and decodes all 26,084 console GPU programs of the corpus,
 checked against LLVM (100 % on 2.8 M instructions). **Translator version 1 runs** (PLAN.md,
 section 11, "M3.2"): compute programs become HLSL, one thread per console lane, and are checked
-on the host GPU against the ISA. 296 of 2,682 compute programs (11 %) translate so far, all of
-them compile; what blocks the rest is nearly all image instructions.
+on the host GPU against the ISA. With images (a descriptor table the host keeps, SM 6.6 heaps)
+**2,070 of 2,682 compute programs (77 %) translate**. DXC compiles them, but large ones take
+minutes (7 to 9 minutes at `-O3` for the largest): structured control flow is the next step.
 
 ## 1. Rules from the user (follow them exactly)
 
@@ -145,7 +146,7 @@ Set-Location "C:\Users\Admin\Documents\GitHub\Project Americas"; . .\scripts\env
 | `src/x86` | our x86-64 decoder (length, operands, flow, required feature) and the two-pass code census |
 | `src/loader` | the import routing policy: ours / wrap / host / title / unresolved |
 | `src/formats` | DEFLATE (raw and zlib) |
-| `src/shader` | shader pack reader (records found by their framing), DXBC container parser, `console_program` (XDAT / XBCH / FSSM: the native programs and their records), `rdna2` (the decoder; `rdna2_tables.inl` generated from AMD's XML), `translate` (console program → HLSL) |
+| `src/shader` | shader pack reader (records found by their framing), DXBC container parser, `console_program` (XDAT / XBCH / FSSM: the native programs and their records), `rdna2` (the decoder; `rdna2_tables.inl` generated from AMD's XML), `translate` (console program → HLSL), `image_bindings` (the T# / S# table) |
 | `src/runtime` | the runtime DLL, below |
 | `src/runtime/memory` | title memory: console flag translation, physical pages, the XMemAlloc default allocator |
 | `src/runtime/gdk` | XGameRuntime: `runtime.*` (exports, QueryApiImpl, area objects, report), `catalog.cpp` (the areas not done yet, by slot), `task_queue*` (XTaskQueue / XAsync), `offline.cpp` (XUser, XSystem, XGame, XNetworking, features, events) |
@@ -282,9 +283,12 @@ RDNA 2 decoder decodes all 26,084 programs by control flow, checked against LLVM
    * GPU tests in `tests/translate_tests.cpp`: assemble with llvm-mc
      (`-triple=amdgcn -mcpu=gfx1030 -mattr=+wavefrontsize64 --show-encoding`), put the words
      in, check registers and memory.
-   * Done since: typed buffers, SDWA/DPP, `v_fma_mix`, permutes, cube ops, atomics.
-   * Next: images (a texture binding model: the T# and S# decoded at run time, descriptor
-     heaps in the test harness), then the other stages (PS/VS/mesh I/O from the FSSM
+   * Done since: typed buffers, SDWA/DPP, `v_fma_mix`, permutes, cube ops, atomics, images
+     (`shader/image_bindings`: the host maps T# / S# words to heap indices; misses are queued).
+   * `am-shaders images` lists every image form; `tsurvey <n> --raw <dir>` writes the HLSL
+     of `n` translated programs instead of compiling them (time them with `dxc.exe`).
+   * Next: **structured control flow**, because compile time grows too fast with the
+     dispatcher (PLAN.md 11, M3.2). Then the other stages (PS/VS/mesh I/O from the FSSM
      records), the indirect jumps, and the runtime binding model (M4).
    * Then the speed work (IR, structuring, uniformity) and `am-shaders precompile`.
    * It must be resumable, run below normal priority, and be content-addressed (console bytes

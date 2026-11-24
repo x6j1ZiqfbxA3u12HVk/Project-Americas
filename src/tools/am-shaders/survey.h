@@ -23,6 +23,8 @@ int translate(const std::string& wanted, const std::filesystem::path& pack_dir, 
 
 // Every program through the translator: what translates, by stage; which instructions hold
 // the rest up; DXC on a sample of `compile_sample` translations.
-int translation_survey(const std::filesystem::path& pack_dir, const std::filesystem::path& out_json, size_t compile_sample);
+int image_survey(const std::filesystem::path& pack_dir);
+int translation_survey(const std::filesystem::path& pack_dir, const std::filesystem::path& out_json, size_t compile_sample,
+                       const std::filesystem::path& hlsl_dir = {});
 
 }  // namespace am::tools

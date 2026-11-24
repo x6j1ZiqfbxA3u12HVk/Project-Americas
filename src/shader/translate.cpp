@@ -49,6 +49,19 @@ struct Ctx {
   bool uses_lds = false;
   uint32_t max_vgpr = 0;
   bool dpp = false;  // this instruction's src0 is am_dpp, and am_dpp_on gates its writes
+  bool uses_images = false;
+  // Descriptor lookups still valid in this block, by first SGPR (T#s, S#s), and every one made.
+  std::set<uint32_t> live_images, live_samplers, image_vars, sampler_vars;
+  // Forgets the lookups whose registers [lo, hi] may have changed.
+  void drop_descriptors(uint32_t lo, uint32_t hi) {
+    for (auto* set : {&live_images, &live_samplers}) {
+      const uint32_t n = set == &live_images ? 8 : 4;
+      for (auto it = set->begin(); it != set->end();) {
+        if (*it <= hi && *it + n - 1 >= lo) it = set->erase(it);
+        else ++it;
+      }
+    }
+  }
 
   // The lane condition of a vector write (EXEC, and DPP's masks when it has them).
   std::string act() const { return dpp ? "(AM_ACT != 0u && am_dpp_on)" : "(AM_ACT != 0u)"; }
@@ -275,6 +288,228 @@ bool buffer_address(Ctx& c) {
   c.line("if (AM_ACT) { uint4 rs = uint4(s[" + num(r) + "], s[" + num(r + 1) + "], s[" + num(r + 2) + "], s[" + num(r + 3) + "]);");
   c.line("  uint64_t p; uint lim; am_buffer_address(rs, " + index + ", " + offset + " + " + num(c.f(Field::OFFSET)) + "u, " +
          c.src(c.f(Field::SOFFSET)) + ", p, lim);");
+  return true;
+}
+
+// ---- images (MIMG) ----
+//
+// The T# and S# are looked up in the host's bindings table (image_bindings.h) where the
+// instruction runs, outside any EXEC test: they are wave-uniform, and implicit derivatives
+// need every lane. Only the register writes, stores and atomics follow EXEC.
+
+enum class ImgKind : uint8_t { Sample, Gather, Load, Store, Atomic, Info };
+struct ImgOp {
+  ImgKind kind;
+  bool offset = false, bias = false, compare = false, grads = false, lod = false, implicit = false;
+  uint32_t atomic = 0;
+};
+
+const rd::Field kNsaFields[] = {Field::VADDRA, Field::VADDRB, Field::VADDRC, Field::VADDRD, Field::VADDRE, Field::VADDRF,
+                                Field::VADDRG, Field::VADDRH, Field::VADDRI, Field::VADDRJ, Field::VADDRK, Field::VADDRL};
+
+bool image(Ctx& c, const ImgOp& op) {
+  const std::string name = c.in->info->name;
+  if (c.f(Field::TFE) || c.f(Field::LWE)) return c.fail(name + " (tfe/lwe)");
+  if (c.f(Field::R128)) return c.fail(name + " (128-bit T#)");
+  const uint32_t dim = c.f(Field::DIM), dmask = c.f(Field::DMASK), vd = c.f(Field::VDATA);
+  const bool a16 = c.f(Field::A16) != 0, d16 = c.f(Field::D16) != 0, nsa = c.f(Field::NSA) != 0;
+  if (a16 && (op.kind == ImgKind::Sample || op.kind == ImgKind::Gather)) return c.fail(name + " (a16)");
+  if (dim >= 6 && op.kind != ImgKind::Load) return c.fail(name + " (msaa)");
+  // Address components, in the hardware's order: offset, bias, z-compare, gradients,
+  // coordinates, lod / mip. A16 packs two to a register.
+  int next = 0;
+  bool bad = false;
+  const auto addr = [&]() -> std::string {
+    const int k = next++;
+    const int dword = a16 ? k / 2 : k;
+    uint32_t reg;
+    if (!nsa) reg = c.f(Field::VADDR) + dword;
+    else if (dword == 0) reg = c.f(Field::VADDR);
+    else if (dword - 1 < 12) reg = c.f(kNsaFields[dword - 1]);
+    else {
+      bad = true;
+      return "0u";
+    }
+    c.touch_v(reg);
+    const std::string v = "v[" + num(reg) + "]";
+    return a16 ? "((" + v + " >> " + (k % 2 ? "16u" : "0u") + ") & 0xFFFFu)" : v;
+  };
+  static const int kCoords[] = {1, 2, 3, 3, 2, 3, 3, 4}, kGrads[] = {1, 2, 3, 2, 1, 2, 0, 0};
+  std::string offset, bias, cmp, g[6], co[4], lod;
+  if (op.kind == ImgKind::Info) {
+    lod = addr();
+  } else {
+    if (op.offset) offset = addr();
+    if (op.bias) bias = addr();
+    if (op.compare) cmp = addr();
+    if (op.grads) for (int j = 0; j < 2 * kGrads[dim]; ++j) g[j] = addr();
+    for (int j = 0; j < kCoords[dim]; ++j) co[j] = addr();
+    if (op.lod) lod = addr();
+  }
+  if (bad) return c.fail(name + " (address)");
+  c.uses_images = true;
+  const uint32_t t = c.f(Field::SRSRC) * 4, sa = c.f(Field::SSAMP) * 4;
+  const auto sq = [&](uint32_t b) { return "uint4(s[" + num(b) + "], s[" + num(b + 1) + "], s[" + num(b + 2) + "], s[" + num(b + 3) + "])"; };
+  const std::string suffix = dim == 0 || dim == 4 ? "1d" : dim == 1 || dim == 5 ? "2d" : dim == 2 ? "3d" : dim == 3 ? "cube" : "ms";
+  const bool arr = dim == 4 || dim == 5;
+  const auto fl = [](const std::string& x) { return "asfloat(" + x + ")"; };
+  const auto in = [](const std::string& x) { return "asint(" + x + ")"; };
+  // The coordinates for the dimension's helpers: 1d (x, slice), 2d (x, y, slice), 3d (x, y, z),
+  // cube (s, t, face), ms (x, y, slice, sample).
+  std::string fco, ico;
+  switch (dim) {
+    case 0: fco = "float2(" + fl(co[0]) + ", 0.0f)"; ico = "int4(" + in(co[0]) + ", 0, 0, 0)"; break;
+    case 4: fco = "float2(" + fl(co[0]) + ", " + fl(co[1]) + ")"; ico = "int4(" + in(co[0]) + ", " + in(co[1]) + ", 0, 0)"; break;
+    case 1:
+      fco = "float3(" + fl(co[0]) + ", " + fl(co[1]) + ", 0.0f)";
+      ico = "int4(" + in(co[0]) + ", " + in(co[1]) + ", 0, 0)";
+      break;
+    case 6: ico = "int4(" + in(co[0]) + ", " + in(co[1]) + ", 0, " + in(co[2]) + ")"; break;
+    case 7: ico = "int4(" + in(co[0]) + ", " + in(co[1]) + ", " + in(co[2]) + ", " + in(co[3]) + ")"; break;
+    default:  // 3D, cube, 2D array
+      fco = "float3(" + fl(co[0]) + ", " + fl(co[1]) + ", " + fl(co[2]) + ")";
+      ico = "int4(" + in(co[0]) + ", " + in(co[1]) + ", " + in(co[2]) + ", 0)";
+      break;
+  }
+  (void)arr;
+  // A lookup made earlier in the block, of registers unchanged since, is used again.
+  if (!c.live_images.count(t)) {
+    c.line("am_im_" + num(t) + " = am_image(" + sq(t) + ", " + sq(t + 4) + ");");
+    c.live_images.insert(t);
+    c.image_vars.insert(t);
+  }
+  const bool sampled = op.kind == ImgKind::Sample || op.kind == ImgKind::Gather;
+  if (sampled && !c.live_samplers.count(sa)) {
+    c.line("am_sm_" + num(sa) + " = am_sampler(" + sq(sa) + ");");
+    c.live_samplers.insert(sa);
+    c.sampler_vars.insert(sa);
+  }
+  c.line("{ AmImage im = am_im_" + num(t) + ";");
+  if (sampled) c.line("  AmSampler sm = am_sm_" + num(sa) + ";");
+  // The channels the instruction moves, in order.
+  std::vector<int> channels;
+  for (int b = 0; b < 4; ++b) {
+    if ((dmask >> b) & 1) channels.push_back(b);
+  }
+  // Writes `n` result channels (uint4 r) to VDATA, two to a register with D16.
+  // `float_bits`: the values are float bits (else the image's class decides how D16 packs).
+  const auto write_results = [&](const std::vector<int>& from, bool float_bits) {
+    if (!d16) {
+      c.touch_v(vd + static_cast<uint32_t>(from.size()) - 1);
+      std::string w = "  if (AM_ACT) {";
+      for (size_t n = 0; n < from.size(); ++n) w += " v[" + num(vd + n) + "] = r[" + num(from[n]) + "];";
+      c.line(w + " }");
+      return;
+    }
+    c.touch_v(vd + static_cast<uint32_t>((from.size() + 1) / 2) - 1);
+    const std::string h = float_bits ? "f32tof16(asfloat(X))" : "((im.flags & 3u) == 0u ? f32tof16(asfloat(X)) : (X & 0xFFFFu))";
+    std::string w = "  if (AM_ACT) {";
+    for (size_t n = 0; n < from.size(); n += 2) {
+      std::string e = fill(h, "r[" + num(from[n]) + "]");
+      if (n + 1 < from.size()) e = "(" + e + " | (" + fill(h, "r[" + num(from[n + 1]) + "]") + " << 16))";
+      w += " v[" + num(vd + n / 2) + "] = " + e + ";";
+    }
+    c.line(w + " }");
+  };
+
+  switch (op.kind) {
+    case ImgKind::Sample: {
+      if (channels.empty()) channels.push_back(0);
+      if (dim == 3) c.line("  float4 cc = am_cube_dir(" + fco + ");");
+      else c.line("  " + std::string(dim == 0 || dim == 4 ? "float2" : "float3") + " cc = " + fco + ";");
+      const std::string pos = dim == 3 ? "cc" : "cc";
+      // The coordinates gradients are taken of: the face direction for cubes.
+      const std::string gsel = dim == 3 ? "cc.xyz" : dim == 0 || dim == 4 ? "cc.x" : dim == 2 ? "cc" : "cc.xy";
+      const std::string gtype = dim == 3 || dim == 2 ? "float3" : dim == 0 || dim == 4 ? "float" : "float2";
+      if (op.compare) {
+        if (!op.lod && op.implicit) return c.fail(name);
+        if (dim == 2) return c.fail(name + " (3D compare)");
+        c.line("  float4 rf = am_cmp_lz_" + suffix + "(im, sm, " + pos + ", " + fl(cmp) + ").xxxx;");
+      } else if (op.implicit || op.grads) {
+        if (op.implicit) {
+          const std::string scale = op.bias ? " * exp2(" + fl(bias) + ")" : "";
+          c.line("  " + gtype + " dx = AM_DX(" + gsel + ")" + scale + ", dy = AM_DY(" + gsel + ")" + scale + ";");
+        } else {
+          const int n = kGrads[dim];
+          std::string dx = gtype + "(", dy = gtype + "(";
+          for (int j = 0; j < n; ++j) {
+            dx += (j ? ", " : "") + fl(g[j]);
+            dy += (j ? ", " : "") + fl(g[n + j]);
+          }
+          dx += ")";
+          dy += ")";
+          if (dim == 3) {
+            // Face-coordinate gradients become direction gradients (the map is affine).
+            c.line("  float3 dx = am_cube_dir(" + fco + " + float3(" + fl(g[0]) + ", " + fl(g[1]) + ", 0.0f)).xyz - cc.xyz;");
+            c.line("  float3 dy = am_cube_dir(" + fco + " + float3(" + fl(g[2]) + ", " + fl(g[3]) + ", 0.0f)).xyz - cc.xyz;");
+          } else {
+            c.line("  " + gtype + " dx = " + dx + ", dy = " + dy + ";");
+          }
+        }
+        c.line("  float4 rf = am_grad_" + suffix + "(im, sm, " + pos + ", dx, dy);");
+      } else {
+        c.line("  float4 rf = am_sample_" + suffix + "(im, sm, " + pos + ", " + (op.lod ? fl(lod) : std::string("0.0f")) + ");");
+      }
+      c.line("  uint4 r = asuint(rf);");
+      write_results(channels, true);
+      break;
+    }
+    case ImgKind::Gather: {
+      if (channels.size() != 1) return c.fail(name + " (dmask)");
+      if (dim != 1 && dim != 5 && dim != 3) return c.fail(name + " (dimension)");
+      std::string off = "int2(0, 0)";
+      if (op.offset) {
+        if (dim == 3) return c.fail(name + " (cube offset)");
+        off = "int2(int(" + offset + " << 26) >> 26, int(" + offset + " << 18) >> 26)";
+      }
+      if (dim == 3) c.line("  uint4 r = am_gather_cube(im, sm, am_cube_dir(" + fco + "), " + num(channels[0]) + "u);");
+      else c.line("  uint4 r = am_gather_2d(im, sm, " + fco + ", " + num(channels[0]) + "u, " + off + ");");
+      write_results({0, 1, 2, 3}, false);
+      break;
+    }
+    case ImgKind::Load: {
+      if (channels.empty()) channels.push_back(0);
+      c.line("  uint4 r = am_load_" + suffix + "(im, " + ico + ", " + (op.lod ? in(lod) : std::string("0")) + ");");
+      write_results(channels, false);
+      break;
+    }
+    case ImgKind::Info: {
+      if (dim >= 6) return c.fail(name + " (msaa)");
+      c.line("  uint4 r = am_info_" + suffix + "(im, " + lod + ");");
+      write_results(channels, false);
+      break;
+    }
+    case ImgKind::Store: {
+      if (op.lod) return c.fail(name + " (mip)");
+      std::string d = "uint4(";
+      for (int b = 0, n = 0; b < 4; ++b) {
+        std::string x = "0u";
+        if ((dmask >> b) & 1) {
+          if (!d16) {
+            c.touch_v(vd + n);
+            x = "v[" + num(vd + n) + "]";
+          } else {
+            c.touch_v(vd + n / 2);
+            const std::string h = "((v[" + num(vd + n / 2) + "] >> " + (n % 2 ? "16u" : "0u") + ") & 0xFFFFu)";
+            x = "((im.flags & 3u) == 0u ? asuint(f16tof32(" + h + ")) : " + h + ")";
+          }
+          ++n;
+        }
+        d += (b ? ", " : "") + x;
+      }
+      c.line("  if (AM_ACT) am_store_" + suffix + "(im, " + ico + ", " + d + "));");
+      break;
+    }
+    case ImgKind::Atomic: {
+      if (dim != 0 && dim != 1 && dim != 2 && dim != 5) return c.fail(name + " (dimension)");
+      c.touch_v(vd + (op.atomic == 1 ? 1 : 0));
+      const std::string cmpv = op.atomic == 1 ? "v[" + num(vd + 1) + "]" : "0u";
+      c.line("  if (AM_ACT) { uint o = am_atomic_" + suffix + "(im, " + ico + ", " + num(op.atomic) + "u, v[" + num(vd) + "], " +
+             cmpv + ");" + (c.f(Field::GLC) ? " v[" + num(vd) + "] = o;" : "") + " }");
+      break;
+    }
+  }
+  c.line("}");
   return true;
 }
 
@@ -966,6 +1201,44 @@ const std::unordered_map<std::string, Handler>& table() {
         };
       }
     }
+    // -- images --
+    {
+      const auto add = [&t](const char* name, ImgOp op) { t[name] = [op](Ctx& c) { return image(c, op); }; };
+      ImgOp o{ImgKind::Sample};
+      o.implicit = true;
+      add("image_sample", o);
+      o.bias = true;
+      add("image_sample_b", o);
+      add("image_sample_lz", ImgOp{ImgKind::Sample});
+      o = ImgOp{ImgKind::Sample};
+      o.lod = true;
+      add("image_sample_l", o);
+      o = ImgOp{ImgKind::Sample};
+      o.grads = true;
+      add("image_sample_d", o);
+      o = ImgOp{ImgKind::Sample};
+      o.compare = true;
+      add("image_sample_c_lz", o);
+      // Gather reads the top level, as D3D's does: gather4 (implicit lod) and gather4_lz.
+      add("image_gather4", ImgOp{ImgKind::Gather});
+      add("image_gather4_lz", ImgOp{ImgKind::Gather});
+      o = ImgOp{ImgKind::Gather};
+      o.offset = true;
+      add("image_gather4_o", o);
+      add("image_gather4_lz_o", o);
+      add("image_load", ImgOp{ImgKind::Load});
+      o = ImgOp{ImgKind::Load};
+      o.lod = true;
+      add("image_load_mip", o);
+      add("image_store", ImgOp{ImgKind::Store});
+      add("image_get_resinfo", ImgOp{ImgKind::Info});
+      static const char* const kAtomics[] = {"swap", "cmpswap", "add", "sub", "smin", "umin", "smax", "umax", "and", "or", "xor"};
+      for (uint32_t k = 0; k < 11; ++k) {
+        o = ImgOp{ImgKind::Atomic};
+        o.atomic = k;
+        t[std::string("image_atomic_") + kAtomics[k]] = [o](Ctx& c) { return image(c, o); };
+      }
+    }
     // -- LDS --
     t["ds_read_b32"] = [](Ctx& c) {
       c.uses_lds = true;
@@ -1078,6 +1351,7 @@ const char* kTestBinding = R"(
 // The tests' binding model: GPU addresses map onto one buffer from am_args.base.
 RWByteAddressBuffer am_memory : register(u0);
 RWByteAddressBuffer am_dump : register(u1);
+RWByteAddressBuffer am_bindings : register(u2);  // image_bindings.h
 cbuffer am_args : register(b0) { uint4 am_user[8]; uint2 am_base; uint2 am_pad; };
 uint am_offset(uint64_t a) { return uint(a - am_u64(am_base.x, am_base.y)); }
 uint am_load(uint64_t a) { return am_memory.Load(am_offset(a)); }
@@ -1104,6 +1378,285 @@ void am_store_masked(uint64_t a, uint x, uint m) {
   if (m == 0xFFFFFFFFu) { am_store(a, x); return; }
   am_memory.InterlockedAnd(am_offset(a), ~m);
   am_memory.InterlockedOr(am_offset(a), x & m);
+}
+)";
+
+const char* kImageHelpers = R"(
+// ---- images: descriptors from the bindings table, views from the descriptor heaps ----
+struct AmImage { uint srv; uint alt; uint uav; uint flags; };
+struct AmSampler { uint index; uint flags; };
+#define AM_VALID 0x80000000u
+#define AM_ARR(im) (((im).flags & 4u) != 0u)
+#define AM_DX(x) (WaveReadLaneAt(x, am_lane | 1u) - WaveReadLaneAt(x, am_lane & ~1u))
+#define AM_DY(x) (WaveReadLaneAt(x, am_lane | 2u) - WaveReadLaneAt(x, am_lane & ~2u))
+uint am_bind_hash(uint4 a, uint4 b) {
+  uint h = 0x811C9DC5u;
+  [unroll] for (uint i = 0u; i < 4u; ++i) h = (h ^ a[i]) * 0x01000193u;
+  [unroll] for (uint j = 0u; j < 4u; ++j) h = (h ^ b[j]) * 0x01000193u;
+  return h ^ (h >> 16);
+}
+uint4 am_bind_find(uint table, uint cap, uint size, uint4 a, uint4 b) {
+  if (cap != 0u) {
+    uint h = am_bind_hash(a, b);
+    [loop] for (uint p = 0u; p < 16u; ++p) {
+      uint at = table + ((h + p) & (cap - 1u)) * size;
+      uint4 v = am_bindings.Load4(at + 32u);
+      if (v.w == 0u) break;
+      if (all(am_bindings.Load4(at) == a) && all(am_bindings.Load4(at + 16u) == b)) return v;
+    }
+  }
+  return uint4(0u, 0u, 0u, 0u);
+}
+// A descriptor the table lacks: queued once a wave for the host.
+void am_bind_miss(uint kind, uint4 a, uint4 b) {
+  if (!WaveIsFirstLane()) return;
+  uint n;
+  am_bindings.InterlockedAdd(24u, 1u, n);
+  if (n >= am_bindings.Load(20u)) return;
+  uint at = am_bindings.Load(16u) + n * 48u;
+  am_bindings.Store4(at, uint4(kind, 0u, 0u, 0u));
+  am_bindings.Store4(at + 16u, a);
+  am_bindings.Store4(at + 32u, b);
+}
+AmImage am_image(uint4 a, uint4 b) {
+  uint4 v = am_bind_find(am_bindings.Load(0u), am_bindings.Load(4u), 64u, a, b);
+  if (v.w == 0u) am_bind_miss(1u, a, b);
+  AmImage im;
+  im.srv = WaveReadLaneFirst(v.x); im.alt = WaveReadLaneFirst(v.y); im.uav = WaveReadLaneFirst(v.z); im.flags = WaveReadLaneFirst(v.w);
+  return im;
+}
+AmSampler am_sampler(uint4 a) {
+  uint4 v = am_bind_find(am_bindings.Load(8u), am_bindings.Load(12u), 48u, a, uint4(0u, 0u, 0u, 0u));
+  if (v.w == 0u) am_bind_miss(2u, a, uint4(0u, 0u, 0u, 0u));
+  AmSampler sm;
+  sm.index = WaveReadLaneFirst(v.x); sm.flags = WaveReadLaneFirst(v.w);
+  return sm;
+}
+
+// A view of the image's numeric class (the format decides: float, uint or sint).
+#define AM_CLASS_DO(T, idx, st) { uint cl_ = im.flags & 3u; \
+  if (cl_ == 0u) { T<float4> t = ResourceDescriptorHeap[idx]; st; } \
+  else if (cl_ == 1u) { T<uint4> t = ResourceDescriptorHeap[idx]; st; } \
+  else { T<int4> t = ResourceDescriptorHeap[idx]; st; } }
+#define AM_CLASS_RET(T, idx, e) AM_CLASS_DO(T, idx, return asuint(e))
+#define AM_CLASS_STORE(T, idx, at) { uint cl_ = im.flags & 3u; \
+  if (cl_ == 0u) { T<float4> t = ResourceDescriptorHeap[idx]; t[at] = asfloat(d); } \
+  else if (cl_ == 1u) { T<uint4> t = ResourceDescriptorHeap[idx]; t[at] = d; } \
+  else { T<int4> t = ResourceDescriptorHeap[idx]; t[at] = asint(d); } return; }
+#define AM_NONE uint4(0u, 0u, 0u, 0u)
+
+// Loads: c = (x, y, z or slice, sample); out of bounds reads zero.
+uint4 am_load_1d(AmImage im, int4 c, int mip) {
+  if ((im.flags & AM_VALID) == 0u) return AM_NONE;
+  if ((im.flags & 16u) != 0u) {
+    if (AM_ARR(im)) AM_CLASS_RET(RWTexture1DArray, im.uav, t[uint2(c.xy)])
+    AM_CLASS_RET(RWTexture1D, im.uav, t[uint(c.x)])
+  }
+  if (AM_ARR(im)) AM_CLASS_RET(Texture1DArray, im.srv, t.Load(int3(c.xy, mip)))
+  AM_CLASS_RET(Texture1D, im.srv, t.Load(int2(c.x, mip)))
+}
+uint4 am_load_2d(AmImage im, int4 c, int mip) {
+  if ((im.flags & AM_VALID) == 0u) return AM_NONE;
+  if ((im.flags & 16u) != 0u) {
+    if (AM_ARR(im)) AM_CLASS_RET(RWTexture2DArray, im.uav, t[uint3(c.xyz)])
+    AM_CLASS_RET(RWTexture2D, im.uav, t[uint2(c.xy)])
+  }
+  if (AM_ARR(im)) AM_CLASS_RET(Texture2DArray, im.srv, t.Load(int4(c.xyz, mip)))
+  AM_CLASS_RET(Texture2D, im.srv, t.Load(int3(c.xy, mip)))
+}
+uint4 am_load_3d(AmImage im, int4 c, int mip) {
+  if ((im.flags & AM_VALID) == 0u) return AM_NONE;
+  if ((im.flags & 16u) != 0u) AM_CLASS_RET(RWTexture3D, im.uav, t[uint3(c.xyz)])
+  AM_CLASS_RET(Texture3D, im.srv, t.Load(int4(c.xyz, mip)))
+}
+// A cube's faces are loaded through its 2D-array views (z = face, or layer of a cube array).
+uint4 am_load_cube(AmImage im, int4 c, int mip) {
+  if ((im.flags & AM_VALID) == 0u) return AM_NONE;
+  if ((im.flags & 16u) != 0u) AM_CLASS_RET(RWTexture2DArray, im.uav, t[uint3(c.xyz)])
+  AM_CLASS_RET(Texture2DArray, im.alt, t.Load(int4(c.xyz, mip)))
+}
+uint4 am_load_ms(AmImage im, int4 c, int mip) {
+  if ((im.flags & AM_VALID) == 0u) return AM_NONE;
+  if (AM_ARR(im)) AM_CLASS_RET(Texture2DMSArray, im.srv, t.Load(int3(c.xyz), c.w))
+  AM_CLASS_RET(Texture2DMS, im.srv, t.Load(int2(c.xy), c.w))
+}
+
+// Stores, through the uav.
+void am_store_1d(AmImage im, int4 c, uint4 d) {
+  if ((im.flags & (AM_VALID | 8u)) != (AM_VALID | 8u)) return;
+  if (AM_ARR(im)) AM_CLASS_STORE(RWTexture1DArray, im.uav, uint2(c.xy))
+  AM_CLASS_STORE(RWTexture1D, im.uav, uint(c.x))
+}
+void am_store_2d(AmImage im, int4 c, uint4 d) {
+  if ((im.flags & (AM_VALID | 8u)) != (AM_VALID | 8u)) return;
+  if (AM_ARR(im)) AM_CLASS_STORE(RWTexture2DArray, im.uav, uint3(c.xyz))
+  AM_CLASS_STORE(RWTexture2D, im.uav, uint2(c.xy))
+}
+void am_store_3d(AmImage im, int4 c, uint4 d) {
+  if ((im.flags & (AM_VALID | 8u)) != (AM_VALID | 8u)) return;
+  AM_CLASS_STORE(RWTexture3D, im.uav, uint3(c.xyz))
+}
+void am_store_cube(AmImage im, int4 c, uint4 d) {
+  if ((im.flags & (AM_VALID | 8u)) != (AM_VALID | 8u)) return;
+  AM_CLASS_STORE(RWTexture2DArray, im.uav, uint3(c.xyz))
+}
+
+// The console's cube coordinates (s, t in [1, 2] on the face, face + 8 * layer) as a direction
+// and layer: the inverse of v_cubesc / v_cubetc / v_cubeid with s = sc / |ma| + 1.5.
+float4 am_cube_dir(float3 c) {
+  float u = (c.x - 1.5f) * 2.0f, v = (c.y - 1.5f) * 2.0f;
+  float layer = floor((c.z + 0.5f) / 8.0f);
+  uint f = uint(round(c.z - 8.0f * layer));
+  float3 d;
+  if (f == 0u) d = float3(1.0f, -v, -u);
+  else if (f == 1u) d = float3(-1.0f, -v, u);
+  else if (f == 2u) d = float3(u, 1.0f, v);
+  else if (f == 3u) d = float3(u, -1.0f, -v);
+  else if (f == 4u) d = float3(u, -v, 1.0f);
+  else d = float3(-u, -v, -1.0f);
+  return float4(d, layer);
+}
+
+#define AM_SAMPLED(im, sm) (((im).flags & (sm).flags & AM_VALID) != 0u)
+// Sampling at a level: c = (x, slice) / (x, y, slice) / (x, y, z) / (direction, layer).
+float4 am_sample_1d(AmImage im, AmSampler sm, float2 c, float lod) {
+  if (!AM_SAMPLED(im, sm)) return 0.0f;
+  SamplerState s = SamplerDescriptorHeap[sm.index];
+  if (AM_ARR(im)) { Texture1DArray<float4> t = ResourceDescriptorHeap[im.srv]; return t.SampleLevel(s, c, lod); }
+  Texture1D<float4> t1 = ResourceDescriptorHeap[im.srv]; return t1.SampleLevel(s, c.x, lod);
+}
+float4 am_sample_2d(AmImage im, AmSampler sm, float3 c, float lod) {
+  if (!AM_SAMPLED(im, sm)) return 0.0f;
+  SamplerState s = SamplerDescriptorHeap[sm.index];
+  if (AM_ARR(im)) { Texture2DArray<float4> t = ResourceDescriptorHeap[im.srv]; return t.SampleLevel(s, c, lod); }
+  Texture2D<float4> t1 = ResourceDescriptorHeap[im.srv]; return t1.SampleLevel(s, c.xy, lod);
+}
+float4 am_sample_3d(AmImage im, AmSampler sm, float3 c, float lod) {
+  if (!AM_SAMPLED(im, sm)) return 0.0f;
+  SamplerState s = SamplerDescriptorHeap[sm.index];
+  Texture3D<float4> t = ResourceDescriptorHeap[im.srv]; return t.SampleLevel(s, c, lod);
+}
+float4 am_sample_cube(AmImage im, AmSampler sm, float4 c, float lod) {
+  if (!AM_SAMPLED(im, sm)) return 0.0f;
+  SamplerState s = SamplerDescriptorHeap[sm.index];
+  if (AM_ARR(im)) { TextureCubeArray<float4> t = ResourceDescriptorHeap[im.srv]; return t.SampleLevel(s, c, lod); }
+  TextureCube<float4> t1 = ResourceDescriptorHeap[im.srv]; return t1.SampleLevel(s, c.xyz, lod);
+}
+// Sampling with gradients (given, or taken across the console's quads of lanes).
+float4 am_grad_1d(AmImage im, AmSampler sm, float2 c, float dx, float dy) {
+  if (!AM_SAMPLED(im, sm)) return 0.0f;
+  SamplerState s = SamplerDescriptorHeap[sm.index];
+  if (AM_ARR(im)) { Texture1DArray<float4> t = ResourceDescriptorHeap[im.srv]; return t.SampleGrad(s, c, dx, dy); }
+  Texture1D<float4> t1 = ResourceDescriptorHeap[im.srv]; return t1.SampleGrad(s, c.x, dx, dy);
+}
+float4 am_grad_2d(AmImage im, AmSampler sm, float3 c, float2 dx, float2 dy) {
+  if (!AM_SAMPLED(im, sm)) return 0.0f;
+  SamplerState s = SamplerDescriptorHeap[sm.index];
+  if (AM_ARR(im)) { Texture2DArray<float4> t = ResourceDescriptorHeap[im.srv]; return t.SampleGrad(s, c, dx, dy); }
+  Texture2D<float4> t1 = ResourceDescriptorHeap[im.srv]; return t1.SampleGrad(s, c.xy, dx, dy);
+}
+float4 am_grad_3d(AmImage im, AmSampler sm, float3 c, float3 dx, float3 dy) {
+  if (!AM_SAMPLED(im, sm)) return 0.0f;
+  SamplerState s = SamplerDescriptorHeap[sm.index];
+  Texture3D<float4> t = ResourceDescriptorHeap[im.srv]; return t.SampleGrad(s, c, dx, dy);
+}
+float4 am_grad_cube(AmImage im, AmSampler sm, float4 c, float3 dx, float3 dy) {
+  if (!AM_SAMPLED(im, sm)) return 0.0f;
+  SamplerState s = SamplerDescriptorHeap[sm.index];
+  if (AM_ARR(im)) { TextureCubeArray<float4> t = ResourceDescriptorHeap[im.srv]; return t.SampleGrad(s, c, dx, dy); }
+  TextureCube<float4> t1 = ResourceDescriptorHeap[im.srv]; return t1.SampleGrad(s, c.xyz, dx, dy);
+}
+// Depth compares at level 0, with the S#'s comparison.
+float am_cmp_lz_1d(AmImage im, AmSampler sm, float2 c, float ref) {
+  if (!AM_SAMPLED(im, sm)) return 0.0f;
+  SamplerComparisonState s = SamplerDescriptorHeap[sm.index];
+  if (AM_ARR(im)) { Texture1DArray<float4> t = ResourceDescriptorHeap[im.srv]; return t.SampleCmpLevelZero(s, c, ref); }
+  Texture1D<float4> t1 = ResourceDescriptorHeap[im.srv]; return t1.SampleCmpLevelZero(s, c.x, ref);
+}
+float am_cmp_lz_2d(AmImage im, AmSampler sm, float3 c, float ref) {
+  if (!AM_SAMPLED(im, sm)) return 0.0f;
+  SamplerComparisonState s = SamplerDescriptorHeap[sm.index];
+  if (AM_ARR(im)) { Texture2DArray<float4> t = ResourceDescriptorHeap[im.srv]; return t.SampleCmpLevelZero(s, c, ref); }
+  Texture2D<float4> t1 = ResourceDescriptorHeap[im.srv]; return t1.SampleCmpLevelZero(s, c.xy, ref);
+}
+float am_cmp_lz_cube(AmImage im, AmSampler sm, float4 c, float ref) {
+  if (!AM_SAMPLED(im, sm)) return 0.0f;
+  SamplerComparisonState s = SamplerDescriptorHeap[sm.index];
+  if (AM_ARR(im)) { TextureCubeArray<float4> t = ResourceDescriptorHeap[im.srv]; return t.SampleCmpLevelZero(s, c, ref); }
+  TextureCube<float4> t1 = ResourceDescriptorHeap[im.srv]; return t1.SampleCmpLevelZero(s, c.xyz, ref);
+}
+// Gathers one channel of the four texels a bilinear sample would use (D3D's order).
+#define AM_GATHER(t, s, p, o) (comp == 0u ? t.GatherRed(s, p, o) : comp == 1u ? t.GatherGreen(s, p, o) : \
+                               comp == 2u ? t.GatherBlue(s, p, o) : t.GatherAlpha(s, p, o))
+#define AM_GATHER_NO(t, s, p) (comp == 0u ? t.GatherRed(s, p) : comp == 1u ? t.GatherGreen(s, p) : \
+                               comp == 2u ? t.GatherBlue(s, p) : t.GatherAlpha(s, p))
+uint4 am_gather_2d(AmImage im, AmSampler sm, float3 c, uint comp, int2 o) {
+  if (!AM_SAMPLED(im, sm)) return AM_NONE;
+  SamplerState s = SamplerDescriptorHeap[sm.index];
+  if (AM_ARR(im)) AM_CLASS_RET(Texture2DArray, im.srv, AM_GATHER(t, s, c, o))
+  AM_CLASS_RET(Texture2D, im.srv, AM_GATHER(t, s, c.xy, o))
+}
+uint4 am_gather_cube(AmImage im, AmSampler sm, float4 c, uint comp) {
+  if (!AM_SAMPLED(im, sm)) return AM_NONE;
+  SamplerState s = SamplerDescriptorHeap[sm.index];
+  if (AM_ARR(im)) AM_CLASS_RET(TextureCubeArray, im.srv, AM_GATHER_NO(t, s, c))
+  AM_CLASS_RET(TextureCube, im.srv, AM_GATHER_NO(t, s, c.xyz))
+}
+// Size of a level: (width, height, depth or layers, levels).
+uint4 am_info_1d(AmImage im, uint mip) {
+  uint w = 0u, e = 1u, n = 0u;
+  if ((im.flags & AM_VALID) == 0u) return AM_NONE;
+  if (AM_ARR(im)) AM_CLASS_DO(Texture1DArray, im.srv, t.GetDimensions(mip, w, e, n))
+  else AM_CLASS_DO(Texture1D, im.srv, t.GetDimensions(mip, w, n))
+  return uint4(w, e, 1u, n);
+}
+uint4 am_info_2d(AmImage im, uint mip) {
+  uint w = 0u, h = 0u, e = 1u, n = 0u;
+  if ((im.flags & AM_VALID) == 0u) return AM_NONE;
+  if (AM_ARR(im)) AM_CLASS_DO(Texture2DArray, im.srv, t.GetDimensions(mip, w, h, e, n))
+  else AM_CLASS_DO(Texture2D, im.srv, t.GetDimensions(mip, w, h, n))
+  return uint4(w, h, e, n);
+}
+uint4 am_info_3d(AmImage im, uint mip) {
+  uint w = 0u, h = 0u, d = 0u, n = 0u;
+  if ((im.flags & AM_VALID) == 0u) return AM_NONE;
+  AM_CLASS_DO(Texture3D, im.srv, t.GetDimensions(mip, w, h, d, n))
+  return uint4(w, h, d, n);
+}
+uint4 am_info_cube(AmImage im, uint mip) {
+  uint w = 0u, h = 0u, e = 1u, n = 0u;
+  if ((im.flags & AM_VALID) == 0u) return AM_NONE;
+  if (AM_ARR(im)) AM_CLASS_DO(TextureCubeArray, im.srv, t.GetDimensions(mip, w, h, e, n))
+  else AM_CLASS_DO(TextureCube, im.srv, t.GetDimensions(mip, w, h, n))
+  return uint4(w, h, e, n);
+}
+// 32-bit image atomics (the numbering of am_atomic); the value before.
+#define AM_IMG_ATOMIC(r) \
+  if (op == 0u) InterlockedExchange(r, x, o); else if (op == 1u) InterlockedCompareExchange(r, cmp, x, o); \
+  else if (op == 2u) InterlockedAdd(r, x, o); else if (op == 3u) InterlockedAdd(r, 0u - x, o); \
+  else if (op == 5u) InterlockedMin(r, x, o); else if (op == 7u) InterlockedMax(r, x, o); \
+  else if (op == 8u) InterlockedAnd(r, x, o); else if (op == 9u) InterlockedOr(r, x, o); else InterlockedXor(r, x, o);
+#define AM_IMG_ATOMIC_S(r) { int so = 0; if (op == 4u) InterlockedMin(r, asint(x), so); else InterlockedMax(r, asint(x), so); o = asuint(so); }
+#define AM_ATOMIC_BODY(T, at) \
+  if (op == 4u || op == 6u) { T<int> t = ResourceDescriptorHeap[im.uav]; AM_IMG_ATOMIC_S(t[at]) } \
+  else { T<uint> t = ResourceDescriptorHeap[im.uav]; AM_IMG_ATOMIC(t[at]) }
+uint am_atomic_1d(AmImage im, int4 c, uint op, uint x, uint cmp) {
+  uint o = 0u;
+  if ((im.flags & (AM_VALID | 8u)) != (AM_VALID | 8u)) return o;
+  if (AM_ARR(im)) { AM_ATOMIC_BODY(RWTexture1DArray, uint2(c.xy)) } else { AM_ATOMIC_BODY(RWTexture1D, uint(c.x)) }
+  return o;
+}
+uint am_atomic_2d(AmImage im, int4 c, uint op, uint x, uint cmp) {
+  uint o = 0u;
+  if ((im.flags & (AM_VALID | 8u)) != (AM_VALID | 8u)) return o;
+  if (AM_ARR(im)) { AM_ATOMIC_BODY(RWTexture2DArray, uint3(c.xyz)) } else { AM_ATOMIC_BODY(RWTexture2D, uint2(c.xy)) }
+  return o;
+}
+uint am_atomic_3d(AmImage im, int4 c, uint op, uint x, uint cmp) {
+  uint o = 0u;
+  if ((im.flags & (AM_VALID | 8u)) != (AM_VALID | 8u)) return o;
+  AM_ATOMIC_BODY(RWTexture3D, uint3(c.xyz))
+  return o;
 }
 )";
 
@@ -1229,6 +1782,41 @@ std::string format_table() {
 
 }  // namespace
 
+// After an instruction: the descriptor lookups whose SGPRs it may have written are dropped.
+// Vector, memory and image instructions write none (VOPC and VOP2 carries: VCC, EXEC only);
+// SOPC and SOPP write SCC at most; the rest are taken to write any.
+void forget_written(Ctx& c, const rd::Instruction& insn) {
+  const std::string_view name = insn.info->name;
+  switch (insn.encoding) {
+    case rd::Encoding::Vop1:
+    case rd::Encoding::Vop2:
+    case rd::Encoding::Vopc:
+      if (name == "v_readfirstlane_b32") break;
+      c.drop_descriptors(106, 107);
+      c.drop_descriptors(126, 127);
+      return;
+    case rd::Encoding::Vop3:
+      if ((insn.info->flags & rd::kSdst) || name.substr(0, 5) == "v_cmp" || name.substr(0, 10) == "v_readlane" ||
+          name == "v_readfirstlane_b32") {
+        break;
+      }
+      return;
+    case rd::Encoding::Vop3p:
+    case rd::Encoding::Mimg:
+    case rd::Encoding::Mubuf:
+    case rd::Encoding::Mtbuf:
+    case rd::Encoding::Ds:
+    case rd::Encoding::Sopc:
+    case rd::Encoding::Sopp:
+      return;
+    default:
+      if (insn.encoding == rd::Encoding::Flat || name.substr(0, 7) == "global_") return;
+      break;
+  }
+  c.live_images.clear();
+  c.live_samplers.clear();
+}
+
 Translation translate(const TranslateInput& in, Binding binding) {
   Translation tr;
   tr.wave_size = in.wave32 ? 32 : 64;
@@ -1275,6 +1863,8 @@ Translation translate(const TranslateInput& in, Binding binding) {
     if (starts.count(at)) {
       if (open) body += "      pc = " + num(at) + "u; break;\n";
       body += "    case " + num(at) + "u:\n";
+      c.live_images.clear();
+      c.live_samplers.clear();
     }
     open = true;
     c.in = &insn;
@@ -1321,6 +1911,7 @@ Translation translate(const TranslateInput& in, Binding binding) {
       continue;
     }
     body += c.out;
+    forget_written(c, insn);
   }
   if (open) body += "      return;\n";
   if (!tr.unsupported.empty()) return tr;
@@ -1335,6 +1926,7 @@ Translation translate(const TranslateInput& in, Binding binding) {
   h += kTestBinding;
   h += format_table();
   h += kBufferHelpers;
+  if (c.uses_images) h += kImageHelpers;
   if (c.uses_lds || in.lds_bytes) h += "groupshared uint am_lds[" + num(std::max<uint32_t>(in.lds_bytes / 4, 1)) + "];\n";
   const uint32_t tx = std::max<uint32_t>(in.cs_threads[0], 1), ty = std::max<uint32_t>(in.cs_threads[1], 1),
                  tz = std::max<uint32_t>(in.cs_threads[2], 1);
@@ -1344,6 +1936,8 @@ Translation translate(const TranslateInput& in, Binding binding) {
   h += "  uint v[" + num(nv) + "];\n  [unroll] for (uint j = 0u; j < " + num(nv) + "u; ++j) v[j] = 0u;\n";
   h += "  uint am_null = 0u;\n  bool scc = false;\n  uint am_lane = WaveGetLaneIndex();\n";
   h += "  uint am_dpp = 0u;\n  bool am_dpp_on = true;\n";
+  for (const uint32_t r : c.image_vars) h += "  AmImage am_im_" + num(r) + " = (AmImage)0;\n";
+  for (const uint32_t r : c.sampler_vars) h += "  AmSampler am_sm_" + num(r) + " = (AmSampler)0;\n";
   for (uint32_t i = 0; i < user; ++i) h += "  s[" + num(i) + "] = am_user[" + num(i / 4) + "][" + num(i % 4) + "];\n";
   uint32_t next_s = user;
   for (int k = 0; k < 3; ++k) {
