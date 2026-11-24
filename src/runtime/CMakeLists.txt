@@ -28,19 +28,22 @@ add_library(am_runtime STATIC
   d3d12x/list.cpp
   d3d12x/object.cpp
   d3d12x/pipeline.cpp
+  d3d12x/present.cpp
   d3d12x/queue.cpp
   d3d12x/resource.cpp
   d3d12x/root_signature.cpp
   d3d12x/views.cpp
   d3d12x/xg.cpp
   hle/files.cpp
+  present/presenter.cpp
+  present/window.cpp
   input/game_input.cpp
   hle/identity.cpp
   hle/network.cpp
   hle/registry.cpp
   hle/system.cpp
   hle/xmem.cpp)
-target_link_libraries(am_runtime PUBLIC am_core am_pe am_loader am_x86 am_formats PRIVATE ws2_32 winhttp)
+target_link_libraries(am_runtime PUBLIC am_core am_pe am_loader am_x86 am_formats PRIVATE ws2_32 winhttp d3d12 dxgi)
 
 # The runtime proper, loaded by americas.exe.
 add_library(americas_rt SHARED rt_main.cpp)

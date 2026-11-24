@@ -132,6 +132,7 @@ const Kind& queue_kind() {
       {16, "Signal", reinterpret_cast<void*>(&queue_signal)},
       {17, "Wait", reinterpret_cast<void*>(&queue_wait)},
       {18, "GetTimestampFrequency", reinterpret_cast<void*>(&queue_get_timestamp_frequency)},
+      {32, "PresentX", reinterpret_cast<void*>(&queue_present_x)},
   });
   return k;
 }

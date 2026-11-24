@@ -871,8 +871,17 @@ Other objects:
   60 Hz). The output's slot 21 is the console's `GetDisplayModeList1`.
 * **Command queue:** two slots later than D3D12's from Signal on: Signal 16, Wait 17,
   GetTimestampFrequency 18 (our first guess, D3D12's 16, wrote the frequency over a fence's
-  vtable). Slot 32 is called once a frame as `(1, planes, parameters)`: `PresentX` (a probe
-  still); slot 35 twice a frame.
+  vtable). Slot 32 is `PresentX(plane count, planes, parameters)`, once a frame; slot 35 runs
+  twice a frame (a probe).
+* **PresentX and the window** (`d3d12x/present.cpp`, `runtime/present`). A plane's parameters
+  are 72 bytes: frame token +0, resource count +8, resources +0x10, source rectangles +0x18,
+  destination placement +0x20, color space +0x28. The first resource of the first plane is
+  shown in the game window: a window on a thread of its own, and a flip-model swap chain of
+  the host's D3D12 (any D3D12 GPU, the high-performance one first) the size of the image,
+  scaled by DXGI. Each frame the image is copied from the title's memory to an upload buffer
+  and from there into the swap chain. The title bar shows the frame rate; closing the window
+  ends the run (report written). The game presents its 3840x2160 RGBA8 back buffers at 30 fps;
+  they stay black until the GPU back end runs the title's commands.
 * **Fence:** D3D12's slots 8–10; slot 12 gives the address of the fence's 64-bit value, which
   the game's wait loop reads directly (the GPU's memory word on the console).
 * **Command allocator.**
@@ -918,10 +927,11 @@ each CLZERO cost millions of exceptions a minute. At load such loops now jump to
 the image that clears the line with eight stores (18 of the executable's 41 Zen 2-only sites
 are patched, 23 left to emulation, none of them hot so far).
 
-**Where the game is now: its frame loop, at 30 fps, with the null back end.** It records
-command lists, presents once a frame (queue slot 32) and waits for frame events between
-frames, for the whole 120 s of a run without a crash. Next: `PresentX` into a window, the
-per-frame probes (device 70 and 81, queue 35, the command list's slots), then the GPU back end.
+**Where the game is now: its frame loop, at 30 fps, in a window.** It records command lists,
+presents once a frame into the game window and waits for frame events between frames, for
+the whole of a run without a crash. The window is black: nothing runs the title's GPU
+commands yet. Next: the per-frame probes (device 70 and 81, queue 35, the command list's
+slots), then the GPU back end.
 
 ### Local tools (in `C:\Project Americas\tools`, never in the repository)
 
@@ -936,8 +946,8 @@ per-frame probes (device 70 and 81, queue 35, the command list's slots), then th
 
 
 Next, in parallel:
-* **M2.** The D3D12.X device (M2.4): `PresentX` into a window and the per-frame probes, then
-  the rest of the device and command list slots the game reaches, `PresentX`,
+* **M2.** The D3D12.X device (M2.4): the per-frame probes, then the rest of the device and
+  command list slots the game reaches, `PresentX`,
   frame pacing and a window; threads and topology, GameInput devices, and the remaining
   XGameRuntime areas (XPackage, XPersistentLocalStorage, XDisplay HDR) as the game reaches
   them.

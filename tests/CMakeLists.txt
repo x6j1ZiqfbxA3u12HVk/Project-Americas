@@ -11,6 +11,7 @@ add_executable(am_tests
   rdna2_tests.cpp
   runtime_tests.cpp
   policy_tests.cpp
+  present_tests.cpp
   shader_pack_tests.cpp
   storage_tests.cpp
   x86_tests.cpp)

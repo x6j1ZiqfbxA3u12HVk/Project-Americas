@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 // d3d12_xs.dll's entry points (plan, section 5.5).
 
@@ -42,6 +42,8 @@ HRESULT create_committed_resource(Object* device, const D3D12_HEAP_PROPERTIES* h
 HRESULT create_placed_resource_at(Object* device, uint64_t address, const D3D12_RESOURCE_DESC* desc,
                                   uint32_t initial_layout, const D3D12_CLEAR_VALUE* clear, const GUID* riid,
                                   void** out);
+// A resource's description and memory; false when `object` is not one of our resources.
+bool resource_memory(const void* object, D3D12_RESOURCE_DESC* desc, uint64_t* address);
 // The XMemAlloc attributes for a resource's memory of `size` bytes at `alignment`.
 uint64_t resource_attributes(uint64_t size, uint64_t alignment);
 
@@ -56,6 +58,9 @@ HRESULT create_console_pipeline(const char* how, const void* desc, const GUID* r
 // xg.cpp: xg_xs.dll, the console's texture layout library.
 HRESULT WINAPI xg_suggest_swizzle_mode(const D3D12_RESOURCE_DESC* desc, UINT flags, UINT* layout);
 HRESULT WINAPI xg_create_texture_computer(const D3D12_RESOURCE_DESC* desc, void** out);
+
+// present.cpp: the command queue's slot 32, PresentX(plane count, planes, parameters).
+HRESULT WINAPI queue_present_x(Object* self, UINT plane_count, const void* planes, const void* parameters);
 
 // frame.cpp: device slots 78-80, the frame interval and frame events.
 void add_frame_methods(std::vector<Method>& out);

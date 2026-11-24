@@ -152,6 +152,15 @@ HRESULT create_committed_resource(Object* device, const D3D12_HEAP_PROPERTIES* h
   return S_OK;
 }
 
+bool resource_memory(const void* object, D3D12_RESOURCE_DESC* desc, uint64_t* address) {
+  Object* o = object_of_kind(object, resource_kind());
+  if (!o) return false;
+  const auto* r = static_cast<const Resource*>(o);
+  if (desc) *desc = r->desc;
+  if (address) *address = r->address;
+  return r->address != 0;
+}
+
 HRESULT create_placed_resource_at(Object* device, uint64_t address, const D3D12_RESOURCE_DESC* desc,
                                   uint32_t initial_layout, const D3D12_CLEAR_VALUE* /*clear*/, const GUID* /*riid*/,
                                   void** out) {

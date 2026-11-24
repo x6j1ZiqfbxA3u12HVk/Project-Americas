@@ -39,8 +39,11 @@ game maps 6.1 GiB of them at once, which eager commit could not hold in a 16 GB 
 `d3d12x/layout.h`), resources placed at the title's own addresses (slot 133), pipelines
 (slots 55, 57, 67, 86), the console's queue slot order (Signal at 16), fence value addresses
 and frame pacing (slots 78-80), **the game runs its frame loop at its own 30 fps** for the
-whole run: it records command lists and presents once a frame (queue slot 32, still a probe),
-with the null back end. No crash in 120 s.
+whole run: it records command lists and presents once a frame, with the null back end. No
+crash in 120 s. **PresentX shows its back buffer in a window** (`runtime/present`: a window
+thread and a swap chain of the host's D3D12); the title bar reads about "30 fps, frame N (no
+GPU rendering yet)". The picture is black until the GPU back end exists. Closing the window
+ends the run.
 
 **M3:** the RDNA 2 decoder is done and decodes all 26,084 console GPU programs of the corpus,
 checked against LLVM (100 % on 2.8 M instructions). Next there: the translator.
@@ -196,7 +199,7 @@ Set-Location "C:\Users\Admin\Documents\GitHub\Project Americas"; . .\scripts\env
       back buffers (committed resources), the BVH builder's root signatures and compute
       pipelines, 6.1 GiB of physical pages mapped (M2.4);
   11. texture layouts (XG), placed resources, graphics pipelines, frame pacing;
-  12. **its frame loop, at 30 fps**: command lists, `PresentX` (a probe) once a frame.
+  12. **its frame loop, at 30 fps, in a window**: command lists, `PresentX` once a frame.
 * **Memory facts** (PLAN.md, section 11, "M2.1", has the full table):
   * XMem's reference pages on learn.microsoft.com are NDA-only: read the game's code instead;
   * allocation type bit 29 means 2 MiB pages, bits 29 + 22 mean 64 KiB pages;
@@ -241,12 +244,9 @@ method the game calls.
 
 DirectStorage and files are done (PLAN.md section 11, "M2.3").
 
-1. **Present into a window (the next step).** Queue slot 32 is called once a frame as
-   `(1, planes, parameters)`: the console's `PresentX`. Read the plane parameters (which
-   resource, its region) from the game's calls, then show that resource in a window. Until
-   the GPU back end exists that needs a CPU path: the back buffers are linear inside their
-   padded layout (`d3d12x/layout.h`), but nothing draws into them yet, so expect black.
-   * The other per-frame probes: device 70 (writes 32-byte descriptors into the big heap:
+1. **The per-frame probes (the next step).** The game presents into the window at 30 fps
+   (`d3d12x/present.cpp`, `runtime/present`); what it does each frame besides is still probes:
+   * device 70 (writes 32-byte descriptors into the big heap:
      probably the console's own view creation from a GPU address) and 81, queue 35 (twice a
      frame), and the command list's slots (9, 12, 20-25, 32-36, 44-52, 70-75, 126, 139-146).
      Each probe line names its call site now.
