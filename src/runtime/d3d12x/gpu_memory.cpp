@@ -281,9 +281,27 @@ void on_view(uint64_t address, uint64_t pages, int64_t pool_page) {
 
 // Opens the pool once it exists (the title makes it when it first asks for pages). The section
 // is asked for before the GPU memory's lock is taken: the title memory's lock comes first.
+// The pool window is opened from the pool's section (OpenExistingHeapFromFileMapping). On the
+// development PC's AMD driver that leaks the section's whole commit charge for good, even when
+// everything is released before exit: a gigabyte a run, until the system runs out of commit
+// and the device is lost (a reboot gives it back). So it is off unless AMERICAS_GPU_POOL_WINDOW
+// asks for it; shaders then read zeros from pool pages.
+bool pool_window_wanted() {
+  static const bool wanted = GetEnvironmentVariableA("AMERICAS_GPU_POOL_WINDOW", nullptr, 0) != 0;
+  return wanted;
+}
+
 void open_pool_if_ready() {
   GpuMemory& m = memory();
   if (m.pool_window) return;
+  if (!pool_window_wanted()) {
+    std::lock_guard g(m.lock);
+    if (!m.pool_window) {
+      m.pool_window = UINT32_MAX;
+      logf("gpu memory: no window over the physical page pool (AMERICAS_GPU_POOL_WINDOW=1 opens one; see gpu_memory.cpp)");
+    }
+    return;
+  }
   mem::TitleMemory& tm = mem::title_memory();
   HANDLE section = tm.gpu_pool_section();
   const uint64_t pages = tm.gpu_pool_pages();

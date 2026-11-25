@@ -14,10 +14,12 @@
 #include <utility>
 #include <vector>
 
+#include "core/text.h"
 #include "runtime/d3d12x/commands.h"
 #include "runtime/d3d12x/d3d12x.h"
 #include "runtime/d3d12x/object.h"
 #include "runtime/log.h"
+#include "runtime/memory/title_memory.h"
 
 namespace am::rt::d3d12x {
 namespace {
@@ -133,6 +135,57 @@ void WINAPI queue_execute_command_lists_x(Queue* self, UINT count, void* const* 
   submit_lists(count, lists);
 }
 
+// Slot 31: CopyPageMappingsBatchX(batch count, batches, pool, pool pages, flags). The pool is
+// memory the title mapped physical pages into; each batch maps some of them at its destination
+// address, range by range (64 KiB pages): kind 0 maps pool pages [start, start + count) in a
+// row, 1 maps pool page `start` `count` times, 2 unmaps, 3 leaves the pages as they are. The
+// game streams textures into pool pages and maps them into its tiled heaps this way.
+// Done at once (ahead of the GPU work queued before it).
+struct PageRange {
+  uint32_t kind, start, count;
+};
+struct PageBatch {
+  uint64_t destination;
+  uint32_t count;
+  const PageRange* ranges;
+};
+
+HRESULT WINAPI queue_copy_page_mappings(Queue* self, UINT count, const PageBatch* batches, uint64_t pool, UINT pool_pages,
+                                        UINT flags) {
+  trace(self, 31, "CopyPageMappingsBatchX", count, pool, pool_pages);
+  (void)flags;
+  if (count && !batches) return E_INVALIDARG;
+  constexpr uint64_t kPage = 64 << 10;
+  mem::TitleMemory& memory = mem::title_memory();
+  static std::atomic<int> refused{0};
+  for (UINT b = 0; b < count; ++b) {
+    uint64_t at = batches[b].destination;
+    for (uint32_t r = 0; batches[b].ranges && r < batches[b].count; ++r) {
+      const PageRange range = batches[b].ranges[r];
+      const uint64_t bytes = uint64_t{range.count} * kPage;
+      bool ok = true;
+      switch (range.kind) {
+        case 0:
+          ok = uint64_t{range.start} + range.count <= pool_pages &&
+               memory.copy_mappings(at, pool + uint64_t{range.start} * kPage, range.count, false);
+          break;
+        case 1:
+          ok = range.start < pool_pages && memory.copy_mappings(at, pool + uint64_t{range.start} * kPage, range.count, true);
+          break;
+        case 2: ok = memory.map_pages(reinterpret_cast<void*>(at), range.count, nullptr) != nullptr; break;
+        case 3: break;
+        default: ok = false; break;
+      }
+      if (!ok && refused.fetch_add(1, std::memory_order_relaxed) < 8) {
+        logf("d3d12x: page mapping (kind %u, pool page %u, %u pages) at 0x%s refused", range.kind, range.start, range.count,
+             hex(at).c_str());
+      }
+      at += bytes;
+    }
+  }
+  return S_OK;
+}
+
 const Kind& queue_kind() {
   static const Kind k("command queue", 64, {
       {10, "ExecuteCommandLists", reinterpret_cast<void*>(&queue_execute_command_lists)},
@@ -143,6 +196,7 @@ const Kind& queue_kind() {
       {18, "GetTimestampFrequency", reinterpret_cast<void*>(&queue_get_timestamp_frequency)},
       {32, "PresentX", reinterpret_cast<void*>(&queue_present_x)},
       {35, "ExecuteCommandListsX", reinterpret_cast<void*>(&queue_execute_command_lists_x)},
+      {31, "CopyPageMappingsBatchX", reinterpret_cast<void*>(&queue_copy_page_mappings)},
   });
   return k;
 }

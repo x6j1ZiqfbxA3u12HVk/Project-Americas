@@ -660,6 +660,33 @@ void* TitleMemory::map_pages(void* address, uint64_t count, const uint64_t* page
   return address;
 }
 
+bool TitleMemory::copy_mappings(uint64_t to, uint64_t from, uint64_t count, bool repeat) {
+  if (!count) return true;
+  if (to % kPage || from % kPage || count > (uint64_t{1} << 40) / kPage) return false;
+  std::lock_guard<std::mutex> lock(mutex_);
+  ++map_calls_;
+  std::vector<uint64_t> index(count);
+  for (uint64_t k = 0; k < count; ++k) {
+    const uint64_t source = repeat ? from : from + k * kPage;
+    uint64_t at = 0;
+    const View* v = view_at(source, &at);
+    if (!v) return false;
+    index[k] = v->first + (source - at) / kPage;
+  }
+  unmap(to, count * kPage);
+  for (uint64_t k = 0; k < count;) {
+    uint64_t run = 1;
+    while (k + run < count && index[k + run] == index[k] + run && (index[k] < lazy_pages_) == (index[k + run] < lazy_pages_)) ++run;
+    if (!map_view(to + k * kPage, run, index[k])) {
+      unmap(to, k * kPage);
+      ++refused_;
+      return false;
+    }
+    k += run;
+  }
+  return true;
+}
+
 bool TitleMemory::map_pages_scatter(void* const* addresses, uint64_t count, const uint64_t* pages) {
   if (!addresses && count) {
     SetLastError(ERROR_INVALID_PARAMETER);

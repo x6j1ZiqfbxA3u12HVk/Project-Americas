@@ -74,6 +74,10 @@ class TitleMemory {
   // XMemMapPhysicalPages: maps `count` pages at `address` in place of what is mapped there;
   // `pages` null unmaps. Returns `address`, or nullptr when a page is unknown or the host fails.
   void* map_pages(void* address, uint64_t count, const uint64_t* pages);
+  // The console GPU's page mapping copy (queue slot 31): maps at `to` the physical pages mapped
+  // at `from`, `count` pages in a row; `repeat`: the one page at `from`, `count` times. False
+  // when a source page has no physical page mapped.
+  bool copy_mappings(uint64_t to, uint64_t from, uint64_t count, bool repeat);
   // XMemMapPhysicalPagesScatter: one page per address; `pages` null or a page 0 unmaps.
   bool map_pages_scatter(void* const* addresses, uint64_t count, const uint64_t* pages);
   // Writes bytes [offset, offset + size) of the pages listed (64 KiB each, in order), mapped

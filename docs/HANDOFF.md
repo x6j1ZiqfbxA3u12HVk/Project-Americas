@@ -588,7 +588,24 @@ dispatch and 18 indexed draws a frame, through a new slot 67 pipeline.
 * **`AMERICAS_D3D12_DRED=1`** logs DRED breadcrumbs (draws marked with their pipeline) and
   page faults with allocation names when the device is lost.
 
-**Open: the device is lost about 40 s into loading** (frame ~1200-3000), reason 0x887a0001
+**Solved: the system commit leak, and with it the device loss during loading.**
+`OpenExistingHeapFromFileMapping` loses the section's whole commit charge for good on this PC's
+AMD driver. A standalone test showed it: 256 MiB lost per open, even with heap, view and section
+released before exit. `OpenExistingHeapFromAddress` on VirtualAlloc memory loses nothing. The
+1 GiB physical-pool window was opened that way, so every game run leaked 1 GiB until the system
+ran out of commit. Then buffer creation failed and the device was removed (0x887a0001), about
+40 s into loading. The pool window is now off unless `AMERICAS_GPU_POOL_WINDOW=1`, and a run
+leaks nothing (checked). Without it, shaders read zeros from pool pages. **A leak-free way for
+the GPU to reach pool pages is open.** Ideas: per-view copies into GPU buffers, or pool pages
+from VirtualAlloc memory with remapping done another way. **After runs with the window on,
+reboot** to get the commit back.
+
+**Queue slot 31, CopyPageMappingsBatchX(batch count, batches, pool, pool pages, flags)**
+(`queue.cpp`, `TitleMemory::copy_mappings`): each batch maps pool pages at its destination,
+range by range. The kinds are 0 (pages in a row), 1 (one page repeated), 2 (unmap) and 3
+(leave). It is done at once on the CPU.
+
+**Earlier notes on the device loss** (now explained by the leak above) (frame ~1200-3000), reason 0x887a0001
 (invalid call). There is no debug-layer error and no page fault. It comes right after the
 game's `XMemVirtualAlloc(3.4 GiB, type 0x20402000, flags 0x23)` at 0xfd8a00000.
 
