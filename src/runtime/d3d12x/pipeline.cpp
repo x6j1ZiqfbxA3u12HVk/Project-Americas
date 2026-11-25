@@ -52,6 +52,8 @@ struct ConsolePipeline {
   std::vector<std::string> names;  // the elements' semantic names
   bool layout_ok = false;
   uint32_t blend[8] = {};  // CB_BLEND0..7_CONTROL, from the first metadata block
+  bool has_blend_desc = false;  // a derived pipeline's blend state (slot 55), in place of `blend`
+  D3D12_BLEND_DESC blend_desc{};
   std::mutex lock;
   bool failed = false;  // its programs are not all precompiled: not tried again
   std::map<std::vector<uint32_t>, Microsoft::WRL::ComPtr<ID3D12PipelineState>> made;
@@ -671,6 +673,7 @@ ID3D12PipelineState* console_host_pipeline(ConsolePipeline& c, const DXGI_FORMAT
                        D3D12_CONSERVATIVE_RASTERIZATION_MODE_OFF};
   d.BlendState.IndependentBlendEnable = TRUE;
   for (int k = 0; k < 8; ++k) d.BlendState.RenderTarget[k] = blend_of(c.blend[k]);
+  if (c.has_blend_desc) d.BlendState = c.blend_desc;
   d.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
   d.NumRenderTargets = static_cast<UINT>(key.size() - 2);
   for (size_t k = 0; k + 2 < key.size(); ++k) d.RTVFormats[k] = static_cast<DXGI_FORMAT>(key[k]);
@@ -755,6 +758,48 @@ void capture_console_blocks(PipelineState* p, const void* desc) {
 }
 
 }  // namespace
+
+HRESULT create_derived_pipeline(const void* base, UINT count, const void* desc, const GUID* /*riid*/, void** out) {
+  if (!out) return E_POINTER;
+  *out = nullptr;
+  Object* o = base ? object_of_kind(base, pipeline_kind()) : nullptr;
+  if (!o) {
+    logf("d3d12x: slot 55: the base %p is not one of our pipelines", base);
+    return E_INVALIDARG;
+  }
+  const auto* b = static_cast<PipelineState*>(o);
+  PipelineState* p = new_pipeline("pipeline (slot 55)", b->root_signature);
+  p->shaders = b->shaders;
+  p->console_programs = b->console_programs;
+  p->console_name = b->console_name;
+  p->host = b->host;  // a stream pipeline's: its blend state stays the base's for now
+  if (b->console) {
+    p->console = std::make_unique<ConsolePipeline>();
+    p->console->markers = b->console->markers;
+    p->console->elements = b->console->elements;
+    p->console->names = b->console->names;
+    p->console->layout_ok = b->console->layout_ok;
+    std::copy(std::begin(b->console->blend), std::end(b->console->blend), p->console->blend);
+    p->console->has_blend_desc = b->console->has_blend_desc;
+    p->console->blend_desc = b->console->blend_desc;
+  }
+  // The replaced state: a type, then the state (2: blend). Only the first of `count` is read.
+  uint32_t type = 0;
+  read_guarded(desc, &type, sizeof type);
+  D3D12_BLEND_DESC blend{};
+  const bool is_blend = type == 2 && read_guarded(static_cast<const uint8_t*>(desc) + 4, &blend, sizeof blend);
+  if (is_blend && p->console) {
+    p->console->has_blend_desc = true;
+    p->console->blend_desc = blend;
+  }
+  static std::atomic<int> logged{0};
+  if (logged.fetch_add(1, std::memory_order_relaxed) < 8 || (!is_blend && logged.load() < 64)) {
+    logf("d3d12x: slot 55: %s derived (%u descriptions, the first of type %u)%s = %p", b->made_by, count, type,
+         p->console || p->host ? "" : " (the base has no host pipeline)", static_cast<void*>(p));
+  }
+  *out = p;
+  return S_OK;
+}
 
 HRESULT create_console_pipeline(const char* how, const void* desc, const GUID* /*riid*/, void** out) {
   if (!out) return E_POINTER;

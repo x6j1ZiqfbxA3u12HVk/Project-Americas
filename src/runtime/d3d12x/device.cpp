@@ -115,17 +115,17 @@ HRESULT WINAPI create_pipeline_state(Device*, const D3D12_PIPELINE_STATE_STREAM_
   return create_pipeline_from_stream(desc, riid, out);
 }
 
-// Slots 57 and 67: console pipeline creations, (description, riid, out, ...). Slot 55: (0,
-// count, descriptions, riid, out); the game passes a count of 1.
+// Slots 57 and 67: console pipeline creations, (description, riid, out, ...). Slot 55: a
+// pipeline derived from another with some state replaced: (base pipeline, count, descriptions,
+// riid, out); each description is a type and the state (2: a D3D12_BLEND_DESC).
 HRESULT WINAPI create_pipeline_57(Device*, const void* desc, const GUID* riid, void** out) {
   return create_console_pipeline("pipeline (slot 57)", desc, riid, out);
 }
 HRESULT WINAPI create_pipeline_67(Device*, const void* desc, const GUID* riid, void** out) {
   return create_console_pipeline("pipeline (slot 67)", desc, riid, out);
 }
-HRESULT WINAPI create_pipeline_55(Device*, uint64_t, UINT count, const void* desc, const GUID* riid, void** out) {
-  if (count != 1) logf("d3d12x: slot 55 with %u descriptions: only the first is answered", count);
-  return create_console_pipeline("pipeline (slot 55)", desc, riid, out);
+HRESULT WINAPI create_pipeline_55(Device*, uint64_t a1, UINT count, const void* desc, const GUID* riid, void** out) {
+  return create_derived_pipeline(reinterpret_cast<const void*>(a1), count, desc, riid, out);
 }
 
 // Slot 27: CreateCommittedResource(heap properties, heap flags, description, initial state,

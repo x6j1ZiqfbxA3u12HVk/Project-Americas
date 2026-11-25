@@ -72,6 +72,9 @@ HRESULT create_compute_pipeline(const D3D12_COMPUTE_PIPELINE_STATE_DESC* desc, u
                                 const GUID* riid, void** out);
 HRESULT create_pipeline_from_stream(const D3D12_PIPELINE_STATE_STREAM_DESC* desc, const GUID* riid, void** out);
 HRESULT create_console_pipeline(const char* how, const void* desc, const GUID* riid, void** out);
+// Slot 55: a pipeline derived from `base` (one of ours) with the state in `desc` replaced: a type
+// (2: a D3D12_BLEND_DESC follows it) and the state.
+HRESULT create_derived_pipeline(const void* base, UINT count, const void* desc, const GUID* riid, void** out);
 // "how it was made, then each shader's stage and hash" (logs).
 std::string describe_pipeline(const void* pipeline);
 

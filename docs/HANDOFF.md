@@ -500,18 +500,28 @@ the back buffer) now runs on the GPU: 2 of the frame's 3 draws, no debug-layer e
     (`AMERICAS_DEBUG_NOCLEAR` skips clears); `AMERICAS_DEBUG_VS=1` (and `_VS_ID`): a simple
     vertex shader. These split "nothing drawn" into its causes quickly.
   * `am-shaders precompile --raw <dir>` writes the HLSL of every program it would compile.
-* **Why the picture is still black:** the composite samples the intermediate target at
-  `0xddcfc0000`, which the stream draw (slot 86) and the slot 55 draw render. **Slot 55's
-  descriptions are not decoded** (no shader container is found in them), so its draw is
-  skipped and the intermediate stays black. That is the next step.
+* **Slot 55 derives a pipeline** from another of ours (its first argument) with some state
+  replaced: (base, count, descriptions, riid, out), each description a type and the state; the
+  game uses type 2, a D3D12_BLEND_DESC (blend variants of slot 57 pipelines).
+  `create_derived_pipeline` copies the base and applies the blend.
+* **All three boot-screen draws now run on the GPU** (no debug-layer error), and **the black
+  screen is what the game draws**, checked from its own data:
+  * the stream draw (slot 86) fills the intermediate target with a full-screen triangle whose
+    vertex colour (in its vertex data block) is opaque black;
+  * the slot 55 draw is a colour overlay (a fade) whose colour is (0, 0, 0, 0);
+  * the slot 57 draw copies the intermediate to the back buffer.
+  So the GPU path works end to end; the boot sequence itself does not move on.
 
 After that, from the plan:
 
-* **Next: slot 55's pipelines.** Decode its descriptions (device.cpp `create_pipeline_55`: (0,
-  count, descriptions, riid, out); the game passes 2 descriptions in some calls), find their
-  programs and state, and make host pipelines as for slot 57. Then capture frames
-  (`AMERICAS_CAPTURE`) to see the boot screen.
-* Slot 57: the rasterizer and depth registers in block 0.
+* **Next: why the boot sequence does not move on.** The frame loop runs, but the game keeps
+  drawing its black boot screen (fill, transparent fade, composite). Find what it waits for:
+  `hang.txt` (every thread's stack at the timeout, named with `scripts\symbolize.py`),
+  `report.json` (the stubs called and how often), and the services it asks for that we refuse
+  (XPackage, XPersistentLocalStorage, XDisplay HDR in `gdk/catalog.cpp`; audio). Capture frames
+  (`AMERICAS_CAPTURE`) once it moves.
+* Slot 57: the rasterizer and depth registers in block 0. Slot 55 with other description
+  types (logged when they appear) and counts above 1.
 * VB/IB views from console addresses.
 * Slot 55's shaders.
 * GFX10 detiling for textures.
