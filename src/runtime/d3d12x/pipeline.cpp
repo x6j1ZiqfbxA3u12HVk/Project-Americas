@@ -207,6 +207,34 @@ bool is_shader(uint32_t type) {
          type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS || type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS;
 }
 
+// A compute pipeline's host pipeline: its program's precompiled translation (by marker) with the
+// translated root signature, made on a worker thread. The driver can take very long over some
+// programs (the game's watchdog ended the run while one was made on its thread); dispatches
+// wait until it is there.
+void start_host_compute(PipelineState* p, const std::string& marker) {
+  p->compute = true;
+  std::vector<uint8_t> code;
+  present::HostGpu* gpu = present::host_gpu();
+  if (!gpu || marker.empty() || !load_precompiled(marker, code)) {
+    static std::atomic<int> told{0};
+    if (told.fetch_add(1, std::memory_order_relaxed) < 16) logf("gpu: compute program %s is not precompiled", marker.c_str());
+    return;
+  }
+  add_ref(p);  // kept alive until the worker is done
+  std::thread([p, gpu, marker, code = std::move(code)] {
+    D3D12_COMPUTE_PIPELINE_STATE_DESC host{};
+    host.pRootSignature = translated_root_signature();
+    host.CS = {code.data(), code.size()};
+    const HRESULT hr = host.pRootSignature ? gpu->device->CreateComputePipelineState(&host, IID_PPV_ARGS(&p->host)) : E_FAIL;
+    if (SUCCEEDED(hr)) p->host_compute.store(p->host.Get(), std::memory_order_release);
+    static std::atomic<int> told{0};
+    if (FAILED(hr) && told.fetch_add(1, std::memory_order_relaxed) < 8) {
+      logf("gpu: host compute pipeline for %s refused (0x%08lx)", marker.c_str(), static_cast<unsigned long>(hr));
+    }
+    release(p);
+  }).detach();
+}
+
 void log_first_bytes(const char* how, const void* desc, const PipelineState* p) {
   static std::atomic<int> logged{0};
   if (logged.fetch_add(1, std::memory_order_relaxed) >= 24) return;
@@ -262,30 +290,7 @@ HRESULT create_compute_pipeline(const D3D12_COMPUTE_PIPELINE_STATE_DESC* desc, u
   p->extra[0] = extra0;
   p->extra[1] = extra1;
   p->compute = true;
-  // Its host pipeline: the program's precompiled translation with the translated root signature,
-  // made on a worker thread. The driver can take very long over some programs (the game's
-  // watchdog ended the run while one was made on its thread); dispatches wait until it is there.
-  std::vector<uint8_t> code;
-  const std::string marker = program_marker(p->shaders[0].bytecode, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS);
-  present::HostGpu* gpu = present::host_gpu();
-  if (gpu && !marker.empty() && load_precompiled(marker, code)) {
-    add_ref(p);  // kept alive until the worker is done
-    std::thread([p, gpu, marker, code = std::move(code)] {
-      D3D12_COMPUTE_PIPELINE_STATE_DESC host{};
-      host.pRootSignature = translated_root_signature();
-      host.CS = {code.data(), code.size()};
-      const HRESULT hr = host.pRootSignature ? gpu->device->CreateComputePipelineState(&host, IID_PPV_ARGS(&p->host)) : E_FAIL;
-      if (SUCCEEDED(hr)) p->host_compute.store(p->host.Get(), std::memory_order_release);
-      static std::atomic<int> told{0};
-      if (FAILED(hr) && told.fetch_add(1, std::memory_order_relaxed) < 8) {
-        logf("gpu: host compute pipeline for %s refused (0x%08lx)", marker.c_str(), static_cast<unsigned long>(hr));
-      }
-      release(p);
-    }).detach();
-  } else {
-    static std::atomic<int> told{0};
-    if (told.fetch_add(1, std::memory_order_relaxed) < 16) logf("gpu: compute program %s is not precompiled", marker.c_str());
-  }
+  start_host_compute(p, program_marker(p->shaders[0].bytecode, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS));
   static std::atomic<int> logged{0};
   if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
     const Shader& cs = p->shaders[0];
@@ -740,7 +745,7 @@ ID3D12PipelineState* console_host_pipeline(ConsolePipeline& c, const DXGI_FORMAT
 // title memory and GPU programs already in GPU memory, each program after its metadata. The
 // pairs end at the first one that is neither. Saved as one file: for each block its address
 // (8 bytes), size and kind (4 each; kind 1 for a program), then its bytes.
-void capture_console_blocks(PipelineState* p, const void* desc) {
+void capture_console_blocks(PipelineState* p, const void* desc, bool compute) {
   uint64_t words[33] = {};
   if (!desc || !read_guarded(desc, words, sizeof words)) return;
   if (is_object(reinterpret_cast<void*>(words[0])) && !p->root_signature) {
@@ -764,7 +769,9 @@ void capture_console_blocks(PipelineState* p, const void* desc) {
     bundle.insert(bundle.end(), reinterpret_cast<const uint8_t*>(&size32), reinterpret_cast<const uint8_t*>(&size32) + 4);
     bundle.insert(bundle.end(), reinterpret_cast<const uint8_t*>(&kind), reinterpret_cast<const uint8_t*>(&kind) + 4);
     bundle.insert(bundle.end(), block.begin(), block.end());
-    if (!kind && metadata == 0 && block.size() >= 0xF0) {
+    if (compute) {
+      // Compute pipelines: no blend or input layout in their metadata.
+    } else if (!kind && metadata == 0 && block.size() >= 0xF0) {
       std::memcpy(console->blend, block.data() + 0xD0, sizeof console->blend);
     } else if (!kind && metadata == 1) {
       read_input_layout(block, *console);
@@ -794,6 +801,11 @@ void capture_console_blocks(PipelineState* p, const void* desc) {
   save_once(name, bundle.data(), bundle.size());
   p->console_programs = programs;
   p->console_name = std::string(name, 16) + (markers.empty() ? "" : ":" + markers);
+  if (compute) {
+    if (console->markers.size() == 1) start_host_compute(p, console->markers[0]);
+    else logf("d3d12x: a console compute pipeline with %zu programs (one expected)", console->markers.size());
+    return;  // no graphics pipeline to make
+  }
   p->console = std::move(console);
 }
 
@@ -844,7 +856,10 @@ HRESULT create_derived_pipeline(const void* base, UINT count, const void* desc, 
 HRESULT create_console_pipeline(const char* how, const void* desc, const GUID* /*riid*/, void** out) {
   if (!out) return E_POINTER;
   PipelineState* p = new_pipeline(how, nullptr);
-  if (std::strstr(how, "57")) capture_console_blocks(p, desc);
+  // Slots 57 (graphics) and 67 (compute) describe their pipelines the same way: the root
+  // signature object, then (address, size) blocks of metadata and GPU programs.
+  if (std::strstr(how, "57")) capture_console_blocks(p, desc, false);
+  else if (std::strstr(how, "67")) capture_console_blocks(p, desc, true);
   find_shaders(p, desc);
   log_first_bytes(how, desc, p);
   *out = p;
