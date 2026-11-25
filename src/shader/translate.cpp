@@ -978,6 +978,19 @@ const std::unordered_map<std::string, Handler>& table() {
       c.line("}");
       return true;
     };
+    // VOP3B: D (64 bits) = S0 * S1 + S2 (64 bits); SDST gets each lane's carry out of the add.
+    t["v_mad_u64_u32"] = [](Ctx& c) {
+      if (!plain_form(c) || !is_vop3(*c.in)) return c.fail("v_mad_u64_u32 form");
+      const uint32_t sd = c.f(Field::SDST), d = vop_dst(c);
+      c.touch_v(d + 1);
+      c.line("{ uint64_t a = " + c.src64(c.f(Field::SRC2)) + "; uint64_t r = uint64_t(" + vsrc(c, 0) + ") * uint64_t(" + vsrc(c, 1) +
+             ") + a; bool cy = r < a;");
+      c.line("  uint4 m = WaveActiveBallot(cy && AM_ACT != 0u);");
+      c.line("  if (AM_ACT) { v[" + num(d) + "] = uint(r); v[" + num(d + 1) + "] = uint(r >> 32); }");
+      if (sd != 125) c.line("  s[" + num(sd) + "] = m.x;" + (c.wave64 ? " s[" + num(sd + 1) + "] = m.y;" : std::string()));
+      c.line("}");
+      return true;
+    };
     t["v_add_co_ci_u32"] = [](Ctx& c) {
       if (!plain_form(c)) return false;
       const bool vop3 = is_vop3(*c.in);
