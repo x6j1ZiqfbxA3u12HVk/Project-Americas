@@ -402,7 +402,7 @@ bool image(Ctx& c, const ImgOp& op) {
       return;
     }
     c.touch_v(vd + static_cast<uint32_t>((from.size() + 1) / 2) - 1);
-    const std::string h = float_bits ? "f32tof16(asfloat(X))" : "((im.flags & 3u) == 0u ? f32tof16(asfloat(X)) : (X & 0xFFFFu))";
+    const std::string h = float_bits ? "am_f16(asfloat(X))" : "((im.flags & 3u) == 0u ? am_f16(asfloat(X)) : (X & 0xFFFFu))";
     std::string w = "  if (AM_ACT) {";
     for (size_t n = 0; n < from.size(); n += 2) {
       std::string e = fill(h, "r[" + num(from[n]) + "]");
@@ -535,7 +535,7 @@ bool buffer_d16(Ctx& c, int n, bool store, bool tbuffer, bool hi) {
     c.line("  am_fmt_store(p, lim, info, " + num(n) + "u, " + val + "));");
   } else {
     c.line("  uint4 r = am_fmt_load(p, lim, info, rs.w);");
-    c.line("  uint4 h = ints ? (r & 0xFFFFu) : f32tof16(asfloat(r));");
+    c.line("  uint4 h = ints ? (r & 0xFFFFu) : uint4(am_f16(asfloat(r.x)), am_f16(asfloat(r.y)), am_f16(asfloat(r.z)), am_f16(asfloat(r.w)));");
     if (n == 1) {
       const std::string v = "v[" + num(vd) + "]";
       c.line("  " + v + " = " + (hi ? "(" + v + " & 0xFFFFu) | (h.x << 16);" : "(" + v + " & 0xFFFF0000u) | h.x;"));
@@ -549,6 +549,101 @@ bool buffer_d16(Ctx& c, int n, bool store, bool tbuffer, bool hi) {
   }
   c.line("}");
   return true;
+}
+
+// ---- 16-bit ALU ----
+using Handler = std::function<bool(Ctx&)>;
+//
+// A 16-bit source is the low half of its register, or with VOP3's op_sel bit the high one. The
+// result goes to the low half (op_sel bit 3: the high one) and the other half keeps its bits:
+// this GPU (GFX9 and later) preserves them. Inline float constants are the f16 ones.
+bool form16(Ctx& c) {
+  if (c.in->form == rd::Form::Dpp16 || c.in->form == rd::Form::Dpp8) return dpp_prelude(c);
+  return true;
+}
+std::string src16(Ctx& c, int k) {
+  const std::string x = vsrc(c, k, true);
+  const bool hi = is_vop3(*c.in) && ((c.f(Field::OP_SEL) >> k) & 1);
+  return "((" + x + (hi ? " >> 16u" : "") + ") & 0xFFFFu)";
+}
+std::string fsrc16(Ctx& c, int k) {
+  std::string x = "f16tof32(" + src16(c, k) + ")";
+  bool abs = false, neg = false;
+  if (is_vop3(*c.in)) {
+    abs = (c.f(Field::ABS) >> k) & 1;
+    neg = (c.f(Field::NEG) >> k) & 1;
+  } else if ((c.in->form == rd::Form::Sdwa || c.in->form == rd::Form::Dpp16) && k < 2) {
+    abs = c.f(k == 0 ? Field::SRC0_ABS : Field::SRC1_ABS) != 0;
+    neg = c.f(k == 0 ? Field::SRC0_NEG : Field::SRC1_NEG) != 0;
+  }
+  if (abs) x = "abs(" + x + ")";
+  if (neg) x = "(-" + x + ")";
+  return x;
+}
+void write16(Ctx& c, const std::string& value16) {
+  const uint32_t d = vop_dst(c);
+  const std::string v = c.vdst(d), x = "((" + value16 + ") & 0xFFFFu)";
+  if (c.in->form == rd::Form::Sdwa) return c.vwrite(d, x);  // the destination select places it
+  const bool hi = is_vop3(*c.in) && ((c.f(Field::OP_SEL) >> 3) & 1);
+  c.vwrite(d, hi ? "((" + v + " & 0xFFFFu) | (" + x + " << 16))" : "((" + v + " & 0xFFFF0000u) | " + x + ")");
+}
+std::string f16_result(Ctx& c, const std::string& f) {
+  return "am_f16(" + (is_vop3(*c.in) && c.f(Field::CLAMP) ? "saturate(" + f + ")" : f) + ")";
+}
+// Integer forms: A, B, C are 16-bit sources.
+void int16(std::unordered_map<std::string, Handler>& t, const char* name, const char* body) {
+  t[name] = [body](Ctx& c) {
+    if (!form16(c)) return false;
+    const std::string e = body;
+    const std::string a = src16(c, 0), b = e.find('B') != std::string::npos ? src16(c, 1) : "";
+    const std::string d = e.find('C') != std::string::npos ? src16(c, 2) : "";
+    write16(c, fill(e, a, b, d));
+    return true;
+  };
+}
+// Float forms: A, B, C are f16 sources as float.
+void float16(std::unordered_map<std::string, Handler>& t, const char* name, const char* body) {
+  t[name] = [body](Ctx& c) {
+    if (!form16(c)) return false;
+    const std::string e = body;
+    const std::string a = fsrc16(c, 0), b = e.find('B') != std::string::npos ? fsrc16(c, 1) : "";
+    const std::string d = e.find('C') != std::string::npos ? fsrc16(c, 2) : "";
+    write16(c, f16_result(c, fill(e, a, b, d)));
+    return true;
+  };
+}
+// Packed (VOP3P): both halves at once; per source, op_sel picks the half the low result
+// reads and op_sel_hi the one the high result reads; NEG and NEG_HI negate them.
+void packed16(std::unordered_map<std::string, Handler>& t, const char* name, const char* body, bool fl, int sources) {
+  t[name] = [body, fl, sources](Ctx& c) {
+    const uint32_t sel = c.f(Field::OP_SEL), selhi = c.f(Field::OP_SEL_HI) | c.f(Field::OP_SEL_HI_2) << 2;
+    const uint32_t neg = c.f(Field::NEG), neghi = c.f(Field::NEG_HI);
+    const rd::Field fields[] = {Field::SRC0, Field::SRC1, Field::SRC2};
+    std::string lo[3], hi[3];
+    for (int k = 0; k < sources; ++k) {
+      const uint32_t code = c.f(fields[k]);
+      if (code >= 128 && code < 256 && code != 253 && code != 251 && code != 252) {
+        return c.fail(std::string(c.in->info->name) + " (constant operand)");
+      }
+      const std::string x = c.src(code);
+      for (int h = 0; h < 2; ++h) {
+        const bool upper = ((h ? selhi : sel) >> k) & 1;
+        std::string v = "((" + x + (upper ? " >> 16u" : "") + ") & 0xFFFFu)";
+        if (fl) {
+          v = "f16tof32(" + v + ")";
+          if (((h ? neghi : neg) >> k) & 1) v = "(-" + v + ")";
+        }
+        (h ? hi[k] : lo[k]) = v;
+      }
+    }
+    const auto one = [&](const std::string* v) {
+      std::string e = fill(body, v[0], v[1], v[2]);
+      if (fl) e = "am_f16(" + (c.f(Field::CLAMP) ? "saturate(" + e + ")" : e) + ")";
+      return "((" + e + ") & 0xFFFFu)";
+    };
+    c.vwrite(vop_dst(c), "(" + one(lo) + " | (" + one(hi) + " << 16))");
+    return true;
+  };
 }
 
 // ---- the instruction table ----
@@ -678,6 +773,45 @@ const std::unordered_map<std::string, Handler>& table() {
       };
     }
 
+    // -- 16-bit and packed --
+    int16(t, "v_lshrrev_b16", "(B >> (A & 15u))");
+    int16(t, "v_lshlrev_b16", "(B << (A & 15u))");
+    int16(t, "v_ashrrev_i16", "asuint((asint(B << 16) >> 16) >> (A & 15u))");
+    int16(t, "v_add_nc_u16", "(A + B)");
+    int16(t, "v_sub_nc_u16", "(A - B)");
+    int16(t, "v_mul_lo_u16", "(A * B)");
+    int16(t, "v_max_u16", "max(A, B)");
+    int16(t, "v_min_u16", "min(A, B)");
+    int16(t, "v_max_i16", "asuint(max(asint(A << 16) >> 16, asint(B << 16) >> 16))");
+    int16(t, "v_min_i16", "asuint(min(asint(A << 16) >> 16, asint(B << 16) >> 16))");
+    float16(t, "v_add_f16", "(A + B)");
+    float16(t, "v_sub_f16", "(A - B)");
+    float16(t, "v_subrev_f16", "(B - A)");
+    float16(t, "v_mul_f16", "(A * B)");
+    float16(t, "v_max_f16", "max(A, B)");
+    float16(t, "v_min_f16", "min(A, B)");
+    float16(t, "v_fma_f16", "mad(A, B, C)");
+    float16(t, "v_rcp_f16", "rcp(A)");
+    float16(t, "v_sqrt_f16", "sqrt(A)");
+    float16(t, "v_rsq_f16", "rsqrt(A)");
+    float16(t, "v_floor_f16", "floor(A)");
+    float16(t, "v_fract_f16", "frac(A)");
+    t["v_fmac_f16"] = [](Ctx& c) {
+      if (!form16(c)) return false;
+      write16(c, f16_result(c, "mad(" + fsrc16(c, 0) + ", " + fsrc16(c, 1) + ", f16tof32(" + c.vdst(vop_dst(c)) + " & 0xFFFFu))"));
+      return true;
+    };
+    packed16(t, "v_pk_add_f16", "(A + B)", true, 2);
+    packed16(t, "v_pk_mul_f16", "(A * B)", true, 2);
+    packed16(t, "v_pk_fma_f16", "mad(A, B, C)", true, 3);
+    packed16(t, "v_pk_max_f16", "max(A, B)", true, 2);
+    packed16(t, "v_pk_min_f16", "min(A, B)", true, 2);
+    packed16(t, "v_pk_add_u16", "(A + B)", false, 2);
+    packed16(t, "v_pk_sub_u16", "(A - B)", false, 2);
+    packed16(t, "v_pk_mul_lo_u16", "(A * B)", false, 2);
+    packed16(t, "v_pk_lshlrev_b16", "(B << (A & 15u))", false, 2);
+    packed16(t, "v_pk_lshrrev_b16", "(B >> (A & 15u))", false, 2);
+
     // -- conversions --
     float_unary(t, "v_cvt_f32_u32", "float(asuint(X))");
     float_unary(t, "v_cvt_f32_i32", "float(asint(X))");
@@ -695,8 +829,12 @@ const std::unordered_map<std::string, Handler>& table() {
       c.vwrite(vop_dst(c), fresult(c, "f16tof32(" + vsrc(c, 0, true) + ")"));
       return true;
     };
-    int_op(t, "v_cvt_f16_f32", "f32tof16(asfloat(A))");
-    // Round toward zero; f32tof16 rounds to nearest: the low bit may differ (noted in the plan).
+    t["v_cvt_f16_f32"] = [](Ctx& c) {
+      if (!form16(c)) return false;
+      write16(c, f16_result(c, fsrc(c, 0)));
+      return true;
+    };
+    // Round toward zero: f32tof16 does that (on the GPUs tested); am_f16 rounds to nearest even.
     int_op(t, "v_cvt_pkrtz_f16_f32", "(f32tof16(asfloat(A)) | (f32tof16(asfloat(B)) << 16))");
     int_op(t, "v_pack_b32_f16", "((A & 0xFFFFu) | (B << 16))");
     int_op(t, "v_cvt_pk_u8_f32", "am_cvt_pk_u8(asfloat(A), B, C)");
@@ -719,6 +857,7 @@ const std::unordered_map<std::string, Handler>& table() {
     int_op(t, "v_min_i32", "asuint(min(asint(A), asint(B)))");
     int_op(t, "v_mul_lo_u32", "(A * B)");
     int_op(t, "v_mul_hi_u32", "uint((uint64_t(A) * uint64_t(B)) >> 32)");
+    int_op(t, "v_mul_hi_i32", "uint(uint64_t(int64_t(asint(A)) * int64_t(asint(B))) >> 32)");
     int_op(t, "v_mul_u32_u24", "((A & 0xFFFFFFu) * (B & 0xFFFFFFu))");
     int_op(t, "v_mad_u32_u24", "((A & 0xFFFFFFu) * (B & 0xFFFFFFu) + C)");
     int_op(t, "v_mul_i32_i24", "asuint((asint(A << 8) >> 8) * (asint(B << 8) >> 8))");
@@ -773,8 +912,8 @@ const std::unordered_map<std::string, Handler>& table() {
         if (c.f(Field::CLAMP)) r = "saturate(" + r + ")";
         const uint32_t d = vop_dst(c);
         if (to == 0) c.vwrite(d, "asuint(" + r + ")");
-        else if (to == 1) c.vwrite(d, "((" + c.vdst(d) + " & 0xFFFF0000u) | f32tof16(" + r + "))");
-        else c.vwrite(d, "((" + c.vdst(d) + " & 0xFFFFu) | (f32tof16(" + r + ") << 16))");
+        else if (to == 1) c.vwrite(d, "((" + c.vdst(d) + " & 0xFFFF0000u) | am_f16(" + r + "))");
+        else c.vwrite(d, "((" + c.vdst(d) + " & 0xFFFFu) | (am_f16(" + r + ") << 16))");
         return true;
       };
     }
@@ -1388,6 +1527,19 @@ const std::unordered_map<std::string, Handler>& table() {
 // The helpers every program gets, and the binding model's memory functions.
 const char* kHelpers = R"(
 uint64_t am_u64(uint lo, uint hi) { return (uint64_t(hi) << 32) | lo; }
+// f32 to f16, rounded to nearest even as the console does: f32tof16 truncates on some GPUs
+// (seen on RDNA 4), so the next half up is taken when it is nearer (ties to the even one).
+uint am_f16(float f) {
+  uint h = f32tof16(f);
+  if ((h & 0x7C00u) == 0x7C00u || f != f) return h;
+  uint m = h & 0x7FFFu;
+  float a = abs(f), d0 = abs(f16tof32(m) - a);
+  if (m < 0x7BFFu) {
+    float d1 = abs(f16tof32(m + 1u) - a);
+    if (d1 < d0 || (d1 == d0 && ((m + 1u) & 1u) == 0u)) m += 1u;
+  }
+  return (h & 0x8000u) | m;
+}
 uint am_bfe_u32(uint a, uint off, uint width) {
   off &= 31u; width &= 31u;
   return width == 0u ? 0u : (a >> off) & ((1u << width) - 1u);
@@ -1841,8 +1993,8 @@ void am_fmt_put(inout uint4 data, inout uint4 mask, uint info, uint k, uint o, u
   else if (t == 4u) x = min(value, m);
   else if (t == 5u) x = uint(clamp(int(value), -int(h) - 1, int(h)));
   else if (w == 32u) x = value;
-  else if (w == 16u) x = f32tof16(f);
-  else x = f32tof16(max(f, 0.0f)) >> (15u - w);
+  else if (w == 16u) x = am_f16(f);
+  else x = am_f16(max(f, 0.0f)) >> (15u - w);
   data[o >> 5] |= (x & m) << (o & 31u);
   mask[o >> 5] |= m << (o & 31u);
 }

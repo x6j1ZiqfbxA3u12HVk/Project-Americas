@@ -838,3 +838,33 @@ TEST_CASE(translate_d16_buffers_and_24_bit_multiplies) {
   }
   CHECK(ok);
 }
+
+// 16-bit results go to one half of the register and keep the other (GFX9 and later).
+TEST_CASE(translate_16_bit_and_packed_alu) {
+  const Result r = run({
+      0x7E0202FF, 0xABCD8000,  // v_mov_b32 v1, 0xabcd8000
+      0x7E040284,              // v_mov_b32 v2, 4
+      0xD7070001, 0x02020302,  // v_lshrrev_b16 v1, v2, v1
+      0x7E0602FF, 0x40003C00,  // v_mov_b32 v3, 0x40003c00          (halves 2.0 : 1.0)
+      0x7E0802FF, 0x12340000,  // v_mov_b32 v4, 0x12340000
+      0xD74B4804, 0x040E0703,  // v_fma_f16 v4, v3, v3, v3 op_sel:[1,0,0,1]   (hi * lo + lo, to the high half)
+      0x7E0A02FF, 0x44004200,  // v_mov_b32 v5, 0x44004200          (4.0 : 3.0)
+      0xCC104006, 0x1A020B03,  // v_pk_mul_f16 v6, v3, v5
+      0xCC0A4807, 0x12020705,  // v_pk_add_u16 v7, v5, v3 op_sel:[1,0] op_sel_hi:[0,1]
+      0x7E1002FF, 0x55550000,  // v_mov_b32 v8, 0x55550000
+      0x7E101503,              // v_cvt_f16_f32 v8, v3        (2.00366 rounds to the nearest half: 0x4002)
+      0x64120703,              // v_add_f16 v9, v3, v3
+      0xBF810000,              // s_endpgm
+  });
+  if (!r.ran) return;
+  bool ok = true;
+  for (int l = 0; l < 64 && ok; ++l) {
+    ok = r.v(l, 1) == 0xABCD0800u && r.v(l, 4) == 0x42000000u && r.v(l, 6) == 0x48004200u && r.v(l, 7) == 0x82008000u &&
+         r.v(l, 8) == 0x55554002u && r.v(l, 9) == 0x00004000u;
+    if (!ok) {
+      std::printf("    lane %d: v1 %08x v4 %08x v6 %08x v7 %08x v8 %08x v9 %08x\n", l, r.v(l, 1), r.v(l, 4), r.v(l, 6), r.v(l, 7),
+                  r.v(l, 8), r.v(l, 9));
+    }
+  }
+  CHECK(ok);
+}

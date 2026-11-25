@@ -49,7 +49,7 @@ ends the run.
 checked against LLVM (100 % on 2.8 M instructions). **Translator version 1 runs** (PLAN.md,
 section 11, "M3.2"): compute programs become HLSL, one thread per console lane, and are checked
 on the host GPU against the ISA. With images (a descriptor table the host keeps, SM 6.6 heaps)
-**2,387 of 2,682 compute programs (89 %) translate**. Control flow is rebuilt as nested ifs
+**2,486 of 2,682 compute programs (92.7 %) translate**. Control flow is rebuilt as nested ifs
 and loops (2,058 of them; the irreducible rest keep a dispatcher), so DXC compiles the largest
 in 38 s and the median in 5 s.
 
@@ -300,8 +300,8 @@ RDNA 2 decoder decodes all 26,084 programs by control flow, checked against LLVM
 
      When it is done: put the total time, the failures and the slowest programs in PLAN.md 11
      (M3.2, "Compile time"), which still says the run is under way. The run covers the 2,070
-     programs translated then; rerunning both commands adds the 317 the LDS and D16 work
-     brought in (`--raw` leaves unchanged files alone, so the rest are skipped).
+     programs translated then; rerunning both commands adds the 416 the LDS, D16 and
+     16-bit work brought in (and recompiles those whose f16 code changed) (`--raw` leaves unchanged files alone, so the rest are skipped).
    * Structured control flow is done (`Structurer` in `translate.cpp`; the dispatcher stays
      for irreducible CFGs).
    * Next: the other stages (PS/VS/mesh I/O from the FSSM records), the indirect jumps, and

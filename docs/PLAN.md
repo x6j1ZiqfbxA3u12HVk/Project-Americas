@@ -898,11 +898,14 @@ builder's `XMemVirtualQuery` calls, and the arguments logged at run time.
     HLSL; the tests' programs too).
   * with LDS atomics, the `st64` pairs and `ds_swizzle_b32`: **2,368 (88 %)**.
   * with D16 typed buffers and the 24-bit multiplies: **2,387 (89 %)**.
-  * What still blocks compute: the 16-bit and packed ALU ops (`v_lshrrev_b16` 63,
-    `v_pk_mul_f16` 39, `v_pk_add_f16`, `v_pk_fma_f16`, `v_add_f16`), signed LDS min/max, ray
-    tracing (`image_bvh*`, 56). Open question for the 16-bit ops: on this GPU, does a 16-bit
-    result keep or clear the register's upper half? Settle it (AMD's ISA text, LLVM's
-    lowering) before translating them.
+  * with the 16-bit and packed ALU ops: **2,486 (92.7 %)**. A 16-bit result goes to one half
+    of its register (VOP3 `op_sel[3]`: the high one) and the other half keeps its bits, as on
+    GFX9 and later; packed constant operands are refused until checked.
+  * **f16 rounding:** HLSL's `f32tof16` truncates on the RX 9060 XT, the console rounds to
+    nearest even. `am_f16` corrects it; every f16 result goes through it (`v_cvt_pkrtz` keeps
+    truncation, which is what it asks for).
+  * What still blocks compute: ray tracing (`image_bvh*`, 56), `v_pack_b32_f16` with op_sel,
+    `image_gather4_l(_o)`, `v_movrels_b32`, `ds_read_u16`, `v_bfm_b32`, indirect jumps (13).
 * **Structured control flow** (translator 2). The blocks' CFG becomes nested loops, blocks
   and `if`s, after Ramsey's "Beyond Relooper":
   * reverse postorder, dominators (Cooper, Harvey and Kennedy), back edges, merge points;
