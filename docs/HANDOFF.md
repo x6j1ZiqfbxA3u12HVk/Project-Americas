@@ -794,3 +794,13 @@ Then the larger pieces before the 3D world shows:
     X/S GB_ADDR_CONFIG).
   * Also re-upload video textures every frame: the checksum check runs every 15th flush,
     at most 16 MiB at a time.
+* **SW_4KB_S detiling is in** (`bindings.cpp`, `offset_4k_s`). Mode 5 is the tiling of
+  nearly every texture the game makes from title memory (only 1x1 textures use an XOR
+  mode). The per-element-size bit patterns come from AMD's addrlib; they are written out in
+  the code. No visible change in the menus.
+* **The intro video stays solid green even so**, so its frames are not CPU-written mode-5
+  textures. Likely Bink decodes on the GPU with compute, whose programs may be refused or
+  still wrong. **Next:** find the video's planes (its T#s at the video's draw) and the
+  dispatches that write them.
+* The menu text arriving letter by letter is settling, not a bug (the user watched it fill
+  in).

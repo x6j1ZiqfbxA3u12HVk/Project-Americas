@@ -34,6 +34,46 @@ bool read_guarded(const void* from, void* to, size_t size) {
   }
 }
 
+// GFX10's SW_4KB_S ("standard") tiling, the mode nearly every texture of the game uses: 4 KiB
+// tiles, row by row across the surface; inside a tile the address bits interleave the element's
+// x and y bits by element size (from AMD's address library patterns; 'z' is a byte within the
+// element). 1 to 16-byte elements; BC formats count 4x4 blocks as elements.
+constexpr uint32_t kSw4kS = 5;
+constexpr const char* kPattern4kS[5] = {
+    "x0x1x2x3y0y1y2y3y4x4y5x5",  // 1 byte
+    "z0x0x1x2y0y1y2x3y3x4y4x5",  // 2 bytes
+    "z0z1x0x1y0y1y2x2y3x3y4x4",  // 4 bytes
+    "z0z1z2x0y0y1x1x2y2x3y3x4",  // 8 bytes
+    "z0z1z2z3y0y1x0x1y2x2y3x3",  // 16 bytes
+};
+
+int element_log2(uint32_t bytes) {
+  for (int k = 0; k < 5; ++k) {
+    if (bytes == (1u << k)) return k;
+  }
+  return -1;
+}
+
+// The byte offset of element (x, y) in a surface `pitch` elements wide.
+uint64_t offset_4k_s(int log2_bytes, uint32_t x, uint32_t y, uint32_t pitch) {
+  const char* pat = kPattern4kS[log2_bytes];
+  uint32_t in_tile = 0, xbits = 0, ybits = 0;
+  for (int bit = 0; bit < 12; ++bit) {
+    const char axis = pat[2 * bit];
+    const int n = pat[2 * bit + 1] - '0';
+    if (axis == 'x') {
+      in_tile |= ((x >> n) & 1u) << bit;
+      xbits = std::max<uint32_t>(xbits, n + 1);
+    } else if (axis == 'y') {
+      in_tile |= ((y >> n) & 1u) << bit;
+      ybits = std::max<uint32_t>(ybits, n + 1);
+    }
+  }
+  const uint32_t tile_w = 1u << xbits, tile_h = 1u << ybits;
+  const uint64_t tiles_per_row = (pitch + tile_w - 1) / tile_w;
+  return ((uint64_t{y / tile_h} * tiles_per_row + x / tile_w) << 12) + in_tile;
+}
+
 struct Texture {
   uint64_t address = 0, size = 0;
   D3D12_RESOURCE_DESC desc{};
@@ -233,9 +273,27 @@ struct Bindings {
     ComPtr<ID3D12Resource> up = buffer(total, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ, D3D12_RESOURCE_FLAG_NONE);
     uint8_t* p = nullptr;
     if (!up || FAILED(up->Map(0, nullptr, reinterpret_cast<void**>(&p)))) return;
+    const int log2_bytes = element_log2(t.layout.element_bytes);
+    const bool detile = t.layout.swizzle_mode == kSw4kS && log2_bytes >= 0;
+    std::vector<uint8_t> tiled;
     for (UINT k = 0; k < subs; ++k) {
       const SubresourceLayout& s = t.layout.subresources[k];
       const uint64_t bytes = std::min<uint64_t>(row_bytes[k], s.row_pitch);
+      if (detile && fp[k].Footprint.Depth == 1) {
+        // The subresource's tiles, then each element from its place in its 4 KiB tile.
+        const uint64_t size = uint64_t{s.row_pitch} * s.padded_rows;
+        tiled.resize(size);
+        read_guarded(reinterpret_cast<const void*>(t.address + s.offset), tiled.data(), size);
+        const uint32_t eb = t.layout.element_bytes, pitch = s.row_pitch / eb;
+        for (UINT y = 0; y < rows[k] && y < s.rows; ++y) {
+          uint8_t* row = p + fp[k].Offset + uint64_t{y} * fp[k].Footprint.RowPitch;
+          for (uint32_t x = 0; x < s.width_elements && (x + 1) * eb <= row_bytes[k]; ++x) {
+            const uint64_t at = offset_4k_s(log2_bytes, x, y, pitch);
+            if (at + eb <= size) std::memcpy(row + uint64_t{x} * eb, tiled.data() + at, eb);
+          }
+        }
+        continue;
+      }
       for (UINT z = 0; z < fp[k].Footprint.Depth; ++z) {
         for (UINT y = 0; y < rows[k] && y < s.rows; ++y) {
           const uint64_t from = t.address + s.offset + (uint64_t{z} * s.padded_rows + y) * s.row_pitch;
@@ -597,7 +655,7 @@ void add_texture(Bindings* b, const D3D12_RESOURCE_DESC& resource, const D3D12_S
   b->textures.push_back(std::move(t));
   b->table_dirty = true;
   static std::atomic<int> logged{0};
-  if (logged.fetch_add(1) < 16) {
+  if (logged.fetch_add(1) < 200) {
     logf("gpu: texture %ux%u, %u mips, format %u, mode %u, at 0x%s: view %u", width, height, mips, format, layout.swizzle_mode,
          hex(address).c_str(), index);
   }
