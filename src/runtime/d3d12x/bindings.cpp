@@ -38,6 +38,12 @@ bool read_guarded(const void* from, void* to, size_t size) {
 // tiles, row by row across the surface; inside a tile the address bits interleave the element's
 // x and y bits by element size (from AMD's address library patterns; 'z' is a byte within the
 // element). 1 to 16-byte elements; BC formats count 4x4 blocks as elements.
+//
+// The patterns below derive from AMD's address library (addrlib, gfx10SwizzlePattern.h),
+// Copyright (c) 2007-2024 Advanced Micro Devices, Inc. All Rights Reserved. Used under the MIT
+// licence: permission is granted free of charge to use, copy, modify, merge, publish and
+// distribute, provided this notice is included; the software is provided "as is", without
+// warranty of any kind.
 constexpr uint32_t kSw4kS = 5;
 constexpr const char* kPattern4kS[5] = {
     "x0x1x2x3y0y1y2y3y4x4y5x5",  // 1 byte
