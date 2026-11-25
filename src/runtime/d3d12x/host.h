@@ -34,6 +34,9 @@ void forget_host_texture(const void* console_resource);
 // from a description (the translated root signature is filled in), or nullptr.
 std::string program_marker(std::span<const uint8_t> container, uint32_t subobject);
 bool load_precompiled(const std::string& marker, std::vector<uint8_t>& dxil);
+// A program a draw or dispatch waited for: listed in rt<N>\wanted-first.txt, which the next
+// `am-shaders precompile` compiles before everything else.
+void note_wanted(const std::string& marker);
 ID3D12PipelineState* make_host_graphics_pipeline(D3D12_GRAPHICS_PIPELINE_STATE_DESC desc, const char* what);
 
 // pipeline.cpp: a console pipeline's host pipeline (nullptr when there is none) and its console

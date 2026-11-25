@@ -16,6 +16,9 @@
 #include <algorithm>
 #include <atomic>
 #include <type_traits>
+#include <condition_variable>
+#include <deque>
+#include <functional>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -70,6 +73,9 @@ struct PipelineState : Object {
   Microsoft::WRL::ComPtr<ID3D12PipelineState> host;  // when its shaders are precompiled
   bool compute = false;
   std::atomic<ID3D12PipelineState*> host_compute{nullptr};  // made on a worker thread, owned by `host`
+  std::string compute_marker;           // its program's
+  std::atomic<bool> compute_tried{false};  // a job has run (made or refused)
+  std::atomic<bool> compute_urgent{false};  // a dispatch waited: moved to the front once
   uint32_t console_programs = 0;  // slot 57: GPU programs given by address
   std::string console_name;       // slot 57: the saved blocks' file, and the programs' markers
   std::unique_ptr<ConsolePipeline> console;
@@ -207,21 +213,70 @@ bool is_shader(uint32_t type) {
          type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS || type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS;
 }
 
-// A compute pipeline's host pipeline: its program's precompiled translation (by marker) with the
-// translated root signature, made on a worker thread. The driver can take very long over some
-// programs (the game's watchdog ended the run while one was made on its thread); dispatches
-// wait until it is there.
-void start_host_compute(PipelineState* p, const std::string& marker) {
-  p->compute = true;
-  std::vector<uint8_t> code;
-  present::HostGpu* gpu = present::host_gpu();
-  if (!gpu || marker.empty() || !load_precompiled(marker, code)) {
-    static std::atomic<int> told{0};
-    if (told.fetch_add(1, std::memory_order_relaxed) < 16) logf("gpu: compute program %s is not precompiled", marker.c_str());
-    return;
+// Host compute pipelines are made by two worker threads, in the order asked for: the driver can
+// take very long over some programs (the game's watchdog ended the run while one was made on
+// its thread), and the game asks for about 2,700 at start-up (a thread each ran the driver out
+// of memory).
+class PipelineMaker {
+ public:
+  void add(std::function<void()> job, bool front = false) {
+    std::lock_guard g(lock_);
+    if (!started_) {
+      started_ = true;
+      for (int k = 0; k < 2; ++k) {
+        std::thread([this] {
+          SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+          for (;;) {
+            std::function<void()> next;
+            {
+              std::unique_lock u(lock_);
+              wake_.wait(u, [this] { return !jobs_.empty(); });
+              next = std::move(jobs_.front());
+              jobs_.pop_front();
+            }
+            next();
+          }
+        }).detach();
+      }
+    }
+    if (front) jobs_.push_front(std::move(job));
+    else jobs_.push_back(std::move(job));
+    wake_.notify_one();
   }
-  add_ref(p);  // kept alive until the worker is done
-  std::thread([p, gpu, marker, code = std::move(code)] {
+
+ private:
+  std::mutex lock_;
+  std::condition_variable wake_;
+  std::deque<std::function<void()>> jobs_;
+  bool started_ = false;
+};
+
+PipelineMaker& pipeline_maker() {
+  static PipelineMaker* const m = new PipelineMaker;
+  return *m;
+}
+
+// A compute pipeline's host pipeline: its program's precompiled translation (by marker) with the
+// translated root signature, made by the pipeline maker; dispatches wait until it is there. A
+// pipeline a dispatch waits for is queued again at the front (the job that runs second finds it
+// made and does nothing).
+void queue_host_compute(PipelineState* p, bool front) {
+  present::HostGpu* gpu = present::host_gpu();
+  if (!gpu || p->compute_marker.empty()) return;
+  add_ref(p);  // kept alive until its job is done
+  pipeline_maker().add([p, gpu] {
+    if (p->compute_tried.exchange(true)) {
+      release(p);
+      return;
+    }
+    const std::string& marker = p->compute_marker;
+    std::vector<uint8_t> code;
+    if (!load_precompiled(marker, code)) {  // listed for the precompile to do first
+      static std::atomic<int> told{0};
+      if (told.fetch_add(1, std::memory_order_relaxed) < 16) logf("gpu: compute program %s is not precompiled", marker.c_str());
+      release(p);
+      return;
+    }
     D3D12_COMPUTE_PIPELINE_STATE_DESC host{};
     host.pRootSignature = translated_root_signature();
     host.CS = {code.data(), code.size()};
@@ -232,7 +287,13 @@ void start_host_compute(PipelineState* p, const std::string& marker) {
       logf("gpu: host compute pipeline for %s refused (0x%08lx)", marker.c_str(), static_cast<unsigned long>(hr));
     }
     release(p);
-  }).detach();
+  }, front);
+}
+
+void start_host_compute(PipelineState* p, const std::string& marker) {
+  p->compute = true;
+  p->compute_marker = marker;
+  queue_host_compute(p, false);
 }
 
 void log_first_bytes(const char* how, const void* desc, const PipelineState* p) {
@@ -277,7 +338,10 @@ ID3D12PipelineState* host_compute_pipeline(const void* object, const void** root
   auto* p = static_cast<PipelineState*>(o);
   if (!p->compute) return nullptr;
   if (root_signature) *root_signature = p->root_signature;
-  return p->host_compute.load(std::memory_order_acquire);
+  ID3D12PipelineState* host = p->host_compute.load(std::memory_order_acquire);
+  if (!host && !p->compute_tried.load() && !p->compute_urgent.exchange(true)) queue_host_compute(p, true);  // a dispatch waits
+  if (!host && p->compute_tried.load()) note_wanted(p->compute_marker);  // tried, nothing made: not precompiled (or refused)
+  return host;
 }
 
 HRESULT create_compute_pipeline(const D3D12_COMPUTE_PIPELINE_STATE_DESC* desc, uint64_t extra0, uint64_t extra1,
@@ -670,6 +734,7 @@ ID3D12PipelineState* console_host_pipeline(ConsolePipeline& c, const DXGI_FORMAT
   for (const std::string& m : c.markers) {
     std::vector<uint8_t> code;
     if (!load_precompiled(m, code)) {
+      for (const std::string& each : c.markers) note_wanted(each);  // a draw waits for them
       c.failed = true;
       return nullptr;
     }

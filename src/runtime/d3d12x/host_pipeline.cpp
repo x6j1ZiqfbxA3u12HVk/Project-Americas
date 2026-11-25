@@ -67,6 +67,17 @@ std::string program_marker(std::span<const uint8_t> container, uint32_t subobjec
   return {};
 }
 
+void note_wanted(const std::string& marker) {
+  TitleProcess* p = process();
+  if (marker.empty() || !p || p->cache_dir().empty()) return;
+  static std::mutex lock;
+  static std::set<std::string> noted;
+  std::lock_guard g(lock);
+  if (!noted.insert(marker).second) return;
+  const std::filesystem::path dir = p->cache_dir() / "shaders" / "dxil" / ("rt" + std::to_string(shader::kTranslatorVersion));
+  std::ofstream(dir / "wanted-first.txt", std::ios::app) << marker << '\n';
+}
+
 bool load_precompiled(const std::string& marker, std::vector<uint8_t>& dxil) {
   TitleProcess* p = process();
   if (marker.empty() || !p || p->cache_dir().empty()) return false;
@@ -80,8 +91,6 @@ bool load_precompiled(const std::string& marker, std::vector<uint8_t>& dxil) {
     std::lock_guard g(lock);
     if (told.insert(marker).second) {
       if (told.size() <= 64) logf("gpu: no precompiled shader %s (run am-shaders precompile)", marker.c_str());
-      // The precompile does the programs the game waited for first.
-      std::ofstream(file.parent_path() / "wanted-first.txt", std::ios::app) << marker << "\n";
     }
     return false;
   }
