@@ -7,6 +7,7 @@
 #include <cstring>
 #include <vector>
 
+#include "runtime/d3d12x/commands.h"
 #include "runtime/d3d12x/d3d12x.h"
 #include "runtime/d3d12x/layout.h"
 #include "runtime/d3d12x/object.h"
@@ -334,4 +335,40 @@ TEST_CASE(d3d12x_frame_events_pace_frames) {
   const double ms = static_cast<double>(b.QuadPart - a.QuadPart) * 1000.0 / static_cast<double>(f.QuadPart);
   CHECK(second == first + 1 && third == second + 1);  // tokens count frames
   CHECK(ms > 15.0 && ms < 40.0);                       // two frame starts, 10 ms apart
+}
+
+TEST_CASE(d3d12x_command_lists_record_commands) {
+  void* device = make_device();
+  const uint32_t desc[4] = {0, 2, 1, 0};
+  void* list = nullptr;
+  CHECK(slot<HRESULT(WINAPI*)(void*, const uint32_t*, void*, void*, const GUID*, void**)>(device, 73)(
+            device, desc, nullptr, nullptr, nullptr, &list) == S_OK);
+  CHECK(list != nullptr);
+  // The console's slots: DrawInstanced 12, OMSetRenderTargets 50, ClearRenderTargetView 52,
+  // Close 9, Reset 139.
+  const float color[4] = {0.25f, 0.5f, 0.75f, 1.0f};
+  slot<void(WINAPI*)(void*, uint64_t, const float*, UINT, const D3D12_RECT*)>(list, 52)(list, 0x1234, color, 0, nullptr);
+  const uint64_t targets[2] = {0x100, 0x140};
+  const uint64_t depth = 0x200;
+  slot<void(WINAPI*)(void*, UINT, const uint64_t*, BOOL, const uint64_t*)>(list, 50)(list, 2, targets, FALSE, &depth);
+  slot<void(WINAPI*)(void*, UINT, UINT, UINT, UINT)>(list, 12)(list, 3, 1, 0, 0);
+  CHECK(slot<HRESULT(WINAPI*)(void*)>(list, 9)(list) == S_OK);
+
+  const Recording* r = recording_of(list);
+  CHECK(r && r->closed && r->commands.size() == 3);
+  if (r && r->commands.size() == 3) {
+    const Command& clear = r->commands[0];
+    CHECK(clear.op == kClearRenderTargetView && clear.a[0] == 0x1234 && clear.data_size == 16);
+    float kept[4] = {};
+    std::memcpy(kept, r->data.data() + clear.data_at, sizeof kept);
+    CHECK(kept[2] == 0.75f);
+    const Command& rts = r->commands[1];
+    uint64_t handles[3] = {};
+    CHECK(rts.op == kSetRenderTargets && rts.data_size == 24);
+    std::memcpy(handles, r->data.data() + rts.data_at, sizeof handles);
+    CHECK(handles[1] == 0x140 && handles[2] == 0x200);
+    CHECK(r->commands[2].op == kDrawInstanced && r->commands[2].a[0] == 3);
+  }
+  CHECK(slot<HRESULT(WINAPI*)(void*, void*, void*)>(list, 139)(list, nullptr, nullptr) == S_OK);
+  CHECK(recording_of(list)->commands.empty());
 }

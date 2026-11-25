@@ -6,6 +6,7 @@
 #include <d3d12.h>
 
 #include <cstdint>
+#include <string>
 #include <vector>
 
 namespace am::rt::d3d12x {
@@ -29,6 +30,16 @@ uint32_t descriptor_size(uint32_t type);
 struct Method;
 // views.cpp: device slots 17-25 and 108 (views, descriptor copies, allocation sizes).
 void add_view_methods(std::vector<Method>& out);
+
+// views.cpp: what a view wrote into its descriptor (kind: 1 CBV, 2 SRV, 3 UAV, 4 RTV, 5 DSV,
+// 6 sampler; the resource object, or a GPU address for CBVs). False if the descriptor holds no
+// view of ours.
+struct ViewInfo {
+  uint16_t kind = 0;
+  uint16_t format = 0;
+  uint64_t resource = 0;
+};
+bool read_view(uint64_t descriptor, ViewInfo& out);
 
 // views.cpp: the bytes and alignment a resource needs (GetResourceAllocationInfo's rules).
 D3D12_RESOURCE_ALLOCATION_INFO allocation_info(const D3D12_RESOURCE_DESC& d);
@@ -54,6 +65,8 @@ HRESULT create_compute_pipeline(const D3D12_COMPUTE_PIPELINE_STATE_DESC* desc, u
                                 const GUID* riid, void** out);
 HRESULT create_pipeline_from_stream(const D3D12_PIPELINE_STATE_STREAM_DESC* desc, const GUID* riid, void** out);
 HRESULT create_console_pipeline(const char* how, const void* desc, const GUID* riid, void** out);
+// "how it was made, then each shader's stage and hash" (logs).
+std::string describe_pipeline(const void* pipeline);
 
 // xg.cpp: xg_xs.dll, the console's texture layout library.
 HRESULT WINAPI xg_suggest_swizzle_mode(const D3D12_RESOURCE_DESC* desc, UINT flags, UINT* layout);

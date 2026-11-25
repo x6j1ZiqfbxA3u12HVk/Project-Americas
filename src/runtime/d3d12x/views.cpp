@@ -165,6 +165,21 @@ D3D12_RESOURCE_ALLOCATION_INFO* WINAPI get_resource_allocation_info2(uint64_t a0
 
 }  // namespace
 
+bool read_view(uint64_t descriptor, ViewInfo& out) {
+  if (!descriptor) return false;
+  Record r{};
+  __try {
+    std::memcpy(&r, reinterpret_cast<const void*>(descriptor), sizeof r);
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    return false;
+  }
+  if (r.magic != kRecordMagic) return false;
+  out.kind = static_cast<uint16_t>(r.kind);
+  out.format = r.format;
+  out.resource = r.resource;
+  return true;
+}
+
 // The bytes and alignment one resource needs: buffers in 64 KiB units, textures by our layout
 // model (layout.h), which the console's XG library answers with too.
 D3D12_RESOURCE_ALLOCATION_INFO allocation_info(const D3D12_RESOURCE_DESC& d) {

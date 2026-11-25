@@ -48,6 +48,7 @@ class TitleProcess {
 
   // ---- for the wrappers ----
   MappedImage* executable() { return exe_; }
+  const std::filesystem::path& cache_dir() const { return options_.cache_dir; }
   MappedImage* find_module(std::string_view name);
   // Lock-free: also asked during exception dispatch and crash reports.
   MappedImage* module_containing(const void* address);

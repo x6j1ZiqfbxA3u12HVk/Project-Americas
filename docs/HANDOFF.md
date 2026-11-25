@@ -45,6 +45,11 @@ thread and a swap chain of the host's D3D12); the title bar reads about "30 fps,
 GPU rendering yet)". The picture is black until the GPU back end exists. Closing the window
 ends the run.
 
+**Command lists (2026-11-25):** every command list call is recorded with its data, and the log
+describes frames: the game sits on a boot screen of three full-screen draws. Most pipelines
+come from GPU programs in memory (slot 57), all of them in the corpus; every shader the game
+hands over is saved under `cache\shaders\runtime`.
+
 **M3:** the RDNA 2 decoder is done and decodes all 26,084 console GPU programs of the corpus,
 checked against LLVM (100 % on 2.8 M instructions). **Translator version 1 runs** (PLAN.md,
 section 11, "M3.2"): compute programs become HLSL, one thread per console lane, and are checked
@@ -249,8 +254,22 @@ method the game calls.
 
 DirectStorage and files are done (PLAN.md section 11, "M2.3").
 
-1. **The per-frame probes (the next step).** The game presents into the window at 30 fps
-   (`d3d12x/present.cpp`, `runtime/present`); what it does each frame besides is still probes:
+1. **Draw the boot screen (the next step).** Command lists now record every command
+   (`d3d12x/commands.h`; slot table in PLAN.md 11, M2.4) and the log describes frames. The boot
+   screen is a black clear and three full-screen triangles, the same every frame:
+   * pipeline 1, a D3D12 stream: containers `7f26a694cd60...` (VS) and `3dc6e3523c81...` (PS),
+     saved in `cache\shaders\runtime` (not in `shaders.rpf`);
+   * pipeline 2, slot 55: shaders not found yet (its description is fixed-function state);
+   * pipeline 3, slot 57: GPU programs from the corpus, markers in the frame log.
+   To draw it: host resources for render targets and the textures it samples (PLAN.md 5.2,
+   class A and B), descriptor translation for its two tables and root SRV, the VS/PS
+   translation of those programs (the shader track), host PSOs, then running the recorded
+   commands at `ExecuteCommandListsX` and presenting the host back buffer. Clears alone show
+   nothing new: the only one is the back buffer to black.
+   * Most game pipelines come from slot 57 (programs already in GPU memory); all 911 of their
+     programs are in the corpus, found by the 24-byte marker. The translator's output should be
+     looked up by that marker at run time.
+   Still probes each frame:
    * device 70 (writes 32-byte descriptors into the big heap:
      probably the console's own view creation from a GPU address) and 81, queue 35 (twice a
      frame), and the command list's slots (9, 12, 20-25, 32-36, 44-52, 70-75, 126, 139-146).

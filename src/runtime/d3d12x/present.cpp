@@ -18,6 +18,7 @@
 #include <string>
 
 #include "core/text.h"
+#include "runtime/d3d12x/commands.h"
 #include "runtime/d3d12x/d3d12x.h"
 #include "runtime/d3d12x/layout.h"
 #include "runtime/d3d12x/object.h"
@@ -109,6 +110,7 @@ HRESULT WINAPI queue_present_x(Object* self, UINT plane_count, const void* plane
     }
   }
   count_frame(shown);
+  frame_present();
   return S_OK;
 }
 

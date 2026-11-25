@@ -15,12 +15,17 @@
 #include <atomic>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <mutex>
+#include <set>
 #include <string>
 #include <vector>
 
 #include "runtime/d3d12x/d3d12x.h"
 #include "runtime/d3d12x/object.h"
 #include "runtime/log.h"
+#include "runtime/process.h"
 
 namespace am::rt::d3d12x {
 namespace {
@@ -35,6 +40,8 @@ struct PipelineState : Object {
   Object* root_signature = nullptr;  // referenced
   std::vector<Shader> shaders;
   uint64_t extra[2] = {};
+  uint32_t console_programs = 0;  // slot 57: GPU programs given by address
+  std::string console_name;       // slot 57: the saved blocks' file, and the programs' markers
 
   ~PipelineState() {
     if (root_signature) release(root_signature);
@@ -66,6 +73,38 @@ std::string container_hash(const uint8_t* b, size_t size) {
   return {};
 }
 
+// Every shader the title hands over is kept in the cache (cache/shaders/runtime under the
+// output folder), once: shaders.rpf is not the only source of them (the boot screen's are
+// elsewhere), and the translator wants exactly what the game uses. Containers are named by
+// their HASH digest; the console's own pipelines (slot 57) by a digest of their blocks.
+std::filesystem::path runtime_shader_dir() {
+  static const std::filesystem::path dir = [] {
+    std::filesystem::path d;
+    if (TitleProcess* p = process(); p && !p->cache_dir().empty()) {
+      d = p->cache_dir() / "shaders" / "runtime";
+      std::error_code ec;
+      std::filesystem::create_directories(d, ec);
+      if (ec) d.clear();
+    }
+    return d;
+  }();
+  return dir;
+}
+
+void save_once(const std::string& name, const uint8_t* bytes, size_t size) {
+  static std::mutex lock;
+  static std::set<std::string> saved;
+  const std::filesystem::path dir = runtime_shader_dir();
+  if (dir.empty() || name.empty()) return;
+  std::lock_guard g(lock);
+  if (!saved.insert(name).second) return;
+  const std::filesystem::path file = dir / name;
+  std::error_code ec;
+  if (std::filesystem::exists(file, ec)) return;
+  std::ofstream out(file, std::ios::binary);
+  out.write(reinterpret_cast<const char*>(bytes), static_cast<std::streamsize>(size));
+}
+
 PipelineState* new_pipeline(const char* made_by, Object* root_signature) {
   auto* p = make_object<PipelineState>(pipeline_kind());
   p->made_by = made_by;
@@ -76,10 +115,14 @@ PipelineState* new_pipeline(const char* made_by, Object* root_signature) {
   return p;
 }
 
+std::string container_hash(const uint8_t* b, size_t size);
+
 void add_shader(PipelineState* p, uint32_t stage, const D3D12_SHADER_BYTECODE& b) {
   if (!b.pShaderBytecode || !b.BytecodeLength) return;
   const auto* bytes = static_cast<const uint8_t*>(b.pShaderBytecode);
   p->shaders.push_back({stage, std::vector<uint8_t>(bytes, bytes + b.BytecodeLength)});
+  const std::string hash = container_hash(bytes, b.BytecodeLength);
+  if (!hash.empty()) save_once(hash + ".dxbc", bytes, b.BytecodeLength);
 }
 
 // The bytes a stream subobject takes: its type, its data at the data's alignment, the whole
@@ -141,6 +184,20 @@ void log_first_bytes(const char* how, const void* desc, const PipelineState* p) 
 
 }  // namespace
 
+std::string describe_pipeline(const void* object) {
+  Object* o = object_of_kind(object, pipeline_kind());
+  if (!o) return object ? "(not a pipeline of ours)" : "(none)";
+  const auto* p = static_cast<const PipelineState*>(o);
+  std::string text = p->made_by;
+  static const char* const kStages[] = {"", "VS", "PS", "DS", "HS", "GS", "CS"};
+  for (const Shader& s : p->shaders) {
+    const char* stage = s.stage < 7 ? kStages[s.stage] : s.stage == 24 ? "AS" : s.stage == 25 ? "MS" : "?";
+    text += std::string(" ") + stage + " " + container_hash(s.bytecode.data(), s.bytecode.size()).substr(0, 12);
+  }
+  if (!p->console_name.empty()) text += " blocks " + p->console_name;
+  return text;
+}
+
 HRESULT create_compute_pipeline(const D3D12_COMPUTE_PIPELINE_STATE_DESC* desc, uint64_t extra0, uint64_t extra1,
                                 const GUID* /*riid*/, void** out) {
   if (!out) return E_POINTER;
@@ -201,9 +258,142 @@ HRESULT create_pipeline_from_stream(const D3D12_PIPELINE_STATE_STREAM_DESC* desc
   return S_OK;
 }
 
+namespace {
+
+// The stage a shader container holds, by its DXIL part's program header (kind << 16 | version),
+// as a stream subobject type; 0 when unknown.
+uint32_t container_stage(const uint8_t* b, size_t size) {
+  auto u32 = [&](size_t at) {
+    uint32_t v = 0;
+    if (at + 4 <= size) std::memcpy(&v, b + at, 4);
+    return v;
+  };
+  const uint32_t parts = u32(28);
+  for (uint32_t i = 0; i < parts && i < 64; ++i) {
+    const uint32_t at = u32(32 + size_t{i} * 4);
+    if (u32(at) == 0x4C495844) {  // "DXIL"
+      switch (u32(at + 8) >> 16) {
+        case 0: return D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS;
+        case 1: return D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS;
+        case 2: return D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS;
+        case 3: return D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_HS;
+        case 4: return D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DS;
+        case 5: return D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS;
+        case 13: return D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS;
+        case 14: return D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS;
+        default: return 0;
+      }
+    }
+  }
+  return 0;
+}
+
+bool read_guarded(const void* from, void* to, size_t size) {
+  __try {
+    std::memcpy(to, from, size);
+    return true;
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    return false;
+  }
+}
+
+// A shader container at `address`, if there is one: its bytes.
+bool container_at(uint64_t address, std::vector<uint8_t>& out) {
+  if (address < 0x10000 || (address & 3)) return false;
+  uint32_t head[8] = {};
+  if (!read_guarded(reinterpret_cast<const void*>(address), head, sizeof head) || head[0] != 0x43425844) return false;  // "DXBC"
+  const uint32_t size = head[6];
+  if (size < 32 || size > (64u << 20)) return false;
+  out.resize(size);
+  return read_guarded(reinterpret_cast<const void*>(address), out.data(), size);
+}
+
+// The console's pipeline descriptions are not read yet, but their shaders can be found: pointers
+// to shader containers in the description's first 32 words, or one pointer further.
+void find_shaders(PipelineState* p, const void* desc) {
+  uint64_t words[32] = {};
+  if (!desc || !read_guarded(desc, words, sizeof words)) return;
+  std::vector<uint8_t> bytes;
+  auto take = [&](uint64_t address) {
+    if (!container_at(address, bytes)) return false;
+    for (const Shader& s : p->shaders) {
+      if (s.bytecode == bytes) return true;
+    }
+    p->shaders.push_back({container_stage(bytes.data(), bytes.size()), bytes});
+    return true;
+  };
+  for (uint64_t w : words) {
+    if (take(w)) continue;
+    uint64_t inner[8] = {};
+    if (w >= 0x10000 && !(w & 7) && read_guarded(reinterpret_cast<const void*>(w), inner, sizeof inner)) {
+      for (uint64_t v : inner) take(v);
+    }
+  }
+}
+
+// A console GPU program begins with a 24-byte marker: two VOP3 v_nops with literals.
+bool is_console_program(const uint8_t* b, size_t size) {
+  if (size < 24) return false;
+  uint32_t w[6];
+  std::memcpy(w, b, sizeof w);
+  return (w[0] & 0xFFFF0000u) == 0xD5800000u && (w[3] & 0xFFFF0000u) == 0xD5800000u;
+}
+
+uint64_t fnv1a(const uint8_t* b, size_t size, uint64_t h = 0xCBF29CE484222325ull) {
+  for (size_t i = 0; i < size; ++i) h = (h ^ b[i]) * 0x100000001B3ull;
+  return h;
+}
+
+// Slot 57's description: the root signature, then (address, size) pairs: blocks of metadata in
+// title memory and GPU programs already in GPU memory, each program after its metadata. The
+// pairs end at the first one that is neither. Saved as one file: for each block its address
+// (8 bytes), size and kind (4 each; kind 1 for a program), then its bytes.
+void capture_console_blocks(PipelineState* p, const void* desc) {
+  uint64_t words[33] = {};
+  if (!desc || !read_guarded(desc, words, sizeof words)) return;
+  if (is_object(reinterpret_cast<void*>(words[0])) && !p->root_signature) {
+    p->root_signature = reinterpret_cast<Object*>(words[0]);
+    add_ref(p->root_signature);
+  }
+  std::vector<uint8_t> bundle, block;
+  uint32_t programs = 0;
+  std::string markers;
+  for (int i = 1; i + 1 < 33; i += 2) {
+    const uint64_t address = words[i], size = words[i + 1];
+    if (!address && !size) continue;
+    if (address < 0x10000 || !size || size > (1u << 20)) break;
+    block.resize(size);
+    if (!read_guarded(reinterpret_cast<const void*>(address), block.data(), size)) break;
+    const uint32_t kind = is_console_program(block.data(), block.size()) ? 1 : 0;
+    const uint32_t size32 = static_cast<uint32_t>(size);
+    bundle.insert(bundle.end(), reinterpret_cast<const uint8_t*>(&address), reinterpret_cast<const uint8_t*>(&address) + 8);
+    bundle.insert(bundle.end(), reinterpret_cast<const uint8_t*>(&size32), reinterpret_cast<const uint8_t*>(&size32) + 4);
+    bundle.insert(bundle.end(), reinterpret_cast<const uint8_t*>(&kind), reinterpret_cast<const uint8_t*>(&kind) + 4);
+    bundle.insert(bundle.end(), block.begin(), block.end());
+    if (kind) {
+      ++programs;
+      char m[32];
+      uint32_t w[3];
+      std::memcpy(w, block.data(), sizeof w);
+      std::snprintf(m, sizeof m, " %08x%08x", w[1], w[2]);
+      markers += m;
+    }
+  }
+  if (bundle.empty()) return;
+  char name[48];
+  std::snprintf(name, sizeof name, "%016llx.cpipe", static_cast<unsigned long long>(fnv1a(bundle.data(), bundle.size())));
+  save_once(name, bundle.data(), bundle.size());
+  p->console_programs = programs;
+  p->console_name = std::string(name, 16) + (markers.empty() ? "" : ":" + markers);
+}
+
+}  // namespace
+
 HRESULT create_console_pipeline(const char* how, const void* desc, const GUID* /*riid*/, void** out) {
   if (!out) return E_POINTER;
   PipelineState* p = new_pipeline(how, nullptr);
+  if (std::strstr(how, "57")) capture_console_blocks(p, desc);
+  find_shaders(p, desc);
   log_first_bytes(how, desc, p);
   *out = p;
   return S_OK;

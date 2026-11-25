@@ -14,6 +14,7 @@
 #include <utility>
 #include <vector>
 
+#include "runtime/d3d12x/commands.h"
 #include "runtime/d3d12x/d3d12x.h"
 #include "runtime/d3d12x/object.h"
 #include "runtime/log.h"
@@ -124,6 +125,13 @@ void WINAPI queue_execute_command_lists(Queue* self, UINT count, void* const* li
   trace(self, 10, "ExecuteCommandLists", count, reinterpret_cast<uint64_t>(lists), 0);
 }
 
+// Slot 35: the console's ExecuteCommandLists(count, lists, frame token, flags); the game
+// submits its frame's lists here twice a frame.
+void WINAPI queue_execute_command_lists_x(Queue* self, UINT count, void* const* lists, uint64_t token, UINT flags) {
+  trace(self, 35, "ExecuteCommandListsX", count, token, flags);
+  for (UINT i = 0; lists && i < count; ++i) frame_execute(lists[i]);
+}
+
 const Kind& queue_kind() {
   static const Kind k("command queue", 64, {
       {10, "ExecuteCommandLists", reinterpret_cast<void*>(&queue_execute_command_lists)},
@@ -133,6 +141,7 @@ const Kind& queue_kind() {
       {17, "Wait", reinterpret_cast<void*>(&queue_wait)},
       {18, "GetTimestampFrequency", reinterpret_cast<void*>(&queue_get_timestamp_frequency)},
       {32, "PresentX", reinterpret_cast<void*>(&queue_present_x)},
+      {35, "ExecuteCommandListsX", reinterpret_cast<void*>(&queue_execute_command_lists_x)},
   });
   return k;
 }

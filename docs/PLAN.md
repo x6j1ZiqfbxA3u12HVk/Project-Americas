@@ -982,6 +982,8 @@ The device's slots, as learned so far:
 | 127 | committed resource creation | shaped like `CreateCommittedResource3`: heap properties, flags, description, initial barrier layout, clear value, protected session, castable formats (count, list), riid, out |
 | 133 | CreatePlacedResourceX | `(GPU virtual address, description, initial layout, clear value, riid, out)`: a resource in the title's own memory, no heap |
 | 39, 41 | CreateQueryHeap, CreateCommandSignature | D3D12's order (probes) |
+| 55 | pipeline creation | `(0, count, descriptions, riid, out)`: the descriptions hold small enums only |
+| 57 | pipeline creation | root signature, then (address, size) pairs: metadata blocks and GPU programs in GPU memory (see below) |
 | 61, 70, 74, 81 | not identified | probes; the game accepts their 0. 70 and 81 run once a frame (70 writes 32-byte descriptors in the big heap); 74 takes the 6.1 GiB of physical pages the game maps |
 
 Other objects:
@@ -1044,6 +1046,35 @@ buffers first.
 each CLZERO cost millions of exceptions a minute. At load such loops now jump to a stub next to
 the image that clears the line with eight stores (18 of the executable's 41 Zen 2-only sites
 are patched, 23 left to emulation, none of them hot so far).
+
+**Command lists record (`d3d12x/commands.h`, `d3d12x/list.cpp`).** The console list's methods
+are D3D12's `ID3D12GraphicsCommandList` in D3D12's order up to SetPipelineState (25), then four
+slots later from SetDescriptorHeaps (D3D12's 28, the console's 32) to ExecuteIndirect; Close is
+9, Reset 139, the barrier call 146. The title's code records most commands inline (packets
+into a buffer in the list object: cursor at +0x18, end at +0x30, per-root-parameter headers at
++0x144) and calls the method only when the buffer is full; our list objects keep cursor and end
+0, so every command reaches its method. Each command is recorded with the bytes its pointers
+point at. Queue slot 35 is `ExecuteCommandListsX(count, lists, token, flags)`. The log sums up
+frames 1-3 and every 300th: counts per command, render-target clears (target, color), and the
+pipelines and draws in order.
+
+**The boot screen**, every frame: clear the 3840x2160 back buffer to black, then three
+full-screen triangles (`DrawInstanced(3, 1)`): one pipeline from a D3D12 stream (slot 86), one
+from slot 55, one from slot 57. Nothing in the frame changes over a run: the game stays on this
+screen.
+
+**Pipelines from programs in GPU memory (slot 57).** Most of the game's pipelines (10,241 in a
+30-second run) come from slot 57: the root signature, then (address, size) pairs of metadata
+blocks in title memory and console GPU programs already in GPU memory (the 2.1 GiB code heap at
+`0xDC96...`). Their 911 distinct programs are all in the shader corpus (matched by the 24-byte
+marker each program starts with), so the marker links a runtime pipeline to its corpus program
+and translation. Slot 55's description holds only small enums (fixed-function state); where its
+shaders come from is open.
+
+**Every shader the game hands over is saved** in `C:\Project Americas\cache\shaders\runtime`:
+containers as `<HASH digest>.dxbc`, slot 57 pipelines as `<digest>.cpipe` (for each block its
+address, size and kind, then its bytes). The stream pipeline's containers are not in
+`shaders.rpf` (they come from another file), so the corpus alone is not the whole set.
 
 **Where the game is now: its frame loop, at 30 fps, in a window.** It records command lists,
 presents once a frame into the game window and waits for frame events between frames, for
