@@ -382,6 +382,15 @@ bool host_view_desc(ID3D12Device* device, DXGI_FORMAT resource_format, D3D12_SHA
       break;
     default: break;
   }
+  // A depth-stencil texture read as its depth: the view format its family takes.
+  if (plane == 0 && (resource_format == DXGI_FORMAT_R32G8X24_TYPELESS || resource_format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT) &&
+      (f == DXGI_FORMAT_R32_FLOAT || f == DXGI_FORMAT_R32_TYPELESS)) {
+    f = DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
+  }
+  if (plane == 0 && (resource_format == DXGI_FORMAT_R24G8_TYPELESS || resource_format == DXGI_FORMAT_D24_UNORM_S8_UINT) &&
+      (f == DXGI_FORMAT_R24_UNORM_X8_TYPELESS || f == DXGI_FORMAT_R32_FLOAT || f == DXGI_FORMAT_R32_TYPELESS)) {
+    f = DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+  }
   D3D12_FEATURE_DATA_FORMAT_SUPPORT support{f, {}, {}};
   if (FAILED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof support)) ||
       !(support.Support1 & (D3D12_FORMAT_SUPPORT1_SHADER_LOAD | D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE))) {
@@ -524,6 +533,26 @@ void add_texture(Bindings* b, const D3D12_RESOURCE_DESC& resource, const D3D12_S
     std::copy(words, words + 8, ib.words);
     ib.srv = ib.alt = index;
     ib.flags = image_flags;
+    // A texture shaders write: a writable view of its first mip too (typed stores need a format
+    // the device stores; sRGB views write through their UNORM twin).
+    if (host->GetDesc().Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) {
+      DXGI_FORMAT f = v.Format;
+      if (f == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB) f = DXGI_FORMAT_R8G8B8A8_UNORM;
+      if (f == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB) f = DXGI_FORMAT_B8G8R8A8_UNORM;
+      D3D12_FEATURE_DATA_FORMAT_SUPPORT support{f, {}, {}};
+      D3D12_CPU_DESCRIPTOR_HANDLE uav_slot{};
+      if (SUCCEEDED(b->device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof support)) &&
+          (support.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE)) {
+        if (const uint32_t uav = allocate_view_slot(&uav_slot)) {
+          D3D12_UNORDERED_ACCESS_VIEW_DESC u{};
+          u.Format = f;
+          u.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+          b->device->CreateUnorderedAccessView(host, nullptr, &u, uav_slot);
+          ib.uav = uav;
+          ib.flags |= shader::kImageHasUav;
+        }
+      }
+    }
     b->images.push_back(ib);
     b->table_dirty = true;
     static std::atomic<int> told{0};

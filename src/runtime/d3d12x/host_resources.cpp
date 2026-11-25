@@ -122,6 +122,9 @@ ID3D12Resource* host_texture(const void* console_resource, bool create) {
   // The console's own flag bits and layouts stay on the console side.
   d.Flags &= kGpuWritten | D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE;
   if (d.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) d.Flags &= ~D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+  // Shaders write it in place (bindless: we do not know which dispatch writes what), so it may
+  // be used in several states at once and leaves COMMON for any of them on its own.
+  if (d.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) d.Flags |= D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS;
   d.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
   d.Alignment = 0;
   // Multisampled targets are single-sampled here for now: shaders sample them as plain 2D

@@ -354,9 +354,9 @@ D3D12_GPU_VIRTUAL_ADDRESS set_heaps(HostList& h, ID3D12GraphicsCommandList* list
 // signature with the user data and the binding table, the dispatch, then a barrier so what it
 // wrote is seen by the work after it.
 void dispatch(HostList& h, ID3D12GraphicsCommandList* list, const Command& c) {
-  // AMERICAS_NO_COMPUTE=1: dispatches are skipped (compute passes do not write textures yet, so
-  // with them some screens lose what they showed without them).
-  static const bool no_compute = GetEnvironmentVariableA("AMERICAS_NO_COMPUTE", nullptr, 0) != 0;
+  // Dispatches run only with AMERICAS_COMPUTE=1 for now: they run, but the translated compute
+  // passes' results are wrong yet, and with them the menus lose what they show without them.
+  static const bool no_compute = GetEnvironmentVariableA("AMERICAS_COMPUTE", nullptr, 0) == 0;
   if (no_compute) {
     ++g_dispatches_skipped;
     return;

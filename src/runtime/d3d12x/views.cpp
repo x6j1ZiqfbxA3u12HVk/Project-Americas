@@ -68,7 +68,8 @@ void WINAPI create_srv(Object* self, Object* resource, const D3D12_SHADER_RESOUR
       v.Format = d.Format;
       v.ViewDimension = d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? D3D12_SRV_DIMENSION_BUFFER : D3D12_SRV_DIMENSION_TEXTURE2D;
     }
-    const bool target = (d.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)) != 0;
+    const bool target = (d.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL |
+                                    D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) != 0;
     if (d.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER && target) {
       uint32_t words[8] = {};
       bind_texture_view(d, v, address, words, host_texture(resource));
@@ -86,6 +87,32 @@ void WINAPI create_srv(Object* self, Object* resource, const D3D12_SHADER_RESOUR
 void WINAPI create_uav(Object* self, Object* resource, Object* counter, const D3D12_UNORDERED_ACCESS_VIEW_DESC* desc,
                        uint64_t dest) {
   trace(self, 19, "CreateUnorderedAccessView", reinterpret_cast<uint64_t>(resource), reinterpret_cast<uint64_t>(counter), dest);
+  // What translated shaders read and write through: a V# for buffers, a T# for textures (the
+  // GPU's own texture, which the table gives a writable view).
+  D3D12_RESOURCE_DESC d{};
+  uint64_t address = 0;
+  if (resource && dest && resource_memory(resource, &d, &address)) {
+    if (d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+      const bool raw = desc && (desc->Buffer.Flags & D3D12_BUFFER_UAV_FLAG_RAW);
+      const FormatSize f = format_size(desc ? desc->Format : DXGI_FORMAT_UNKNOWN);
+      const uint64_t element = !desc || raw ? 4 : desc->Buffer.StructureByteStride ? desc->Buffer.StructureByteStride : std::max<uint32_t>(f.bytes, 1);
+      const uint64_t first = desc ? desc->Buffer.FirstElement : 0;
+      const uint64_t count = desc ? desc->Buffer.NumElements : d.Width / element;
+      uint32_t v[8] = {};
+      encode_buffer_descriptor(v, address + first * element, count * element, !desc || raw ? 0u : static_cast<uint32_t>(element));
+      std::memcpy(reinterpret_cast<void*>(dest), v, sizeof v);
+      return;
+    }
+    if (ID3D12Resource* host = host_texture(resource)) {
+      D3D12_SHADER_RESOURCE_VIEW_DESC v{};
+      v.Format = desc ? desc->Format : d.Format;
+      v.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+      uint32_t words[8] = {};
+      bind_texture_view(d, v, address, words, host);
+      std::memcpy(reinterpret_cast<void*>(dest), words, sizeof words);
+      return;
+    }
+  }
   write_record(dest, resource ? ViewKind::Uav : ViewKind::Null, desc ? desc->Format : 0, reinterpret_cast<uint64_t>(resource));
 }
 
