@@ -52,6 +52,9 @@ constexpr std::string_view kMemoryFunctions[] = {
     "VirtualAlloc", "VirtualAllocEx", "VirtualAlloc2", "VirtualAllocFromApp", "VirtualFree", "VirtualFreeEx",
     "VirtualQuery", "VirtualQueryEx", "VirtualProtect", "VirtualProtectEx",
 };
+// The kernel reads into and writes from these buffers itself, where a title page committed on
+// first touch cannot fault in: the wrapper commits them first.
+constexpr std::string_view kBufferFunctions[] = {"ReadFile", "ReadFileEx", "WriteFile", "WriteFileEx"};
 constexpr std::string_view kModuleFunctions[] = {
     "LoadLibraryA", "LoadLibraryW", "LoadLibraryExA", "LoadLibraryExW", "LoadPackagedLibrary", "GetModuleHandleA",
     "GetModuleHandleW", "GetModuleHandleExA", "GetModuleHandleExW", "GetProcAddress", "FreeLibrary",
@@ -93,6 +96,7 @@ struct Wrap {
 const Wrap kWraps[] = {
     {"console paths", kPathFunctions},
     {"title memory", kMemoryFunctions},
+    {"kernel I/O into title memory", kBufferFunctions},
     {"module identity", kModuleFunctions},
     {"threads and processors", kThreadFunctions},
     {"system information", kSystemFunctions},

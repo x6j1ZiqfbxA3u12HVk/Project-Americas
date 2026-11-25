@@ -5,7 +5,10 @@
 // The console's command list has the same methods as D3D12's ID3D12GraphicsCommandList, in
 // D3D12's order up to SetPipelineState (slot 25), then four slots later from SetDescriptorHeaps
 // (D3D12's 28, the console's 32) to ExecuteIndirect; Close is 9, Reset 139, the barrier call
-// 146 (learned from the game's calls and their call sites).
+// 146 (learned from the game's calls and their call sites). After ExecuteIndirect come the
+// console's own: depth bounds (70), memory value writes at the bottom of the pipe (71: 32 bits,
+// 72: 64 bits; address, value, flush, flags) and waits for memory values (73: 32 bits, 74: 64
+// bits; address, comparison, reference). The game's queues and its CPU wait on those values.
 //
 // The title's code records most commands inline: it writes packets into a buffer in the list
 // object (cursor at +0x18, end at +0x30) and calls the method only when the buffer is full. Our
@@ -67,6 +70,11 @@ enum Op : uint16_t {
   kBeginEvent = 61,
   kEndEvent = 62,
   kExecuteIndirect = 63,
+  kSetDepthBounds = 70,
+  kWriteValue32 = 71,
+  kWriteValue64 = 72,
+  kWaitValue32 = 73,
+  kWaitValue64 = 74,
   kReset = 139,
   kBarrier = 146,
 };

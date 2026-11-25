@@ -15,10 +15,13 @@
 
 #include <algorithm>
 #include <atomic>
+#include <condition_variable>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <mutex>
 #include <string>
+#include <thread>
 
 #include "core/text.h"
 #include "runtime/d3d12x/bindings.h"
@@ -542,7 +545,11 @@ std::vector<Method> list_methods() {
       rec_method<42>(), rec_method<43>(), rec_method<44>(), rec_method<45>(), rec_method<46>(), rec_method<47>(),
       rec_method<48>(), rec_method<49>(), rec_method<50>(), rec_method<52>(), rec_method<53>(), rec_method<54>(),
       rec_method<55>(), rec_method<56>(), rec_method<57>(), rec_method<58>(), rec_method<59>(), rec_method<60>(),
-      rec_method<61>(), rec_method<62>(), rec_method<63>(), rec_method<146>(),
+      rec_method<61>(), rec_method<62>(), rec_method<63>(), rec_method<146>(), rec_method<70>(), rec_method<71>(),
+      rec_method<72>(), rec_method<73>(), rec_method<74>(),
+      // State the host has no use for yet, taken quietly: 75 (pixel shader state), 126 (shading
+      // rate), 131 and 132 (pipeline syncs; host barriers order our work), 142.
+      rec_method<75>(), rec_method<126>(), rec_method<131>(), rec_method<132>(), rec_method<142>(),
   };
   return m;
 }
@@ -550,6 +557,137 @@ std::vector<Method> list_methods() {
 const Kind& list_kind() {
   static const Kind k("command list", kMaxSlots, list_methods());
   return k;
+}
+
+// ---- memory values: the GPU's writes at the bottom of the pipe, and its waits ----
+
+struct ValueWrite {
+  uint64_t address = 0, value = 0;
+  uint32_t bytes = 4, flags = 0;  // flags 1: the GPU timestamp, 2: the system timestamp (64 bits)
+};
+
+void write_value(const ValueWrite& w) {
+  uint64_t v = w.value;
+  if (w.bytes == 8 && (w.flags & 3)) {  // both clocks tick at the queue's timestamp frequency, QPC's
+    LARGE_INTEGER t;
+    QueryPerformanceCounter(&t);
+    v = static_cast<uint64_t>(t.QuadPart);
+  }
+  __try {
+    if (w.bytes == 4) *reinterpret_cast<volatile uint32_t*>(w.address) = static_cast<uint32_t>(v);
+    else *reinterpret_cast<volatile uint64_t*>(w.address) = v;
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+  }
+}
+
+// Writes wait for the host fence after the lists that hold them, then land in order, from a
+// thread of ours: as on the console, a value is written once the work before it has run.
+class ValueWriter {
+ public:
+  void add(uint64_t fence, std::vector<ValueWrite> writes) {
+    std::lock_guard g(lock_);
+    if (!started_) {
+      started_ = true;
+      std::thread([this] { run(); }).detach();
+    }
+    queue_.emplace_back(fence, std::move(writes));
+    wake_.notify_one();
+  }
+
+ private:
+  void run() {
+    HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    for (;;) {
+      std::pair<uint64_t, std::vector<ValueWrite>> next;
+      {
+        std::unique_lock g(lock_);
+        wake_.wait(g, [this] { return !queue_.empty(); });
+        next = std::move(queue_.front());
+        queue_.pop_front();
+      }
+      present::HostGpu* gpu = present::host_gpu();
+      if (next.first && gpu && !gpu->done(next.first) && event) {
+        gpu->fence->SetEventOnCompletion(next.first, event);
+        if (WaitForSingleObject(event, 2000) == WAIT_TIMEOUT) {
+          static std::atomic<int> logged{0};
+          if (logged.fetch_add(1, std::memory_order_relaxed) < 4) {
+            logf("gpu: lists still running after 2 s; their memory value writes land anyway");
+          }
+        }
+      }
+      for (const ValueWrite& w : next.second) write_value(w);
+    }
+  }
+
+  std::mutex lock_;
+  std::condition_variable wake_;
+  std::deque<std::pair<uint64_t, std::vector<ValueWrite>>> queue_;
+  bool started_ = false;
+};
+
+ValueWriter& value_writer() {
+  static ValueWriter* const w = new ValueWriter;
+  return *w;
+}
+
+uint64_t read_value(uint64_t address, uint32_t bytes) {
+  __try {
+    return bytes == 4 ? *reinterpret_cast<volatile uint32_t*>(address) : *reinterpret_cast<volatile uint64_t*>(address);
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    return 0;
+  }
+}
+
+// D3D12_COMPARISON_FUNC order: the wait ends when `value <op> reference`.
+bool value_met(uint32_t comparison, uint64_t value, uint64_t reference) {
+  switch (comparison) {
+    case 1: return false;
+    case 2: return value < reference;
+    case 3: return value == reference;
+    case 4: return value <= reference;
+    case 5: return value > reference;
+    case 6: return value != reference;
+    case 7: return value >= reference;
+    default: return true;
+  }
+}
+
+// A list's waits hold its submission (the host queue cannot wait for memory): the values come
+// from earlier lists' writes or from the CPU. A wait not met in 2 s is let go, and said.
+void wait_for_values(const Recording& r) {
+  for (const Command& c : r.commands) {
+    if (c.op != kWaitValue32 && c.op != kWaitValue64) continue;
+    const uint32_t bytes = c.op == kWaitValue32 ? 4 : 8;
+    const uint64_t address = c.a[0], reference = bytes == 4 ? (c.a[2] & 0xFFFFFFFFu) : c.a[2];
+    const uint32_t comparison = static_cast<uint32_t>(c.a[1]);
+    if (address < 0x10000) continue;
+    const ULONGLONG start = GetTickCount64();
+    bool met = value_met(comparison, read_value(address, bytes), reference);
+    while (!met && GetTickCount64() - start < 2000) {
+      Sleep(0);
+      met = value_met(comparison, read_value(address, bytes), reference);
+    }
+    if (!met) {
+      static std::atomic<int> logged{0};
+      if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+        logf("gpu: a list waits for the value at 0x%s (comparison %u, reference %llu, now %llu): not met in 2 s, let go",
+             hex(address).c_str(), comparison, static_cast<unsigned long long>(reference),
+             static_cast<unsigned long long>(read_value(address, bytes)));
+      }
+    }
+  }
+}
+
+void collect_writes(const Recording& r, std::vector<ValueWrite>& out) {
+  for (const Command& c : r.commands) {
+    if ((c.op != kWriteValue32 && c.op != kWriteValue64) || c.a[0] < 0x10000) continue;
+    ValueWrite w;
+    w.address = c.a[0];
+    w.bytes = c.op == kWriteValue32 ? 4 : 8;
+    w.value = w.bytes == 4 ? (c.a[1] & 0xFFFFFFFFu) : c.a[1];
+    w.flags = w.bytes == 8 ? static_cast<uint32_t>(c.a[3]) : 0;
+    out.push_back(w);
+  }
 }
 
 // ---- the frame's summary ----
@@ -637,6 +775,11 @@ const char* op_name(uint16_t op) {
     case kBeginEvent: return "BeginEvent";
     case kEndEvent: return "EndEvent";
     case kExecuteIndirect: return "ExecuteIndirect";
+    case kSetDepthBounds: return "OMSetDepthBounds";
+    case kWriteValue32: return "WriteValue32";
+    case kWriteValue64: return "WriteValue64";
+    case kWaitValue32: return "WaitValue32";
+    case kWaitValue64: return "WaitValue64";
     case kReset: return "Reset";
     case kBarrier: return "Barrier";
     default: return nullptr;
@@ -649,21 +792,30 @@ const Recording* recording_of(const void* list) {
 }
 
 void submit_lists(UINT count, void* const* lists) {
+  if (!lists) return;
   present::HostGpu* gpu = present::host_gpu();
-  if (!gpu || !lists) return;
   std::vector<ID3D12CommandList*> host_lists;
   std::vector<HostList*> owners;
+  std::vector<ValueWrite> writes;
   for (UINT i = 0; i < count; ++i) {
     Object* o = object_of_kind(lists[i], list_kind());
     if (!o) continue;
+    const Recording& r = static_cast<CommandList*>(o)->rec;
+    wait_for_values(r);
+    collect_writes(r, writes);
+    if (!gpu) continue;
     HostList& h = static_cast<CommandList*>(o)->host;
     if (h.open) host_close(h);  // the title submits only closed lists; be safe
     if (!h.ready) continue;
     host_lists.push_back(h.list.Get());
     owners.push_back(&h);
   }
-  if (host_lists.empty()) return;
+  if (host_lists.empty()) {
+    if (!writes.empty()) value_writer().add(0, std::move(writes));  // nothing runs on the host: in order, now
+    return;
+  }
   const uint64_t done = gpu->submit(static_cast<UINT>(host_lists.size()), host_lists.data());
+  if (!writes.empty()) value_writer().add(done, std::move(writes));
   bool flushed = false;
   for (HostList* h : owners) {
     h->allocators[h->current].fence = done;

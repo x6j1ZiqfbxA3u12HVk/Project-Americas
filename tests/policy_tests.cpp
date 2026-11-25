@@ -18,12 +18,15 @@ TEST_CASE(policy_wraps_functions_that_need_console_behaviour) {
   CHECK(policy.route("api-ms-win-crt-stdio-l1-1-0.dll", "fopen") == Route::Wrap);
   CHECK(policy.route("WS2_32.dll", "connect") == Route::Wrap);
   CHECK(wrap_reason("CreateFileW") == "console paths");
-  CHECK(wrap_reason("ReadFile").empty());
+  // The kernel writes title buffers itself: their pages are committed first.
+  CHECK(policy.route("api-ms-win-core-file-l1-1-0.dll", "ReadFile") == Route::Wrap);
+  CHECK(wrap_reason("ReadFile") == "kernel I/O into title memory");
+  CHECK(wrap_reason("GetFileSizeEx").empty());
 }
 
 TEST_CASE(policy_passes_plain_host_functions) {
   const ImportPolicy policy;
-  CHECK(policy.route("api-ms-win-core-file-l1-1-0.dll", "ReadFile") == Route::Host);
+  CHECK(policy.route("api-ms-win-core-file-l1-1-0.dll", "GetFileSizeEx") == Route::Host);
   CHECK(policy.route("api-ms-win-crt-math-l1-1-0.dll", "sqrt") == Route::Host);
   CHECK(policy.route("ext-ms-win-rtcore-ntuser-window-l1-1-0.dll", "DestroyWindow") == Route::Host);
   // The title's own window is ours to hide: our presenter's window shows the frames.
