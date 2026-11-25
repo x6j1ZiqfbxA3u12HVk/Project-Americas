@@ -530,6 +530,9 @@ After that, from the plan:
     committed GPU pool could not be created (error 1455). Suspect: host heaps opened over title
     memory (`OpenExistingHeapFromAddress` / `FromFileMapping`) or driver allocations not
     released at exit. Check `\Memory\Committed Bytes` before and after a run after a reboot.
+    A run without the committed GPU pool (it could not be made) and without GPU windows did
+    not grow the commit (58.42 -> 58.37 GiB): the leak likely comes with the pool's opened
+    heap or the windows.
   * It still sits on the black boot screen, in the game's "System Init" state (its own crash
     report, `userdata\temp\*.crash.log`, names the state; it also says "Anaconda", Series X).
 * **Next: why the boot sequence does not move on.** The frame loop runs, but the game keeps
