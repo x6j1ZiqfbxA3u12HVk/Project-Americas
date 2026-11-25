@@ -804,3 +804,12 @@ Then the larger pieces before the 3D world shows:
   dispatches that write them.
 * The menu text arriving letter by letter is settling, not a bug (the user watched it fill
   in).
+* **The green intro screen was uncompiled compute programs, not textures.**
+  * During the intro, two 4-vertex draws (slot 57 bundles `db5a5d…`, `efeabc…`) and the
+    compute programs behind them were waiting. The game had listed them in
+    `wanted-first.txt` (`f714…`, `3061…`), and no precompile had run since.
+  * Once compiled, the green is gone. Captures at frames 1100 and 1300 show the start
+    screen; whether the video itself plays is not confirmed yet.
+  * **Habit: after a run that reached new screens, run `am-shaders precompile`.** Round 0
+    does what the game waited for, in minutes.
+  * Do not run two precompiles at once.
