@@ -156,7 +156,7 @@ Set-Location "C:\Users\Admin\Documents\GitHub\Project Americas"; . .\scripts\env
 | `src/tls_carrier` | `am_tls_1..4.dll`: one TLS slot each for title DLLs |
 | `src/tools/*` | `am-probe`, `am-inspect`, `am-cpuscan`, `am-shaders` |
 | `tests` | unit tests (own tiny runner, `tests/test.h`), the fixture title in `tests/fixtures/title` |
-| `scripts` | `env.ps1` (developer shell), `setup.ps1` (hooks, ini), `check_assets.py` (asset policy); read-only analysis: `import_calls.py` (call sites of a DLL's imports), `vtable_calls.py` (slots called through an interface getter), `symbolize.py` (names our frames in hang and crash reports) |
+| `scripts` | `env.ps1` (developer shell), `setup.ps1` (hooks, ini), `check_assets.py` (asset policy); read-only analysis: `import_calls.py` (call sites of a DLL's imports), `vtable_calls.py` (slots called through an interface getter), `symbolize.py` (names our frames in hang and crash reports), `dxc_corpus.py` (compiles translated HLSL in parallel, with progress) |
 
 `src/runtime` in more detail:
 
@@ -287,7 +287,19 @@ RDNA 2 decoder decodes all 26,084 programs by control flow, checked against LLVM
    * Done since: typed buffers, SDWA/DPP, `v_fma_mix`, permutes, cube ops, atomics, images
      (`shader/image_bindings`: the host maps T# / S# words to heap indices; misses are queued).
    * `am-shaders images` lists every image form; `tsurvey <n> --raw <dir>` writes the HLSL
-     of `n` translated programs instead of compiling them (time them with `dxc.exe`).
+     of `n` translated programs instead of compiling them.
+   * **Open job: compile every translated program once** (checks that all compile, and gives
+     the corpus's DXC time; translator 2, about 3 to 4 hours on 4 cores). Started and stopped
+     on 2026-11-25 so the user can watch it. To run it (resumable; results append to
+     `C:\Project Americas\cache\shaders\dxil\results.tsv`):
+
+     ```powershell
+     & "C:\Project Americas\build\release\bin\am-shaders.exe" tsurvey 3000 --raw "C:\Project Americas\cache\shaders\hlsl\cs"
+     python -I scripts\dxc_corpus.py "C:\Project Americas\cache\shaders\hlsl\cs" --out "C:\Project Americas\cache\shaders\dxil"
+     ```
+
+     When it is done: put the total time, the failures and the slowest programs in PLAN.md 11
+     (M3.2, "Compile time"), which still says the run is under way.
    * Structured control flow is done (`Structurer` in `translate.cpp`; the dispatcher stays
      for irreducible CFGs).
    * Next: the other stages (PS/VS/mesh I/O from the FSSM records), the indirect jumps, and
