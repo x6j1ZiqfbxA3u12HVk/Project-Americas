@@ -132,6 +132,7 @@ TitleMemory::~TitleMemory() {
   }
   for (const auto& [at, v] : views_) placeholders().unmap_view(GetCurrentProcess(), ptr(at), 0);
   if (section_) CloseHandle(section_);
+  if (gpu_section_) CloseHandle(gpu_section_);
 }
 
 // ---- allocations ----
@@ -311,7 +312,11 @@ bool TitleMemory::ensure_pool() {
     SetLastError(ERROR_NOT_ENOUGH_MEMORY);
     return false;
   }
-  const uint64_t bytes = capacity_ * kPage;
+  // The committed pool: at most half the pool, and never more than the cap leaves room for.
+  uint64_t gpu_pages = std::min(options_.gpu_pool_bytes / kPage, capacity_ / 2);
+  if (options_.commit_cap && gpu_pages * kPage > options_.commit_cap / 4) gpu_pages = options_.commit_cap / 4 / kPage;
+  lazy_pages_ = capacity_ - gpu_pages;
+  const uint64_t bytes = lazy_pages_ * kPage;
   section_ = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE | SEC_RESERVE,
                                 static_cast<DWORD>(bytes >> 32), static_cast<DWORD>(bytes), nullptr);
   if (!section_) {
@@ -319,11 +324,54 @@ bool TitleMemory::ensure_pool() {
     capacity_ = 0;
     return false;
   }
+  if (gpu_pages) {
+    const uint64_t gbytes = gpu_pages * kPage;
+    gpu_section_ = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE | SEC_COMMIT,
+                                      static_cast<DWORD>(gbytes >> 32), static_cast<DWORD>(gbytes), nullptr);
+    if (!gpu_section_) {
+      logf("memory: no committed page pool of %s (error %lu); all pages commit on touch", format_bytes(gbytes).c_str(),
+           GetLastError());
+      capacity_ = lazy_pages_;
+    }
+  } else {
+    capacity_ = lazy_pages_;
+  }
   allocated_.assign((capacity_ + 63) / 64, 0);
   committed_.assign((capacity_ + 63) / 64, 0);
-  logf("memory: physical page pool of %s (%llu pages of 64 KiB)", format_bytes(bytes).c_str(),
-       static_cast<unsigned long long>(capacity_));
+  for (uint64_t i = lazy_pages_; i < capacity_; ++i) set_bit(committed_, i);  // committed with the section
+  committed_count_ += capacity_ - lazy_pages_;
+  logf("memory: physical page pool of %s (%llu pages of 64 KiB), %s of them committed for the GPU",
+       format_bytes(capacity_ * kPage).c_str(), static_cast<unsigned long long>(capacity_),
+       format_bytes((capacity_ - lazy_pages_) * kPage).c_str());
   return true;
+}
+
+HANDLE TitleMemory::section_of(uint64_t index, uint64_t* offset) const {
+  if (index < lazy_pages_) {
+    *offset = index * kPage;
+    return section_;
+  }
+  *offset = (index - lazy_pages_) * kPage;
+  return gpu_section_;
+}
+
+HANDLE TitleMemory::gpu_pool_section() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return capacity_ > lazy_pages_ ? gpu_section_ : nullptr;
+}
+
+uint64_t TitleMemory::gpu_pool_pages() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return capacity_ - lazy_pages_;
+}
+
+void TitleMemory::set_view_listener(ViewListener listener) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  listener_ = listener;
+  if (!listener) return;
+  for (const auto& [at, v] : views_) {
+    listener(at, v.size / kPage, v.first >= lazy_pages_ ? static_cast<int64_t>(v.first - lazy_pages_) : -1);
+  }
 }
 
 bool TitleMemory::page_index(uint64_t number, uint64_t* index) const {
@@ -348,10 +396,32 @@ bool TitleMemory::allocate_pages(uint64_t flags, uint64_t count, uint64_t* pages
     SetLastError(ERROR_NOT_ENOUGH_MEMORY);
     return false;
   }
-  uint64_t i = hint_, given = 0;
+  // Pages without flag 0x100 (the game's small batches: descriptors, per-frame data) come from
+  // the committed pool while it has room; the rest (the streaming heap) from the lazy pool.
+  uint64_t lo = 0, hi = lazy_pages_;
+  uint64_t free_gpu = 0;
+  if (!(flags & 0x100) && capacity_ > lazy_pages_) {
+    for (uint64_t i = lazy_pages_; i < capacity_; ++i) free_gpu += !test_bit(allocated_, i);
+    if (free_gpu >= count) lo = lazy_pages_, hi = capacity_;
+  }
+  uint64_t free_here = 0;
+  if (hi == lazy_pages_) {
+    for (uint64_t i = 0; i < lazy_pages_; i += 64) {
+      for (uint64_t k = i; k < std::min(i + 64, lazy_pages_); ++k) free_here += !test_bit(allocated_, k);
+    }
+    if (free_here < count) {
+      logf("memory: %llu physical pages asked for, %llu free in the pool for them", static_cast<unsigned long long>(count),
+           static_cast<unsigned long long>(free_here));
+      ++refused_;
+      SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+      return false;
+    }
+  }
+  uint64_t& hint = lo ? hint_gpu_ : hint_;
+  uint64_t i = std::max(hint, lo), given = 0;
   while (given < count) {
-    if (i >= capacity_) i = 0;
-    if (allocated_[i >> 6] == ~uint64_t{0} && (i & 63) == 0) {
+    if (i >= hi) i = lo;
+    if ((i & 63) == 0 && i + 64 <= hi && allocated_[i >> 6] == ~uint64_t{0}) {
       i += 64;
       continue;
     }
@@ -361,7 +431,7 @@ bool TitleMemory::allocate_pages(uint64_t flags, uint64_t count, uint64_t* pages
     }
     ++i;
   }
-  hint_ = i;
+  hint = i;
   allocated_count_ += count;
   peak_ = std::max(peak_, allocated_count_);
   logf("memory: %s of physical pages (flags 0x%s), %s in use", format_bytes(count * kPage).c_str(), hex(flags).c_str(),
@@ -407,7 +477,9 @@ bool TitleMemory::map_view(uint64_t at, uint64_t pages, uint64_t first) {
   const uint64_t len = pages * kPage;
   // Make [at, at + len) a placeholder of its own; fails harmlessly when it already is one.
   VirtualFree(ptr(at), len, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
-  void* view = placeholders().map_view(section_, GetCurrentProcess(), ptr(at), first * kPage, len, MEM_REPLACE_PLACEHOLDER,
+  uint64_t offset = 0;
+  HANDLE section = section_of(first, &offset);
+  void* view = placeholders().map_view(section, GetCurrentProcess(), ptr(at), offset, len, MEM_REPLACE_PLACEHOLDER,
                               PAGE_READWRITE, nullptr, 0);
   if (view != ptr(at)) {
     logf("memory: cannot map %s of physical pages at 0x%s (error %lu): not a placeholder?", format_bytes(len).c_str(),
@@ -416,6 +488,7 @@ bool TitleMemory::map_view(uint64_t at, uint64_t pages, uint64_t first) {
     return false;
   }
   views_[at] = View{len, first};
+  if (listener_) listener_(at, pages, first >= lazy_pages_ ? static_cast<int64_t>(first - lazy_pages_) : -1);
   uint64_t low = views_low_.load(), high = views_high_.load();
   while (at < low && !views_low_.compare_exchange_weak(low, at)) {
   }
@@ -538,6 +611,7 @@ void TitleMemory::unmap(uint64_t base, uint64_t size) {
   for (; it != views_.end() && it->first < end; ++it) hit.push_back(*it);
   for (const auto& [at, v] : hit) {
     views_.erase(at);
+    if (listener_) listener_(at, v.size / kPage, -1);
     placeholders().unmap_view(GetCurrentProcess(), ptr(at), MEM_PRESERVE_PLACEHOLDER);
     // The parts of the view outside the range stay mapped.
     if (at < base) map_view(at, (base - at) / kPage, v.first);
@@ -570,7 +644,7 @@ void* TitleMemory::map_pages(void* address, uint64_t count, const uint64_t* page
   unmap(a, count * kPage);
   for (uint64_t k = 0; k < count;) {
     uint64_t run = 1;
-    while (k + run < count && index[k + run] == index[k] + run) ++run;
+    while (k + run < count && index[k + run] == index[k] + run && (index[k] < lazy_pages_) == (index[k + run] < lazy_pages_)) ++run;
     if (!map_view(a + k * kPage, run, index[k])) {
       unmap(a, k * kPage);
       ++refused_;
@@ -628,10 +702,13 @@ bool TitleMemory::write_pages(const uint64_t* pages, uint64_t page_count, uint64
   uint64_t done = 0, within = offset % kPage;
   for (size_t k = 0; k < index.size();) {
     size_t run = 1;
-    while (k + run < index.size() && index[k + run] == index[k] + run) ++run;
+    while (k + run < index.size() && index[k + run] == index[k] + run && (index[k] < lazy_pages_) == (index[k + run] < lazy_pages_)) {
+      ++run;
+    }
     const uint64_t len = run * kPage;
-    const uint64_t at = index[k] * kPage;
-    void* view = MapViewOfFile(section_, FILE_MAP_WRITE, static_cast<DWORD>(at >> 32), static_cast<DWORD>(at), len);
+    uint64_t at = 0;
+    HANDLE section = section_of(index[k], &at);
+    void* view = MapViewOfFile(section, FILE_MAP_WRITE, static_cast<DWORD>(at >> 32), static_cast<DWORD>(at), len);
     if (!view || !VirtualAlloc(view, len, MEM_COMMIT, PAGE_READWRITE)) {
       const DWORD error = GetLastError();
       if (view) UnmapViewOfFile(view);

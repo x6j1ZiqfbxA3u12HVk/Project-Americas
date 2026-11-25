@@ -12,8 +12,10 @@
 //   shader heap [0]      the page table (raw, 64 MiB)
 //   shader heap [1 + n]  window n (raw, writable)
 //
-// Physical pages (the streaming heaps, plan 5.2 class B) cannot be opened in place: a section
-// committed on touch is refused. They get VRAM copies instead (to come).
+// Physical pages come from two pools (memory/title_memory.h). The committed pool (the game's
+// small batches: descriptors, per-frame data) is one window too; the title memory reports every
+// view of its pages and the page table follows. The pool committed on touch (the streaming
+// heap) cannot be opened in place: its pages get VRAM copies instead (to come).
 //
 // Translated programs use one root signature: 32 root constants at b0 (the user data SGPRs),
 // views from the shader heap by index.

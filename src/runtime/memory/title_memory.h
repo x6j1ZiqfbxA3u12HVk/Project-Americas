@@ -31,6 +31,9 @@ struct MemoryOptions {
   uint64_t physical_bytes = 0;  // size of the physical page pool
   uint64_t commit_cap = 0;      // 0: none; else the pool's commit plus the process's private
                                 // commit stays below it (a job's limit counts only the latter)
+  // Of it, the part committed up front, which the GPU can open in place (a section committed on
+  // touch cannot be): pages allocated without flag 0x100 come from it while it has room.
+  uint64_t gpu_pool_bytes = 1ull << 30;
 };
 
 struct MemoryStats {
@@ -88,6 +91,15 @@ class TitleMemory {
 
   MemoryStats stats() const;
 
+  // The GPU's view of physical pages: the committed pool's section (null until pages exist),
+  // its size in pages, and every mapping change of views: `pool_page` is the first page's index
+  // in the committed pool, or -1 when the pages are unmapped or in the lazy pool. The listener
+  // runs under the title memory's lock and must not call back into it.
+  using ViewListener = void (*)(uint64_t address, uint64_t pages, int64_t pool_page);
+  HANDLE gpu_pool_section() const;
+  uint64_t gpu_pool_pages() const;
+  void set_view_listener(ViewListener listener);  // also called now for the views there are
+
  private:
   struct Region {
     uint64_t size = 0;
@@ -121,7 +133,13 @@ class TitleMemory {
   std::map<uint64_t, Region> regions_;  // by base; never overlapping
   std::map<uint64_t, View> views_;      // by address; never overlapping
 
-  HANDLE section_ = nullptr;
+  HANDLE section_ = nullptr;      // the lazy pool: pages [0, lazy_pages_)
+  HANDLE gpu_section_ = nullptr;  // the committed pool: pages [lazy_pages_, capacity_)
+  uint64_t lazy_pages_ = 0;
+  uint64_t hint_gpu_ = 0;
+  ViewListener listener_ = nullptr;
+  // The section holding pool page `index`, and its offset there.
+  HANDLE section_of(uint64_t index, uint64_t* offset) const;
   uint64_t capacity_ = 0;  // pages
   std::vector<uint64_t> allocated_, committed_;  // bitmaps over the pool
   uint64_t allocated_count_ = 0, committed_count_ = 0, peak_ = 0, hint_ = 0;

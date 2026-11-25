@@ -196,14 +196,14 @@ TEST_CASE(memory_physical_pages_commit_on_first_touch) {
   void* a = memory.allocate(request(0, kMiB, 0x20402000, 0x21, PAGE_READWRITE));
   void* b = memory.allocate(request(0, kMiB, 0x20402000, 0x21, PAGE_READWRITE));
   uint64_t pages[3] = {};
-  CHECK(a && b && memory.allocate_pages(0, 3, pages));
+  CHECK(a && b && memory.allocate_pages(0x380, 3, pages));  // flag 0x100: the pool committed on touch
   CHECK(memory.map_pages(a, 3, pages) == a);
   CHECK(memory.in_physical_view(at(a, 2 * kPage64K + 5)) && !memory.in_physical_view(at(a, 3 * kPage64K)));
-  CHECK(memory.stats().physical_committed == 0);
+  const uint64_t base_commit = memory.stats().physical_committed;  // the GPU pool's, committed up front
 
   // A write commits its page only.
   *at(a, kPage64K + 7) = 0x33;
-  CHECK(memory.stats().physical_committed == kPage64K);
+  CHECK(memory.stats().physical_committed == base_commit + kPage64K);
   // A page touched through one view is committed in every view of it, at once.
   CHECK(memory.map_pages(b, 1, pages + 1) == b);
   CHECK(state(b) == MEM_COMMIT && *at(b, 7) == 0x33);
@@ -211,7 +211,7 @@ TEST_CASE(memory_physical_pages_commit_on_first_touch) {
   // What the kernel will touch is committed up front: here pages 0 and 2, not 1 again.
   CHECK(memory.commit_range(at(a, kPage64K - 1), kPage64K + 2));
   CHECK(state(a) == MEM_COMMIT && state(at(a, 2 * kPage64K)) == MEM_COMMIT);
-  CHECK(memory.stats().physical_committed == 3 * kPage64K);
+  CHECK(memory.stats().physical_committed == base_commit + 3 * kPage64K);
   CHECK(memory.commit_range(at(a, 5 * kPage64K), 100));  // outside every view: nothing to do
 
   CHECK(memory.free(a, 0, MEM_RELEASE) && memory.free(b, 0, MEM_RELEASE));
@@ -250,4 +250,38 @@ TEST_CASE(console_profile_choice) {
   CHECK(choose_console("series_x", 8 * kGiB, &c) && c == Console::SeriesX);
   CHECK(!choose_console("series_z", 8 * kGiB, &c));
   CHECK(profile_of(Console::SeriesX).title_memory == 13 * kGiB + 512 * kMiB);
+}
+
+// Pages without flag 0x100 come from the pool committed up front, which the GPU opens in place:
+// mapped, they are there at once, and the listener hears where each view's pages sit.
+namespace {
+uint64_t g_heard_address = 0, g_heard_pages = 0;
+int64_t g_heard_pool_page = -2;
+void hear(uint64_t address, uint64_t pages, int64_t pool_page) {
+  g_heard_address = address;
+  g_heard_pages = pages;
+  g_heard_pool_page = pool_page;
+}
+}  // namespace
+
+TEST_CASE(memory_gpu_pool_pages_are_committed_and_reported) {
+  TitleMemory memory({16 * kPage64K, 0});
+  memory.set_view_listener(&hear);
+  void* a = memory.allocate(request(0, kMiB, 0x20402000, 0x21, PAGE_READWRITE));
+  uint64_t pages[2] = {};
+  CHECK(a && memory.allocate_pages(0x280, 2, pages));
+  CHECK(memory.gpu_pool_section() != nullptr && memory.gpu_pool_pages() == 8);
+  CHECK(memory.map_pages(a, 2, pages) == a);
+  CHECK(state(a) == MEM_COMMIT);  // no fault needed
+  CHECK(g_heard_address == addr(a) && g_heard_pages == 2 && g_heard_pool_page >= 0);
+  *at(a, kPage64K + 3) = 0x77;
+  CHECK(*at(a, kPage64K + 3) == 0x77);
+  CHECK(memory.map_pages(a, 2, nullptr) == a);
+  CHECK(g_heard_pool_page == -1);  // unmapped
+  // The streaming kind (0x100) still commits on touch.
+  uint64_t lazy = 0;
+  CHECK(memory.allocate_pages(0x380, 1, &lazy) && memory.map_pages(a, 1, &lazy) == a);
+  CHECK(state(a) == MEM_RESERVE && g_heard_pool_page == -1);
+  memory.set_view_listener(nullptr);
+  CHECK(memory.free(a, 0, MEM_RELEASE));
 }
