@@ -78,8 +78,10 @@ bool load_precompiled(const std::string& marker, std::vector<uint8_t>& dxil) {
     static std::mutex lock;
     static std::set<std::string> told;
     std::lock_guard g(lock);
-    if (told.insert(marker).second && told.size() <= 64) {
-      logf("gpu: no precompiled shader %s (run am-shaders precompile)", marker.c_str());
+    if (told.insert(marker).second) {
+      if (told.size() <= 64) logf("gpu: no precompiled shader %s (run am-shaders precompile)", marker.c_str());
+      // The precompile does the programs the game waited for first.
+      std::ofstream(file.parent_path() / "wanted-first.txt", std::ios::app) << marker << "\n";
     }
     return false;
   }

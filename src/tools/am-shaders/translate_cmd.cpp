@@ -322,36 +322,78 @@ int precompile(const fs::path& pack_dir, const fs::path& runtime_dir, const fs::
   SetPriorityClass(GetCurrentProcess(), BELOW_NORMAL_PRIORITY_CLASS);
   std::error_code ec;
   fs::create_directories(out_dir, ec);
-  // The programs the game has used: the GPU programs of its slot 57 pipelines (by marker).
-  std::set<std::string> wanted;
+  // The programs the game has used: the GPU programs of its console pipelines (slots 57 and 67,
+  // saved as .cpipe bundles), by marker. Bundles read before are listed in cpipe-index.tsv (the
+  // bundle's name, a tab, its markers), so a pass reads only the new ones.
+  std::set<std::string> wanted, indexed;
   std::vector<fs::path> files;
-  for (const auto& e : fs::directory_iterator(runtime_dir, ec)) {
-    if (e.path().extension() == L".dxbc") files.push_back(e.path());
-    if (e.path().extension() != L".cpipe") continue;
-    std::string error;
-    auto view = FileView::open(e.path(), error);
-    if (!view) continue;
-    const auto b = view->bytes();
-    for (size_t at = 0; at + 16 <= b.size();) {
-      uint64_t address;
-      uint32_t size, kind;
-      std::memcpy(&address, b.data() + at, 8);
-      std::memcpy(&size, b.data() + at + 8, 4);
-      std::memcpy(&kind, b.data() + at + 12, 4);
-      at += 16;
-      if (kind == 1 && at + 24 <= b.size()) wanted.insert(marker_of(b.subspan(at, 24)));
-      at += size;
+  {
+    std::ifstream in(out_dir / L"cpipe-index.tsv");
+    for (std::string line; std::getline(in, line);) {
+      const size_t tab = line.find('\t');
+      if (tab == std::string::npos) continue;
+      indexed.insert(line.substr(0, tab));
+      for (size_t at = tab + 1; at < line.size();) {
+        const size_t comma = std::min(line.find(',', at), line.size());
+        if (comma > at) wanted.insert(line.substr(at, comma - at));
+        at = comma + 1;
+      }
+    }
+  }
+  size_t new_bundles = 0;
+  {
+    std::ofstream index(out_dir / L"cpipe-index.tsv", std::ios::app);
+    for (const auto& e : fs::directory_iterator(runtime_dir, ec)) {
+      if (e.path().extension() == L".dxbc") files.push_back(e.path());
+      if (e.path().extension() != L".cpipe") continue;
+      const std::string name = narrow(e.path().filename().wstring());
+      if (indexed.count(name)) continue;
+      std::string error;
+      auto view = FileView::open(e.path(), error);
+      if (!view) continue;
+      const auto b = view->bytes();
+      std::string markers;
+      for (size_t at = 0; at + 16 <= b.size();) {
+        uint64_t address;
+        uint32_t size, kind;
+        std::memcpy(&address, b.data() + at, 8);
+        std::memcpy(&size, b.data() + at + 8, 4);
+        std::memcpy(&kind, b.data() + at + 12, 4);
+        at += 16;
+        if (kind == 1 && at + 24 <= b.size()) {
+          const std::string m = marker_of(b.subspan(at, 24));
+          wanted.insert(m);
+          markers += (markers.empty() ? "" : ",") + m;
+        }
+        at += size;
+      }
+      index << name << '\t' << markers << '\n';
+      ++new_bundles;
+    }
+  }
+  // The programs the game waited for (the runtime lists them in wanted-first.txt): compiled
+  // before everything else.
+  std::set<std::string> first;
+  {
+    std::ifstream in(out_dir / L"wanted-first.txt");
+    for (std::string m; std::getline(in, m);) {
+      if (!m.empty() && !fs::exists(out_dir / widen(m + ".dxil"), ec)) first.insert(m);
     }
   }
   for (const fs::path& f : containers(pack_dir)) files.push_back(f);
-  std::printf("precompile: %zu programs wanted from the game's pipelines, %zu containers to look through%s\n", wanted.size(),
-              files.size(), all ? " (all of their programs)" : "");
+  std::printf("precompile: %zu programs wanted from the game's pipelines (%zu new bundles read), %zu the game waited for "
+              "first, %zu containers to look through%s\n",
+              wanted.size(), new_bundles, first.size(), files.size(), all ? " (all of their programs)" : "");
+  std::fflush(stdout);
   std::atomic<size_t> next{0}, done{0}, skipped{0}, failed{0};
   std::mutex lock;
   std::ofstream failures(out_dir / L"failures.tsv", std::ios::app);
+  // Round 0, when the game waited for some programs: those alone. Round 1: everything else.
+  for (int round = first.empty() ? 1 : 0; round < 2; ++round) {
+  next = 0;
   std::vector<std::thread> workers;
   for (unsigned w = 0; w < std::max(1u, std::thread::hardware_concurrency()); ++w) {
-    workers.emplace_back([&] {
+    workers.emplace_back([&, round] {
       for (size_t i; (i = next.fetch_add(1)) < files.size();) {
         const bool runtime_file = files[i].parent_path() == runtime_dir;
         std::string error;
@@ -361,6 +403,7 @@ int precompile(const fs::path& pack_dir, const fs::path& runtime_dir, const fs::
           for (const shader::NativeProgram& p : b.programs) {
             if (p.stage != shader::HwStage::Vs && p.stage != shader::HwStage::Ps && p.stage != shader::HwStage::Cs) continue;
             const std::string marker = marker_of(b.code(p));
+            if (round == 0 && !first.count(marker)) continue;
             if (!all && !runtime_file && !wanted.count(marker)) continue;
             const fs::path out = out_dir / widen(marker + ".dxil");
             const bool have = fs::exists(out, ec);
@@ -397,12 +440,19 @@ int precompile(const fs::path& pack_dir, const fs::path& runtime_dir, const fs::
             std::ofstream(out, std::ios::binary).write(reinterpret_cast<const char*>(c.dxil.data()), static_cast<std::streamsize>(c.dxil.size()));
             ++done;
             std::printf("  %s %s\n", shader::hw_stage_name(p.stage), marker.c_str());
+            std::fflush(stdout);
           }
         }
       }
     });
   }
   for (std::thread& t : workers) t.join();
+  if (round == 0) {
+    std::printf("precompile: the programs the game waited for are done (%zu compiled, %zu failed so far)\n", done.load(),
+                failed.load());
+    std::fflush(stdout);
+  }
+  }
   std::printf("precompile: %zu compiled, %zu there already, %zu failed (%s)\n", done.load(), skipped.load(), failed.load(),
               narrow((out_dir / L"failures.tsv").wstring()).c_str());
   return 0;
