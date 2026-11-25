@@ -19,6 +19,7 @@
 #include <mutex>
 #include <string>
 
+#include "runtime/d3d12x/bindings.h"
 #include "runtime/d3d12x/commands.h"
 #include "runtime/d3d12x/d3d12x.h"
 #include "runtime/d3d12x/gpu_memory.h"
@@ -76,6 +77,7 @@ struct HostList {
   uint64_t args[kParams] = {};
   std::vector<uint32_t> constants[kParams];
   bool bound = false;  // the translated root signature and heap are set in the host list
+  bool flushed = false;  // it holds the image bindings' upkeep (and their misses' readback)
 };
 
 struct CommandList : Object {
@@ -175,6 +177,7 @@ ID3D12GraphicsCommandList* host_begin(CommandList* l) {
   h.ready = false;
   h.states.clear();
   h.bound = false;
+  h.flushed = false;
   return h.list.Get();
 }
 
@@ -269,8 +272,8 @@ bool track(HostList& h, const Recording& r, const Command& c) {
 
 std::atomic<uint64_t> g_draws_run{0}, g_draws_skipped{0};
 
-// A draw, when its pipeline has a host pipeline: the translated root signature and heap, each
-// stage's user data, the draw.
+// A draw, when its pipeline has a host pipeline: the translated root signature and heaps, the
+// image binding table, each stage's user data, the draw.
 void draw(HostList& h, ID3D12GraphicsCommandList* list, const Command& c) {
   const void* rs_object = nullptr;
   ID3D12PipelineState* pso = host_pipeline(h.pipeline, &rs_object);
@@ -281,9 +284,17 @@ void draw(HostList& h, ID3D12GraphicsCommandList* list, const Command& c) {
   }
   if (!h.bound) {
     flush_page_table(list);
-    ID3D12DescriptorHeap* heaps[] = {translated_shader_heap()};
-    list->SetDescriptorHeaps(1, heaps);
+    flush_bindings(list);  // builds the table first: it is never bound null
+    h.flushed = true;
+    const D3D12_GPU_VIRTUAL_ADDRESS table = bindings_table();
+    ID3D12DescriptorHeap* heaps[] = {translated_shader_heap(), sampler_heap()};
+    if (!table || !heaps[0] || !heaps[1]) {
+      ++g_draws_skipped;
+      return;
+    }
+    list->SetDescriptorHeaps(2, heaps);
     list->SetGraphicsRootSignature(translated_graphics_root_signature());
+    list->SetGraphicsRootUnorderedAccessView(2, table);
     h.bound = true;
   }
   uint32_t vs[kUserDataConstants] = {}, ps[kUserDataConstants] = {};
@@ -551,10 +562,13 @@ void submit_lists(UINT count, void* const* lists) {
   }
   if (host_lists.empty()) return;
   const uint64_t done = gpu->submit(static_cast<UINT>(host_lists.size()), host_lists.data());
+  bool flushed = false;
   for (HostList* h : owners) {
     h->allocators[h->current].fence = done;
     h->ready = false;
+    flushed = flushed || h->flushed;
   }
+  if (flushed) bindings_submitted(done);  // the misses' readback is in these lists
 }
 
 void frame_execute(const void* list) {

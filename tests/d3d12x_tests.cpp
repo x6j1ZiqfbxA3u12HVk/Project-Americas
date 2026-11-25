@@ -9,6 +9,7 @@
 
 #include "runtime/d3d12x/commands.h"
 #include "runtime/d3d12x/d3d12x.h"
+#include "runtime/d3d12x/bindings.h"
 #include "runtime/d3d12x/gpu_memory.h"
 #include "runtime/memory/title_memory.h"
 #include "runtime/d3d12x/host.h"
@@ -510,9 +511,11 @@ TEST_CASE(d3d12x_translated_program_uses_title_memory_in_place) {
   gpu->device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&alloc));
   gpu->device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc.Get(), pso.Get(), IID_PPV_ARGS(&list));
   flush_page_table(list.Get());
-  ID3D12DescriptorHeap* heaps[] = {translated_shader_heap()};
-  list->SetDescriptorHeaps(1, heaps);
+  flush_bindings(list.Get());
+  ID3D12DescriptorHeap* heaps[] = {translated_shader_heap(), sampler_heap()};
+  list->SetDescriptorHeaps(2, heaps);
   list->SetComputeRootSignature(root);
+  list->SetComputeRootUnorderedAccessView(1, bindings_table());  // the image binding table, u0
   const uint64_t in_at = reinterpret_cast<uint64_t>(mem), out_at = in_at + 0x100;
   uint32_t user[kUserDataConstants] = {static_cast<uint32_t>(in_at), static_cast<uint32_t>(in_at >> 32),
                                        static_cast<uint32_t>(out_at), static_cast<uint32_t>(out_at >> 32)};

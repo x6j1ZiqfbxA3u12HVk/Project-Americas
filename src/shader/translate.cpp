@@ -1684,7 +1684,8 @@ void am_store_masked(uint64_t a, uint x, uint m) {
 // window of the title allocation holding them. Addresses with no window read 0 and drop
 // stores.
 const char* kRuntimeBinding = R"(
-cbuffer am_args : register(b0) { uint4 am_user[8]; };
+cbuffer am_args : register(b0) { uint4 am_user[5]; };
+RWByteAddressBuffer am_bindings : register(u0);  // image_bindings.h, kept by the runtime
 uint am_entry(uint64_t a) {
   if ((a >> 40) != 0) return 0u;
   ByteAddressBuffer t = ResourceDescriptorHeap[0];
@@ -2546,7 +2547,7 @@ Translation finish_graphics(const TranslateInput& in, const Ctx& c, Translation 
   h += "  uint am_dpp = 0u;\n  bool am_dpp_on = true;\n";
   for (const uint32_t r : c.image_vars) h += "  AmImage am_im_" + num(r) + " = (AmImage)0;\n";
   for (const uint32_t r : c.sampler_vars) h += "  AmSampler am_sm_" + num(r) + " = (AmSampler)0;\n";
-  for (uint32_t i = 0; i < std::min<uint32_t>(in.user_sgprs, 32); ++i) {
+  for (uint32_t i = 0; i < std::min<uint32_t>(in.user_sgprs, binding == Binding::Runtime ? 20u : 32u); ++i) {
     h += "  s[" + num(i) + "] = am_user[" + num(i / 4) + "][" + num(i % 4) + "];\n";
   }
   if (vs) {
@@ -2685,11 +2686,6 @@ Translation translate(const TranslateInput& in, Binding binding) {
     blocks.back().code += "      return;\n";
   }
   if (!tr.unsupported.empty()) return tr;
-  if (binding == Binding::Runtime && c.uses_images) {
-    tr.failure = "images in the runtime binding (to come)";
-    tr.unsupported[tr.failure] = 1;
-    return tr;
-  }
   std::string body;
   bool uses_br = false;
   tr.structured = Structurer(blocks).run(body, uses_br);
@@ -2721,7 +2717,7 @@ Translation translate(const TranslateInput& in, Binding binding) {
   h += "  uint am_dpp = 0u;\n  bool am_dpp_on = true;\n";
   for (const uint32_t r : c.image_vars) h += "  AmImage am_im_" + num(r) + " = (AmImage)0;\n";
   for (const uint32_t r : c.sampler_vars) h += "  AmSampler am_sm_" + num(r) + " = (AmSampler)0;\n";
-  for (uint32_t i = 0; i < user; ++i) h += "  s[" + num(i) + "] = am_user[" + num(i / 4) + "][" + num(i % 4) + "];\n";
+  for (uint32_t i = 0; i < (binding == Binding::Runtime ? std::min(user, 20u) : user); ++i) h += "  s[" + num(i) + "] = am_user[" + num(i / 4) + "][" + num(i % 4) + "];\n";
   uint32_t next_s = user;
   for (int k = 0; k < 3; ++k) {
     if ((in.cs_rsrc2 >> (7 + k)) & 1) h += "  s[" + num(next_s++) + "] = am_gid[" + num(k) + "];\n";

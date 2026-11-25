@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <cstring>
 
+#include "runtime/d3d12x/bindings.h"
 #include "runtime/d3d12x/d3d12x.h"
 #include "runtime/d3d12x/formats.h"
 #include "runtime/d3d12x/layout.h"
@@ -197,8 +198,15 @@ void write_shader_view(uint64_t dest, const D3D12_RESOURCE_DESC* resource, const
     std::memcpy(reinterpret_cast<void*>(dest), v, sizeof v);
     return;
   }
-  write_record(dest, ViewKind::Srv, view.Format, address);
-  (void)resource;
+  // A texture: a real T# (the translated shaders find it in the binding table), with its host
+  // texture made from the title's memory.
+  if (!resource) {
+    write_record(dest, ViewKind::Srv, view.Format, address);
+    return;
+  }
+  uint32_t words[8] = {};
+  bind_texture_view(*resource, view, address, words);
+  std::memcpy(reinterpret_cast<void*>(dest), words, sizeof words);
 }
 
 bool read_view(uint64_t descriptor, ViewInfo& out) {

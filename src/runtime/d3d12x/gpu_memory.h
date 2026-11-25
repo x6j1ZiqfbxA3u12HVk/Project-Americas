@@ -10,15 +10,16 @@
 // The translator's runtime binding reads it (shader/translate.cpp, kRuntimeBinding):
 //
 //   shader heap [0]      the page table (raw, 64 MiB)
-//   shader heap [1 + n]  window n (raw, writable)
+//   shader heap [1 + n]  window n (raw, writable), from the bottom up
+//   shader heap [top]    texture views (bindings.cpp), from the top down
 //
 // Physical pages come from two pools (memory/title_memory.h). The committed pool (the game's
 // small batches: descriptors, per-frame data) is one window too; the title memory reports every
 // view of its pages and the page table follows. The pool committed on touch (the streaming
 // heap) cannot be opened in place: its pages get VRAM copies instead (to come).
 //
-// Translated programs use one root signature: 32 root constants at b0 (the user data SGPRs),
-// views from the shader heap by index.
+// Translated programs use one root signature: 20 root constants at b0 (the user data SGPRs) and
+// the image binding table as root UAV u0 (bindings.h); views from the shader heap by index.
 
 #include <windows.h>
 #include <d3d12.h>
@@ -28,7 +29,7 @@
 namespace am::rt::d3d12x {
 
 constexpr uint32_t kPageTableIndex = 0;
-constexpr uint32_t kUserDataConstants = 32;
+constexpr uint32_t kUserDataConstants = 20;
 
 // Opens the window of the title allocation holding `address` (if it is not open yet); false
 // when the address is not in one we can open.
@@ -37,9 +38,12 @@ bool open_gpu_window(uint64_t address);
 // host GPU.
 ID3D12DescriptorHeap* translated_shader_heap();
 ID3D12RootSignature* translated_root_signature();
-// Graphics: the vertex stage's user data at root parameter 0, the pixel stage's at 1 (both b0,
-// 32 constants, each visible to its stage).
+// Compute: user data at root parameter 0, the binding table at 1. Graphics: the vertex stage's
+// user data at root parameter 0, the pixel stage's at 1 (both b0, 20 constants, each visible to
+// its stage), the binding table at 2.
 ID3D12RootSignature* translated_graphics_root_signature();
+// A shader heap index for a texture view (and its CPU handle); 0 when the heap is full.
+uint32_t allocate_view_slot(D3D12_CPU_DESCRIPTOR_HANDLE* handle);
 // Records the page table's pending updates into `list` (before work that reads them).
 void flush_page_table(ID3D12GraphicsCommandList* list);
 

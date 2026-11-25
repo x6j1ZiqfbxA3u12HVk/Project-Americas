@@ -21,6 +21,7 @@
 #include "runtime/log.h"
 #include "runtime/present/host_gpu.h"
 #include "runtime/process.h"
+#include "shader/translate.h"
 #include "shader/console_program.h"
 #include "shader/container.h"
 
@@ -69,7 +70,9 @@ std::string program_marker(std::span<const uint8_t> container, uint32_t subobjec
 bool load_precompiled(const std::string& marker, std::vector<uint8_t>& dxil) {
   TitleProcess* p = process();
   if (marker.empty() || !p || p->cache_dir().empty()) return false;
-  const std::filesystem::path file = p->cache_dir() / "shaders" / "dxil" / "rt" / (marker + ".dxil");
+  // One folder a translator version (rt<N>): DXIL from an older translator is never loaded.
+  const std::filesystem::path file =
+      p->cache_dir() / "shaders" / "dxil" / ("rt" + std::to_string(shader::kTranslatorVersion)) / (marker + ".dxil");
   std::ifstream in(file, std::ios::binary);
   if (!in) {
     static std::mutex lock;

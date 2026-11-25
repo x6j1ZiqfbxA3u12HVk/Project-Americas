@@ -313,20 +313,14 @@ RDNA 2 decoder decodes all 26,084 programs by control flow, checked against LLVM
      (`shader/image_bindings`: the host maps T# / S# words to heap indices; misses are queued).
    * `am-shaders images` lists every image form; `tsurvey <n> --raw <dir>` writes the HLSL
      of `n` translated programs instead of compiling them.
-   * **Open job: compile every translated program once** (checks that all compile, and gives
-     the corpus's DXC time; translator 2, about 3 to 4 hours on 4 cores). Started and stopped
-     on 2026-11-25 so the user can watch it. To run it (resumable; results append to
-     `C:\Project Americas\cache\shaders\dxil\results.tsv`):
+   * **Done (2026-11-25): every translated program compiled once** with
+     `scripts\dxc_corpus.py` (translator 2, the 2,070 of that day): all compile, none fail,
+     2 h 22 min on 4 cores. To compile what translates now (it skips unchanged files):
 
      ```powershell
      & "C:\Project Americas\build\release\bin\am-shaders.exe" tsurvey 3000 --raw "C:\Project Americas\cache\shaders\hlsl\cs"
      python -I scripts\dxc_corpus.py "C:\Project Americas\cache\shaders\hlsl\cs" --out "C:\Project Americas\cache\shaders\dxil"
      ```
-
-     When it is done: put the total time, the failures and the slowest programs in PLAN.md 11
-     (M3.2, "Compile time"), which still says the run is under way. The run covers the 2,070
-     programs translated then; rerunning both commands adds the 416 the LDS, D16 and
-     16-bit work brought in (and recompiles those whose f16 code changed) (`--raw` leaves unchanged files alone, so the rest are skipped).
    * Structured control flow is done (`Structurer` in `translate.cpp`; the dispatcher stays
      for irreducible CFGs).
    * Next: the other stages (PS/VS/mesh I/O from the FSSM records), the indirect jumps, and
@@ -443,3 +437,45 @@ RDNA 2 decoder decodes all 26,084 programs by control flow, checked against LLVM
 * **PowerShell after `. .\scripts\env.ps1`:** the script sets `$ErrorActionPreference = 'Stop'`
   for the session, so a native program writing to stderr ends the command. Run programs that
   log to stderr (the tests, `americas.exe`) through `cmd /c "... 2>nul"` or with redirects.
+
+## Images in the runtime binding (done, 2026-11-25)
+
+Translated shaders read textures and samplers through the binding table the runtime keeps
+(translator 4):
+
+* `shader/translate.cpp`: the runtime prelude is `am_user[5]` (20 user SGPRs) at b0 plus
+  `am_bindings` at u0.
+* `d3d12x/gpu_memory`: 20 user constants; the binding table is root UAV u0 (compute: param 1;
+  graphics: VS b0 = 0, PS b0 = 1, table = 2). `allocate_view_slot` hands out shader heap
+  indices for texture views from the top (65535 down) while windows grow from 1.
+* `d3d12x/bindings`: the table as a GPU buffer, a 2048-entry sampler heap (S# misses become
+  host samplers), host textures from texture views (uploaded from title memory by layout.h's
+  linear layout: **no detiling yet**), dirty marks, the misses' readback after the fence.
+* `list.cpp`: the first draw of a list flushes the page table and the bindings, sets both
+  heaps, the root signature and the table; `submit_lists` reports the fence of lists that
+  carry the flush.
+* `views.cpp`: texture SRVs write a real T# (`bind_texture_view`); buffers as before.
+* Writes the textures see: plain-address DirectStorage reads and XG `CopyIntoSubresource`.
+  DirectStorage reads into physical pages are not reported yet (their virtual addresses are
+  not known there).
+* Precompiled shaders live in `cache\shaders\dxil\rt<translator version>` (both
+  `am-shaders precompile` and `host_pipeline.cpp`). For translator 4: 947 compiled in 6 min,
+  18 refused for instructions not translated yet (`global_atomic_fmax/fmin`, depth export
+  `exp` target 8, `buffer_load_ushort`, `ds_write_b64`, `ds_bpermute_b32`,
+  `v_mad_u64_u32`, `v_lshrrev_b64`; `rt4\failures.tsv`).
+* **The game run (120 s):** the frame loop runs to the timeout, no crash; 16 host textures
+  made from the game's views (a 256x128 and 1x1 ones), no T# reported missing; the stream draw
+  (slot 86) runs every frame. The slot 57 and slot 55 draws still wait: host pipelines exist
+  only for stream pipelines so far, so the textured UI draw cannot be checked yet.
+
+After that, from the plan:
+
+* **Next:** slot 57 PSO state from metadata block 0 (0x184 bytes) and its input layout from
+  block 1. Then check the UI draw: sga_dr_vs_pos_color_tex + default_ps_tex, whose S# is
+  built inline (s0=1024, s1=0x00c00000, s2=0x18f00000, s3=0).
+* VB/IB views from console addresses.
+* Slot 55's shaders.
+* GFX10 detiling for textures.
+* Depth export (exp target 8).
+* The missing CS ops.
+* Record pypdf (tools/pylib) in PLAN.md "Local tools".

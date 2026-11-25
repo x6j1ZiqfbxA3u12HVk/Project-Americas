@@ -17,6 +17,7 @@
 #include <atomic>
 #include <cstring>
 
+#include "runtime/d3d12x/bindings.h"
 #include "runtime/d3d12x/d3d12x.h"
 #include "runtime/d3d12x/layout.h"
 #include "runtime/d3d12x/object.h"
@@ -53,6 +54,7 @@ HRESULT WINAPI copy_into_subresource(TextureComputer* self, void* memory, UINT p
                   std::min<uint64_t>(row_bytes, row_pitch ? row_pitch : row_bytes));
     }
   }
+  notify_title_write(reinterpret_cast<uint64_t>(to), slice_bytes * s.depth);  // its texture is uploaded again
   return S_OK;
 }
 

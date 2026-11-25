@@ -21,7 +21,7 @@ using Microsoft::WRL::ComPtr;
 constexpr uint64_t kPage = 64 * 1024;
 constexpr uint64_t kAddressBits = 40;
 constexpr uint64_t kTableEntries = (uint64_t{1} << kAddressBits) / kPage;  // 16 Mi entries, 64 MiB
-constexpr uint32_t kHeapSize = 65536;                                       // views of windows (later: textures too)
+constexpr uint32_t kHeapSize = 65536;  // windows from index 1 up, texture views from the top down
 
 struct Window {
   uint64_t base = 0, size = 0;
@@ -43,6 +43,7 @@ struct GpuMemory {
   std::mutex pending_lock;
   std::vector<std::pair<uint64_t, std::vector<uint32_t>>> pending;
   UINT step = 0;
+  uint32_t next_view = kHeapSize;  // the lowest index handed out to a texture view so far
   uint32_t pool_window = 0;  // the committed physical page pool's window, once opened
 
   bool start() {
@@ -68,12 +69,14 @@ struct GpuMemory {
     sv.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
     device->CreateShaderResourceView(table.Get(), &sv, heap->GetCPUDescriptorHandleForHeapStart());
 
-    D3D12_ROOT_PARAMETER1 param{};
-    param.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-    param.Constants = {0, 0, kUserDataConstants};
+    D3D12_ROOT_PARAMETER1 params[2]{};
+    params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    params[0].Constants = {0, 0, kUserDataConstants};
+    params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;  // the binding table, u0
+    params[1].Descriptor = {0, 0, D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE};
     D3D12_VERSIONED_ROOT_SIGNATURE_DESC rd{};
     rd.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
-    rd.Desc_1_1 = {1, &param, 0, nullptr,
+    rd.Desc_1_1 = {2, params, 0, nullptr,
                    D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED | D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED |
                        D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT};
     ComPtr<ID3DBlob> blob, errors;
@@ -81,12 +84,13 @@ struct GpuMemory {
         FAILED(device->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&root)))) {
       return fail("no root signature for translated programs");
     }
-    D3D12_ROOT_PARAMETER1 stages[2]{};
+    D3D12_ROOT_PARAMETER1 stages[3]{};
     stages[0].ParameterType = stages[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     stages[0].Constants = stages[1].Constants = {0, 0, kUserDataConstants};
     stages[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
     stages[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-    rd.Desc_1_1 = {2, stages, 0, nullptr, rd.Desc_1_1.Flags};
+    stages[2] = params[1];  // the binding table, u0, every stage
+    rd.Desc_1_1 = {3, stages, 0, nullptr, rd.Desc_1_1.Flags};
     blob.Reset();
     if (FAILED(D3D12SerializeVersionedRootSignature(&rd, &blob, &errors)) ||
         FAILED(device->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&graphics_root)))) {
@@ -126,7 +130,7 @@ struct GpuMemory {
     uint64_t base = 0, size = 0;
     if ((address >> kAddressBits) || !allocation(address, base, size)) return false;
     if (base % kPage || (base + size) >> kAddressBits || size > (uint64_t{0xFFFF} + 1) * kPage) return false;
-    if (windows.size() >= kHeapSize - 1) return fail("no room for more windows");
+    if (windows.size() + 1 >= next_view) return fail("no room for more windows");
     Window w;
     w.base = base;
     w.size = size;
@@ -184,6 +188,17 @@ struct GpuMemory {
     }
     pool_window = add_window(std::move(w));
     logf("gpu memory: window %u over the physical page pool, %s", pool_window, format_bytes(pages * kPage).c_str());
+  }
+
+  // A heap index for a texture view, from the top down; 0 when the heap is full.
+  uint32_t allocate_view(D3D12_CPU_DESCRIPTOR_HANDLE* handle) {
+    if (next_view <= windows.size() + 1) return 0;
+    const uint32_t n = --next_view;
+    if (handle) {
+      *handle = heap->GetCPUDescriptorHandleForHeapStart();
+      handle->ptr += SIZE_T{n} * step;
+    }
+    return n;
   }
 
   void flush(ID3D12GraphicsCommandList* list) {
@@ -285,6 +300,12 @@ ID3D12RootSignature* translated_graphics_root_signature() {
   std::lock_guard g(memory().lock);
   GpuMemory* m = ready();
   return m ? m->graphics_root.Get() : nullptr;
+}
+
+uint32_t allocate_view_slot(D3D12_CPU_DESCRIPTOR_HANDLE* handle) {
+  std::lock_guard g(memory().lock);
+  GpuMemory* m = ready();
+  return m ? m->allocate_view(handle) : 0;
 }
 
 void flush_page_table(ID3D12GraphicsCommandList* list) {

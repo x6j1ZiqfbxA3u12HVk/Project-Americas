@@ -30,6 +30,7 @@
 #include "core/json.h"
 #include "core/text.h"
 #include "formats/inflate.h"
+#include "runtime/d3d12x/bindings.h"
 #include "runtime/gdk/runtime.h"
 #include "runtime/hle/registry.h"
 #include "runtime/log.h"
@@ -291,7 +292,11 @@ HRESULT execute(const Request& r) {
     }
     return S_OK;
   }
-  return guarded_copy(r.destination, data.data(), data.size()) ? S_OK : E_INVALIDARG;
+  if (!guarded_copy(r.destination, data.data(), data.size())) return E_INVALIDARG;
+  // Textures over these bytes are uploaded again. (Page destinations are not reported yet:
+  // their pages' virtual addresses are not known here.)
+  d3d12x::notify_title_write(reinterpret_cast<uint64_t>(r.destination), data.size());
+  return S_OK;
 }
 
 void worker() {

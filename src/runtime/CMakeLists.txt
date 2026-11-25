@@ -19,6 +19,7 @@ add_library(am_runtime STATIC
   memory/default_alloc.cpp
   memory/title_memory.cpp
   hle/d3d12x.cpp
+  d3d12x/bindings.cpp
   d3d12x/descriptor_heap.cpp
   d3d12x/device.cpp
   d3d12x/dxgi.cpp

@@ -21,9 +21,9 @@
 //   am-shaders images [--out <dir>]
 //       Every image instruction of the corpus by its form and stage.
 //   am-shaders precompile [all] [--out <dir>]
-//       The programs the game's pipelines use (saved by the runtime in <cache>\shadersuntime),
+//       The programs the game's pipelines use (saved by the runtime in <cache>\shaders\runtime),
 //       or with `all` every program, translated with the runtime's binding and compiled to
-//       <cache>\shaders\dxilt\<marker>.dxil, where the runtime loads them. Resumable.
+//       <cache>\shaders\dxil\rt<translator version>\<marker>.dxil, where the runtime loads them. Resumable.
 
 #include <windows.h>
 
@@ -46,6 +46,7 @@
 #include "core/text.h"
 #include "shader/container.h"
 #include "shader/pack.h"
+#include "shader/translate.h"
 #include "survey.h"
 
 namespace fs = std::filesystem;
@@ -271,7 +272,9 @@ int wmain(int argc, wchar_t** argv) {
   if (command == L"images" && positional.empty()) return tools::image_survey(out);
   if (command == L"precompile" && positional.size() <= 1) {
     const bool all = !positional.empty() && positional[0] == L"all";
-    return tools::precompile(out, out.parent_path() / L"runtime", out.parent_path() / L"dxil" / L"rt", all);
+    // One folder a translator version, as the runtime loads them (host_pipeline.cpp).
+    return tools::precompile(out, out.parent_path() / L"runtime",
+                             out.parent_path() / L"dxil" / (L"rt" + std::to_wstring(shader::kTranslatorVersion)), all);
   }
   if (command == L"tsurvey" && positional.size() <= 1) {
     const size_t sample = positional.empty() ? 200 : std::stoul(positional[0]);

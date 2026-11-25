@@ -921,7 +921,7 @@ builder's `XMemVirtualQuery` calls, and the arguments logged at run time.
     passes over loops inside the inlined helpers;
   * with the helpers loop-free (a two-slot cuckoo table for descriptors, written-out channel
     code), it takes **38 s**. The median program takes 4.7 s;
-  * a full run over all 2,070 at `-O3` is under way: its first 200 took 22 minutes on this 4-core PC (eight at a time), so the whole set takes about 3 to 4 hours, an overnight job.
+  * the whole set at `-O3` (translator 2, `scripts/dxc_corpus.py`, eight at a time on 4 cores, 2026-11-25): **all 2,070 compile, none fail, in 2 h 22 min**; the slowest take about 2.5 minutes each with seven others running beside them.
   * What is left is mostly value propagation over the register file (`s[128]` and the VGPRs)
     in the program's own loops. That is for the IR step: registers as SSA values, each live
     only where it is used.

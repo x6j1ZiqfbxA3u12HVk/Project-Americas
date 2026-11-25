@@ -27,7 +27,7 @@
 namespace am::shader {
 
 // Bumped whenever the output for some input changes: part of the cache key.
-constexpr uint32_t kTranslatorVersion = 3;
+constexpr uint32_t kTranslatorVersion = 4;
 
 enum class Binding : uint8_t { Test, Runtime };
 
@@ -56,7 +56,7 @@ struct TranslateInput {
   std::vector<StageInput> inputs;
   // VS: exp parameter N = outputs[N]; PS: exp mrt N = outputs[N] (an SV_Target).
   std::vector<StageOutput> outputs;
-  uint32_t user_sgprs = 16;  // graphics: the user data SGPRs the binding fills
+  uint32_t user_sgprs = 16;  // graphics: the user data SGPRs the binding fills (the runtime's: at most 20)
 };
 
 struct Translation {
