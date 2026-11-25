@@ -1679,6 +1679,58 @@ void am_store_masked(uint64_t a, uint x, uint m) {
 }
 )";
 
+// The runtime's binding model (runtime/d3d12x/gpu_memory.h): the user data SGPRs are root
+// constants; console GPU addresses go through the page table (shader heap view 0) to the
+// window of the title allocation holding them. Addresses with no window read 0 and drop
+// stores.
+const char* kRuntimeBinding = R"(
+cbuffer am_args : register(b0) { uint4 am_user[8]; };
+uint am_entry(uint64_t a) {
+  if ((a >> 40) != 0) return 0u;
+  ByteAddressBuffer t = ResourceDescriptorHeap[0];
+  return t.Load(uint(a >> 16) * 4u);
+}
+uint am_at(uint e, uint64_t a) { return ((e & 0xFFFFu) << 16) | (uint(a) & 0xFFFCu); }
+uint am_load(uint64_t a) {
+  uint e = am_entry(a);
+  if (e == 0u) return 0u;
+  RWByteAddressBuffer w = ResourceDescriptorHeap[NonUniformResourceIndex(e >> 16)];
+  return w.Load(am_at(e, a));
+}
+void am_store(uint64_t a, uint x) {
+  uint e = am_entry(a);
+  if (e == 0u) return;
+  RWByteAddressBuffer w = ResourceDescriptorHeap[NonUniformResourceIndex(e >> 16)];
+  w.Store(am_at(e, a), x);
+}
+uint am_atomic(uint op, uint64_t a, uint x, uint cmp) {
+  uint e = am_entry(a), o = 0u;
+  if (e == 0u) return 0u;
+  RWByteAddressBuffer w = ResourceDescriptorHeap[NonUniformResourceIndex(e >> 16)];
+  uint at = am_at(e, a);
+  if (op == 0u) w.InterlockedExchange(at, x, o);
+  else if (op == 1u) w.InterlockedCompareExchange(at, cmp, x, o);
+  else if (op == 2u) w.InterlockedAdd(at, x, o);
+  else if (op == 3u) w.InterlockedAdd(at, 0u - x, o);
+  else if (op == 4u) { int so; w.InterlockedMin(at, asint(x), so); o = asuint(so); }
+  else if (op == 5u) w.InterlockedMin(at, x, o);
+  else if (op == 6u) { int so; w.InterlockedMax(at, asint(x), so); o = asuint(so); }
+  else if (op == 7u) w.InterlockedMax(at, x, o);
+  else if (op == 8u) w.InterlockedAnd(at, x, o);
+  else if (op == 9u) w.InterlockedOr(at, x, o);
+  else w.InterlockedXor(at, x, o);
+  return o;
+}
+void am_store_masked(uint64_t a, uint x, uint m) {
+  if (m == 0xFFFFFFFFu) { am_store(a, x); return; }
+  uint e = am_entry(a);
+  if (e == 0u) return;
+  RWByteAddressBuffer w = ResourceDescriptorHeap[NonUniformResourceIndex(e >> 16)];
+  w.InterlockedAnd(am_at(e, a), ~m);
+  w.InterlockedOr(am_at(e, a), x & m);
+}
+)";
+
 const char* kImageHelpers = R"(
 // ---- images: descriptors from the bindings table, views from the descriptor heaps ----
 struct AmImage { uint srv; uint alt; uint uav; uint flags; };
@@ -2456,7 +2508,7 @@ std::string lane_macros(bool wave64) {
 // register file, and an entry that calls it. The host runs the lanes at its own wave size: the
 // emulated EXEC covers the lanes the host wave has.
 Translation finish_graphics(const TranslateInput& in, const Ctx& c, Translation tr, const std::string& body, bool uses_br,
-                            uint32_t nv) {
+                            uint32_t nv, Binding binding) {
   const bool vs = in.stage == HwStage::Vs;
   if (c.uses_lds) {
     tr.failure = "LDS in a vertex or pixel shader";
@@ -2467,7 +2519,7 @@ Translation finish_graphics(const TranslateInput& in, const Ctx& c, Translation 
   std::string h;
   h += "// Translated by Project Americas' shader translator, version " + num(kTranslatorVersion) + ".\n";
   h += kHelpers;
-  h += kTestBinding;
+  h += binding == Binding::Runtime ? kRuntimeBinding : kTestBinding;
   h += format_table();
   h += kBufferHelpers;
   if (c.uses_images) h += kImageHelpers;
@@ -2536,11 +2588,7 @@ Translation translate(const TranslateInput& in, Binding binding) {
     tr.unsupported[tr.failure] = 1;
     return tr;
   }
-  if (binding != Binding::Test) {
-    tr.failure = "the runtime binding model comes with M4";
-    tr.unsupported[tr.failure] = 1;
-    return tr;
-  }
+
   const rd::ProgramScan scan = rd::scan_program(in.code);
   if (scan.errors) {
     tr.failure = "decoding: " + scan.first_error_reason;
@@ -2637,6 +2685,11 @@ Translation translate(const TranslateInput& in, Binding binding) {
     blocks.back().code += "      return;\n";
   }
   if (!tr.unsupported.empty()) return tr;
+  if (binding == Binding::Runtime && c.uses_images) {
+    tr.failure = "images in the runtime binding (to come)";
+    tr.unsupported[tr.failure] = 1;
+    return tr;
+  }
   std::string body;
   bool uses_br = false;
   tr.structured = Structurer(blocks).run(body, uses_br);
@@ -2644,13 +2697,13 @@ Translation translate(const TranslateInput& in, Binding binding) {
 
   const uint32_t nv = std::max<uint32_t>({c.max_vgpr, in.vgprs ? in.vgprs : 1u, 4u});
   tr.vgpr_count = nv;
-  if (graphics) return finish_graphics(in, c, std::move(tr), body, uses_br, nv);
+  if (graphics) return finish_graphics(in, c, std::move(tr), body, uses_br, nv, binding);
   const uint32_t user = (in.cs_rsrc2 >> 1) & 31;
   const uint32_t tid_comps = (in.cs_rsrc2 >> 11) & 3;
   std::string h;
   h += "// Translated by Project Americas' shader translator, version " + num(kTranslatorVersion) + ".\n";
   h += kHelpers;
-  h += kTestBinding;
+  h += binding == Binding::Runtime ? kRuntimeBinding : kTestBinding;
   h += format_table();
   h += kBufferHelpers;
   if (c.uses_images) h += kImageHelpers;
@@ -2695,8 +2748,10 @@ Translation translate(const TranslateInput& in, Binding binding) {
     h += "#define am_lanes_below_lo() ((1u << am_lane) - 1u)\n#define am_lanes_below_hi() 0u\n";
     h += "#define am_lane_on(l) (((s[126] >> ((l) & 31u)) & 1u) != 0u)\n";
   }
-  // At s_endpgm the tests' binding dumps the registers.
-  {
+  // At s_endpgm the tests' binding dumps the registers; the runtime's has nothing to do.
+  if (binding == Binding::Runtime) {
+    h += "#define AM_END() {}\n";
+  } else {
     // At s_endpgm the tests' binding dumps the registers (written out: no loop for LLVM).
     std::string d = "#define AM_END() { uint am_at = " + num(kDumpLanes) + "u + (am_gid.x * " + num(tx * ty * tz) +
                     "u + am_flat) * " + num(nv * 4) + "u;";

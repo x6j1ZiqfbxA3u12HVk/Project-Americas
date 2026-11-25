@@ -956,6 +956,34 @@ slot 55 pipeline's shaders are still to be found. Next: the runtime binding mode
 SGPRs from root arguments, console GPU addresses, descriptors), then the runtime looks the
 precompiled DXIL up by program marker and builds host pipelines.
 
+### M4.1: the runtime binding model, memory (started)
+
+Translated programs read and write the title's memory in place (`d3d12x/gpu_memory.cpp`, the
+translator's `Binding::Runtime`), checked by a GPU test: a translated program loads two dwords
+of title memory and stores their sum into it.
+
+* **What the GPU can open in place**, measured on Dev PC 1: plain `VirtualAlloc` memory, by
+  address (`OpenExistingHeapFromAddress`), and a section committed up front
+  (`OpenExistingHeapFromFileMapping`); both give cross-adapter heaps, so their buffers need
+  `ALLOW_CROSS_ADAPTER`. **A section committed on touch (our physical page pool) is refused**,
+  and so is a view of one opened by address.
+* So, as section 5.2 planned: the game's graphics heaps (`XMemVirtualAlloc`, private memory) are
+  read in place (class C); physical pages (the streaming heaps) will get VRAM copies (class B),
+  and lazy commit stays.
+* **Windows.** Each title allocation the GPU touches is opened once as a heap over its own pages,
+  with one buffer over all of it and its raw view in a shader-visible heap.
+* **Page table.** 64 MiB on the GPU: one entry per 64 KiB of the console's address space
+  [0, 2^40), `window << 16 | page in window` (0: none). Translated code does
+  `am_entry(address)` (view 0 of the heap), then loads from the window's view: one extra load a
+  memory access, to be hoisted where the address is wave-uniform.
+* **User data.** Translated programs share one root signature: 32 root constants at b0 are the
+  user data SGPRs; views come from the heap by index (SM 6.6).
+
+Next in the binding model: the user data layout (which SGPRs a root signature's parameters
+fill, from the command list's per-parameter headers at +0x144), images and samplers through
+the descriptor heaps (the T# / S# translation), class B copies of physical pages, then host
+pipelines from precompiled DXIL and forwarded draws.
+
 ### M2.3: console files and DirectStorage (done)
 
 * **Console paths** (`runtime/files`, `hle/files.cpp`):

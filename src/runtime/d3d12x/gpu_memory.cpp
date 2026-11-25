@@ -1,0 +1,213 @@
+#include "runtime/d3d12x/gpu_memory.h"
+
+#include <wrl/client.h>
+
+#include <algorithm>
+#include <atomic>
+#include <cstring>
+#include <mutex>
+#include <vector>
+
+#include "core/text.h"
+#include "runtime/log.h"
+#include "runtime/present/host_gpu.h"
+
+namespace am::rt::d3d12x {
+namespace {
+
+using Microsoft::WRL::ComPtr;
+
+constexpr uint64_t kPage = 64 * 1024;
+constexpr uint64_t kAddressBits = 40;
+constexpr uint64_t kTableEntries = (uint64_t{1} << kAddressBits) / kPage;  // 16 Mi entries, 64 MiB
+constexpr uint32_t kHeapSize = 65536;                                       // views of windows (later: textures too)
+
+struct Window {
+  uint64_t base = 0, size = 0;
+  ComPtr<ID3D12Heap> heap;
+  ComPtr<ID3D12Resource> buffer;
+};
+
+struct GpuMemory {
+  std::mutex lock;
+  bool started = false, usable = false;
+  ComPtr<ID3D12Device3> device;
+  ComPtr<ID3D12DescriptorHeap> heap;
+  ComPtr<ID3D12RootSignature> root;
+  ComPtr<ID3D12Resource> table;   // default heap, R32 entries
+  ComPtr<ID3D12Resource> upload;  // the entries to copy in at the next flush
+  std::vector<Window> windows;
+  // Ranges of entries changed since the last flush, and their values.
+  std::vector<std::pair<uint64_t, std::vector<uint32_t>>> pending;
+  UINT step = 0;
+
+  bool start() {
+    started = true;
+    present::HostGpu* gpu = present::host_gpu();
+    if (!gpu || FAILED(gpu->device.As(&device))) return false;
+    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, kHeapSize, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+    if (FAILED(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap)))) return fail("no shader-visible heap");
+    step = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    D3D12_HEAP_PROPERTIES hp{};
+    hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC bd{D3D12_RESOURCE_DIMENSION_BUFFER, 0, kTableEntries * 4, 1, 1, 1, DXGI_FORMAT_UNKNOWN, {1, 0},
+                           D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_RESOURCE_FLAG_NONE};
+    if (FAILED(device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                               IID_PPV_ARGS(&table)))) {
+      return fail("no page table");
+    }
+    D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
+    sv.Format = DXGI_FORMAT_R32_TYPELESS;
+    sv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+    sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    sv.Buffer.NumElements = static_cast<UINT>(kTableEntries);
+    sv.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+    device->CreateShaderResourceView(table.Get(), &sv, heap->GetCPUDescriptorHandleForHeapStart());
+
+    D3D12_ROOT_PARAMETER1 param{};
+    param.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    param.Constants = {0, 0, kUserDataConstants};
+    D3D12_VERSIONED_ROOT_SIGNATURE_DESC rd{};
+    rd.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
+    rd.Desc_1_1 = {1, &param, 0, nullptr,
+                   D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED | D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED |
+                       D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT};
+    ComPtr<ID3DBlob> blob, errors;
+    if (FAILED(D3D12SerializeVersionedRootSignature(&rd, &blob, &errors)) ||
+        FAILED(device->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&root)))) {
+      return fail("no root signature for translated programs");
+    }
+    windows.emplace_back();  // window numbers start at 1: entry 0 means none
+    usable = true;
+    return true;
+  }
+
+  bool fail(const char* why) {
+    logf("gpu memory: %s", why);
+    return false;
+  }
+
+  // The title allocation around `address`: its base and size (one host allocation).
+  static bool allocation(uint64_t address, uint64_t& base, uint64_t& size) {
+    MEMORY_BASIC_INFORMATION m;
+    if (VirtualQuery(reinterpret_cast<void*>(address), &m, sizeof m) != sizeof m || m.State != MEM_COMMIT ||
+        m.Type != MEM_PRIVATE) {
+      return false;
+    }
+    base = reinterpret_cast<uint64_t>(m.AllocationBase);
+    uint64_t p = base;
+    while (VirtualQuery(reinterpret_cast<void*>(p), &m, sizeof m) == sizeof m && reinterpret_cast<uint64_t>(m.AllocationBase) == base &&
+           m.State != MEM_FREE) {
+      p = reinterpret_cast<uint64_t>(m.BaseAddress) + m.RegionSize;
+    }
+    size = p - base;
+    return size != 0;
+  }
+
+  bool open(uint64_t address) {
+    for (size_t n = 1; n < windows.size(); ++n) {
+      if (address - windows[n].base < windows[n].size) return true;
+    }
+    uint64_t base = 0, size = 0;
+    if ((address >> kAddressBits) || !allocation(address, base, size)) return false;
+    if (base % kPage || (base + size) >> kAddressBits || size > (uint64_t{0xFFFF} + 1) * kPage) return false;
+    if (windows.size() >= kHeapSize - 1) return fail("no room for more windows");
+    Window w;
+    w.base = base;
+    w.size = size;
+    if (FAILED(device->OpenExistingHeapFromAddress(reinterpret_cast<void*>(base), IID_PPV_ARGS(&w.heap)))) {
+      logf("gpu memory: cannot open the allocation at 0x%s (%s) for the GPU", hex(base).c_str(), format_bytes(size).c_str());
+      return false;
+    }
+    D3D12_RESOURCE_DESC bd{D3D12_RESOURCE_DIMENSION_BUFFER, 0, size, 1, 1, 1, DXGI_FORMAT_UNKNOWN, {1, 0}, D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                           D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS};
+    if (FAILED(device->CreatePlacedResource(w.heap.Get(), 0, &bd, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&w.buffer)))) {
+      return fail("no buffer over an opened allocation");
+    }
+    const uint32_t n = static_cast<uint32_t>(windows.size());
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uv{};
+    uv.Format = DXGI_FORMAT_R32_TYPELESS;
+    uv.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+    uv.Buffer.NumElements = static_cast<UINT>(size / 4);
+    uv.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+    D3D12_CPU_DESCRIPTOR_HANDLE h = heap->GetCPUDescriptorHandleForHeapStart();
+    h.ptr += SIZE_T{n} * step;
+    device->CreateUnorderedAccessView(w.buffer.Get(), nullptr, &uv, h);
+    std::vector<uint32_t> entries(size / kPage);
+    for (uint32_t k = 0; k < entries.size(); ++k) entries[k] = (n << 16) | k;
+    pending.emplace_back(base / kPage, std::move(entries));
+    windows.push_back(std::move(w));
+    static std::atomic<int> logged{0};
+    if (logged.fetch_add(1) < 32) logf("gpu memory: window %u over 0x%s, %s", n, hex(base).c_str(), format_bytes(size).c_str());
+    return true;
+  }
+
+  void flush(ID3D12GraphicsCommandList* list) {
+    if (pending.empty()) return;
+    size_t bytes = 0;
+    for (const auto& [first, entries] : pending) bytes += entries.size() * 4;
+    D3D12_HEAP_PROPERTIES hp{};
+    hp.Type = D3D12_HEAP_TYPE_UPLOAD;
+    D3D12_RESOURCE_DESC bd{D3D12_RESOURCE_DIMENSION_BUFFER, 0, bytes, 1, 1, 1, DXGI_FORMAT_UNKNOWN, {1, 0}, D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                           D3D12_RESOURCE_FLAG_NONE};
+    // Kept until the next flush: the list that copies from it has run by then (one queue, in order).
+    if (FAILED(device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                                               IID_PPV_ARGS(&upload)))) {
+      return;
+    }
+    uint8_t* p = nullptr;
+    upload->Map(0, nullptr, reinterpret_cast<void**>(&p));
+    D3D12_RESOURCE_BARRIER b{};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition = {table.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST};
+    list->ResourceBarrier(1, &b);
+    size_t at = 0;
+    for (const auto& [first, entries] : pending) {
+      std::memcpy(p + at, entries.data(), entries.size() * 4);
+      list->CopyBufferRegion(table.Get(), first * 4, upload.Get(), at, entries.size() * 4);
+      at += entries.size() * 4;
+    }
+    upload->Unmap(0, nullptr);
+    std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
+    list->ResourceBarrier(1, &b);
+    pending.clear();
+  }
+};
+
+GpuMemory& memory() {
+  static GpuMemory* const m = new GpuMemory;
+  return *m;
+}
+
+GpuMemory* ready() {
+  GpuMemory& m = memory();
+  if (!m.started) m.start();
+  return m.usable ? &m : nullptr;
+}
+
+}  // namespace
+
+bool open_gpu_window(uint64_t address) {
+  std::lock_guard g(memory().lock);
+  GpuMemory* m = ready();
+  return m && m->open(address);
+}
+
+ID3D12DescriptorHeap* translated_shader_heap() {
+  std::lock_guard g(memory().lock);
+  GpuMemory* m = ready();
+  return m ? m->heap.Get() : nullptr;
+}
+
+ID3D12RootSignature* translated_root_signature() {
+  std::lock_guard g(memory().lock);
+  GpuMemory* m = ready();
+  return m ? m->root.Get() : nullptr;
+}
+
+void flush_page_table(ID3D12GraphicsCommandList* list) {
+  std::lock_guard g(memory().lock);
+  if (GpuMemory* m = ready()) m->flush(list);
+}
+
+}  // namespace am::rt::d3d12x

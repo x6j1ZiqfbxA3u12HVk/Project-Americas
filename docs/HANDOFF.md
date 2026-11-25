@@ -267,10 +267,11 @@ DirectStorage and files are done (PLAN.md section 11, "M2.3").
    while the game runs.** Console calls map to host calls one for one; shaders are compiled
    ahead of time and looked up. The vertex and pixel shaders of two of its three pipelines
    translate now (PLAN.md 11, "M3.3"; `am-shaders translate <path>` takes a saved container).
-   Still to do for the boot screen: the runtime binding model (user data SGPRs from the root
-   arguments, console GPU addresses, descriptors; the translator's `Binding::Runtime`), the
-   textures it samples (class B), the slot 55 pipeline's shaders, host PSOs from precompiled
-   DXIL looked up by program marker, then forwarding draws.
+   The runtime binding's memory part works (PLAN.md 11, "M4.1"): translated programs read and
+   write title memory in place through a GPU page table. Still to do for the boot screen: the
+   user data layout (root arguments to SGPRs), images and samplers in the runtime binding, the
+   textures it samples (class B copies of physical pages), the slot 55 pipeline's shaders, host
+   PSOs from precompiled DXIL looked up by program marker, then forwarding draws.
    * Most game pipelines come from slot 57 (programs already in GPU memory); all 911 of their
      programs are in the corpus, found by the 24-byte marker. The translator's output should be
      looked up by that marker at run time.

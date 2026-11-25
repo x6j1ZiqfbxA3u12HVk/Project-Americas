@@ -24,6 +24,7 @@ add_library(am_runtime STATIC
   d3d12x/dxgi.cpp
   d3d12x/formats.cpp
   d3d12x/frame.cpp
+  d3d12x/gpu_memory.cpp
   d3d12x/host_resources.cpp
   d3d12x/layout.cpp
   d3d12x/list.cpp

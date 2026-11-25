@@ -9,7 +9,13 @@
 
 #include "runtime/d3d12x/commands.h"
 #include "runtime/d3d12x/d3d12x.h"
+#include "runtime/d3d12x/gpu_memory.h"
+#include "runtime/memory/title_memory.h"
 #include "runtime/d3d12x/host.h"
+#include "host/dxc_compile.h"
+#include "shader/translate.h"
+#include <wrl/client.h>
+#include <cstdio>
 #include "runtime/present/host_gpu.h"
 #include "runtime/present/presenter.h"
 #include "runtime/d3d12x/layout.h"
@@ -445,4 +451,77 @@ TEST_CASE(d3d12x_clear_runs_on_the_host_gpu_and_presents) {
   }
   CHECK(all);
   DestroyWindow(window);
+}
+
+// The runtime binding: a translated program reads title memory through the page table and
+// writes back into it, zero copy. Its user SGPRs are root constants: s[0:1] the input's
+// address, s[2:3] the output's.
+TEST_CASE(d3d12x_translated_program_uses_title_memory_in_place) {
+  using namespace am;
+  const std::vector<uint32_t> code = {
+      0xf4000100, 0xfa000004,  // s_load_dword s4, s[0:1], 0x4
+      0xbf8cc07f,              // s_waitcnt lgkmcnt(0)
+      0x7e020204,              // v_mov_b32 v1, s4
+      0x7e040280,              // v_mov_b32 v2, 0
+      0xdc308008, 0x03000002,  // global_load_dword v3, v2, s[0:1] offset:8
+      0xbf8c3f70,              // s_waitcnt vmcnt(0)
+      0x4a020701,              // v_add_nc_u32 v1, v1, v3
+      0xdc708000, 0x00020102,  // global_store_dword v2, v1, s[2:3]
+      0xbf810000,              // s_endpgm
+  };
+  shader::TranslateInput in;
+  in.code = code;
+  in.stage = shader::HwStage::Cs;
+  in.vgprs = 4;
+  in.cs_rsrc2 = 4u << 1;  // four user SGPRs
+  in.cs_threads[0] = 64;
+  const shader::Translation t = shader::translate(in, shader::Binding::Runtime);
+  CHECK(t.ok);
+  if (!t.ok) {
+    std::printf("    not translated: %s\n", t.failure.c_str());
+    return;
+  }
+  std::string why;
+  if (!rt::present::host_gpu() || !host::dxc_available(&why)) return;
+  const host::CompileResult c = host::compile_hlsl(t.hlsl, t.entry, t.profile);
+  CHECK(c.ok);
+  if (!c.ok) {
+    std::printf("    DXC: %s\n", c.messages.substr(0, 2000).c_str());
+    return;
+  }
+  // Title memory: a 64 KiB allocation of its own in the title's range (below 2^40), as the game's
+  // graphics heaps are.
+  auto* mem = static_cast<uint32_t*>(rt::mem::allocate_title_range(65536, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+  CHECK(mem != nullptr);
+  if (!mem) return;
+  mem[1] = 40;
+  mem[2] = 2;
+  CHECK(open_gpu_window(reinterpret_cast<uint64_t>(mem)));
+  rt::present::HostGpu* gpu = rt::present::host_gpu();
+  ID3D12RootSignature* root = translated_root_signature();
+  CHECK(root != nullptr);
+  D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
+  pd.pRootSignature = root;
+  pd.CS = {c.dxil.data(), c.dxil.size()};
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> pso;
+  CHECK(SUCCEEDED(gpu->device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&pso))));
+  Microsoft::WRL::ComPtr<ID3D12CommandAllocator> alloc;
+  Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> list;
+  gpu->device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&alloc));
+  gpu->device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc.Get(), pso.Get(), IID_PPV_ARGS(&list));
+  flush_page_table(list.Get());
+  ID3D12DescriptorHeap* heaps[] = {translated_shader_heap()};
+  list->SetDescriptorHeaps(1, heaps);
+  list->SetComputeRootSignature(root);
+  const uint64_t in_at = reinterpret_cast<uint64_t>(mem), out_at = in_at + 0x100;
+  uint32_t user[kUserDataConstants] = {static_cast<uint32_t>(in_at), static_cast<uint32_t>(in_at >> 32),
+                                       static_cast<uint32_t>(out_at), static_cast<uint32_t>(out_at >> 32)};
+  list->SetComputeRoot32BitConstants(0, kUserDataConstants, user, 0);
+  list->Dispatch(1, 1, 1);
+  list->Close();
+  ID3D12CommandList* lists[] = {list.Get()};
+  gpu->wait(gpu->submit(1, lists));
+  CHECK(SUCCEEDED(gpu->device->GetDeviceRemovedReason()));
+  CHECK(mem[0x40] == 42);  // 40 + 2, written by the GPU into the title's own pages
+  VirtualFree(mem, 0, MEM_RELEASE);
 }
