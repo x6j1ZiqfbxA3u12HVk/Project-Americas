@@ -868,3 +868,75 @@ TEST_CASE(translate_16_bit_and_packed_alu) {
   }
   CHECK(ok);
 }
+
+// Vertex and pixel shaders: a console vertex shader whose fetch leaves POSITION in v4-v7 and
+// COLOR in v8-v11 exports them; a pixel shader interpolates attribute 0 and exports it packed
+// to halves. Translated, compiled and drawn: one triangle over the lower-left half of a 64 x 64
+// target.
+TEST_CASE(translate_vertex_and_pixel_shaders_draw) {
+  const std::vector<uint32_t> vs_code = {
+      0xf80008cf, 0x07060504,  // exp pos0, v4, v5, v6, v7 done
+      0xf800020f, 0x0b0a0908,  // exp param0, v8, v9, v10, v11
+      0xbf810000,              // s_endpgm
+  };
+  const std::vector<uint32_t> ps_code = {
+      0xc8000000,              // v_interp_p1_f32 v0, v0, attr0.x
+      0xc8010001,              // v_interp_p2_f32 v0, v1, attr0.x
+      0xc8090101,              // v_interp_p2_f32 v2, v1, attr0.y
+      0xc80d0201,              // v_interp_p2_f32 v3, v1, attr0.z
+      0xc8190301,              // v_interp_p2_f32 v6, v1, attr0.w
+      0x5e080500,              // v_cvt_pkrtz_f16_f32 v4, v0, v2
+      0x5e0a0d03,              // v_cvt_pkrtz_f16_f32 v5, v3, v6
+      0xf8001c0f, 0x00000504,  // exp mrt0, v4, v4, v5, v5 done compr vm
+      0xbf810000,              // s_endpgm
+  };
+  TranslateInput vs;
+  vs.code = vs_code;
+  vs.stage = HwStage::Vs;
+  vs.vgprs = 12;
+  vs.inputs = {{"POSITION", 0, 4, 4}, {"COLOR", 0, 4, 8}};
+  vs.outputs = {{"COLOR", 0}};
+  TranslateInput ps;
+  ps.code = ps_code;
+  ps.stage = HwStage::Ps;
+  ps.vgprs = 8;
+  ps.inputs = {{"COLOR", 0, 4, 0}};
+  ps.outputs = {{"SV_Target", 0}};
+  const Translation tv = translate(vs, Binding::Test), tp = translate(ps, Binding::Test);
+  CHECK(tv.ok && tp.ok && tv.profile == "vs_6_6" && tp.profile == "ps_6_6");
+  if (!tv.ok || !tp.ok) {
+    std::printf("    not translated: %s / %s\n", tv.failure.c_str(), tp.failure.c_str());
+    return;
+  }
+  std::string why;
+  if (!am::host::dxc_available(&why)) {
+    std::printf("    skipped: %s\n", why.c_str());
+    return;
+  }
+  const am::host::CompileResult cv = am::host::compile_hlsl(tv.hlsl, tv.entry, tv.profile);
+  const am::host::CompileResult cp = am::host::compile_hlsl(tp.hlsl, tp.entry, tp.profile);
+  CHECK(cv.ok && cp.ok);
+  if (!cv.ok || !cp.ok) {
+    std::printf("    DXC: %s\n%s\n", cv.messages.substr(0, 1500).c_str(), cp.messages.substr(0, 1500).c_str());
+    return;
+  }
+  const std::vector<D3D12_INPUT_ELEMENT_DESC> layout = {
+      {"POSITION", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+      {"COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 16, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+  };
+  const std::vector<float> vertices = {
+      -1, -1, 0, 1, 0.25f, 0.5f, 0.75f, 1,  //
+      1,  -1, 0, 1, 0.25f, 0.5f, 0.75f, 1,  //
+      -1, 1,  0, 1, 0.25f, 0.5f, 0.75f, 1,
+  };
+  const am::test::GraphicsRun g = am::test::run_graphics(cv.dxil, cp.dxil, layout, vertices, 32, 3, 64, 64, std::vector<uint32_t>(36, 0));
+  if (!g.ran) {
+    std::printf("    skipped: %s\n", g.why.c_str());
+    return;
+  }
+  // Inside the triangle (the lower left): the color; outside (the upper right): still clear.
+  const uint8_t* in = &g.pixels[(60 * 64 + 3) * 4];
+  const uint8_t* out = &g.pixels[(3 * 64 + 60) * 4];
+  CHECK(std::abs(in[0] - 64) <= 1 && std::abs(in[1] - 128) <= 1 && std::abs(in[2] - 191) <= 1 && in[3] == 255);
+  CHECK(out[0] == 0 && out[1] == 0 && out[2] == 0 && out[3] == 0);
+}

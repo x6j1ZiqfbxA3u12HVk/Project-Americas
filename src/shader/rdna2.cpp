@@ -353,6 +353,7 @@ ProgramScan scan_program(std::span<const uint32_t> code) {
       if (flags & kIndirect) {
         if (insn.encoding == Encoding::Sop1 && insn.opcode == 32) {  // s_setpc_b64: a jump we cannot follow
           r.indirect = true;
+          r.setpc = true;
           break;
         }
         if (insn.encoding == Encoding::Sop1 && insn.opcode == 33) r.indirect = true;  // s_swappc_b64 returns

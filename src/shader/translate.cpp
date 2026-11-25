@@ -42,6 +42,7 @@ std::string fill(const std::string& t, const std::string& a, const std::string& 
 struct Ctx {
   const rd::Instruction* in = nullptr;
   std::string out;
+  const TranslateInput* input = nullptr;  // the program's stage and interface
   bool wave64 = true;
   uint32_t pc = 0;    // dword index of this instruction
   uint32_t next = 0;  // and of the next
@@ -1264,6 +1265,49 @@ const std::unordered_map<std::string, Handler>& table() {
                              "s_denorm_mode", "s_round_mode", "s_clause"}) {
       t[name] = [](Ctx&) { return true; };
     }
+    // -- graphics: exports and attribute interpolation --
+    // exp: position 0 (12) to SV_Position, parameter N (32 + N) to output N; render target N
+    // (0-7) to SV_Target, two halves a register with COMPR. Other positions and null (9) are
+    // dropped. Lanes whose EXEC bit is clear export nothing.
+    t["exp"] = [](Ctx& c) {
+      const uint32_t tgt = c.f(Field::TGT), en = c.f(Field::EN), compr = c.f(Field::COMPR);
+      const uint32_t src[4] = {c.f(Field::VSRC0), c.f(Field::VSRC1), c.f(Field::VSRC2), c.f(Field::VSRC3)};
+      static const char* const kChan[] = {"x", "y", "z", "w"};
+      const HwStage stage = c.input->stage;
+      std::string field;
+      if (stage == HwStage::Vs && tgt == 12) field = "am_o.pos";
+      else if (stage == HwStage::Vs && tgt >= 32 && tgt < 64 && tgt - 32 < c.input->outputs.size()) field = "am_o.o" + num(tgt - 32);
+      else if (stage == HwStage::Ps && tgt < 8 && tgt < c.input->outputs.size()) field = "am_o.o" + num(tgt);
+      else if (tgt == 9 || (stage == HwStage::Vs && ((tgt >= 13 && tgt < 16) || tgt >= 32))) return true;
+      else return c.fail("exp to target " + num(tgt));
+      std::string body;
+      for (uint32_t k = 0; k < 4; ++k) {
+        if (!((en >> k) & 1u)) continue;
+        std::string value;
+        if (compr && stage == HwStage::Ps) {
+          const uint32_t r = src[k / 2];
+          c.touch_v(r);
+          value = "f16tof32(v[" + num(r) + "]" + (k % 2 ? " >> 16" : "") + ")";
+        } else {
+          c.touch_v(src[k]);
+          value = "asfloat(v[" + num(src[k]) + "])";
+        }
+        body += " " + field + "." + kChan[k] + " = " + value + ";";
+      }
+      if (!body.empty()) c.line("if (AM_ACT != 0u) {" + body + " }");
+      return true;
+    };
+    // v_interp_p1 / p2 / mov: the host interpolates; each gives attribute ATTR's channel.
+    for (const char* name : {"v_interp_p1_f32", "v_interp_p2_f32", "v_interp_mov_f32"}) {
+      t[name] = [](Ctx& c) {
+        if (c.in->encoding != rd::Encoding::Vintrp || c.input->stage != HwStage::Ps) return c.fail("v_interp outside a pixel shader's VINTRP form");
+        const uint32_t attr = c.f(Field::ATTR), chan = c.f(Field::ATTRCHAN);
+        if (attr >= c.input->inputs.size()) return c.fail("v_interp of attribute " + num(attr) + " beyond the signature");
+        static const char* const kChan[] = {"x", "y", "z", "w"};
+        c.vwrite(c.f(Field::VDST), "asuint(am_in.i" + num(attr) + "." + kChan[chan & 3] + ")");
+        return true;
+      };
+    }
     t["s_barrier"] = [](Ctx& c) {
       c.line("GroupMemoryBarrierWithGroupSync();");
       return true;
@@ -2386,11 +2430,109 @@ void forget_written(Ctx& c, const rd::Instruction& insn) {
   c.live_samplers.clear();
 }
 
+// Lane helpers that read the register file (EXEC, VCC), for every stage.
+std::string lane_macros(bool wave64) {
+  std::string h;
+  if (wave64) {
+    h += "#define AM_ACT ((((am_lane < 32u) ? s[126] : s[127]) >> (am_lane & 31u)) & 1u)\n";
+    h += "#define am_exec_zero() ((s[126] | s[127]) == 0u)\n#define am_vcc_zero() ((s[106] | s[107]) == 0u)\n";
+    h += "#define am_lane_bit(lo, hi) (((((am_lane < 32u) ? (lo) : (hi)) >> (am_lane & 31u)) & 1u) != 0u)\n";
+    h += "#define am_first_active() (s[126] != 0u ? firstbitlow(s[126]) : s[127] != 0u ? 32u + firstbitlow(s[127]) : 0u)\n";
+    h += "#define am_lanes_below_lo() (am_lane >= 32u ? 0xFFFFFFFFu : (1u << am_lane) - 1u)\n";
+    h += "#define am_lane_on(l) (((((l) < 32u ? s[126] : s[127]) >> ((l) & 31u)) & 1u) != 0u)\n";
+    h += "#define am_lanes_below_hi() (am_lane < 32u ? 0u : (1u << (am_lane - 32u)) - 1u)\n";
+  } else {
+    h += "#define AM_ACT ((s[126] >> am_lane) & 1u)\n";
+    h += "#define am_exec_zero() (s[126] == 0u)\n#define am_vcc_zero() (s[106] == 0u)\n";
+    h += "#define am_lane_bit(lo, hi) ((((lo) >> am_lane) & 1u) != 0u)\n";
+    h += "#define am_first_active() (s[126] != 0u ? firstbitlow(s[126]) : 0u)\n";
+    h += "#define am_lanes_below_lo() ((1u << am_lane) - 1u)\n#define am_lanes_below_hi() 0u\n";
+    h += "#define am_lane_on(l) (((s[126] >> ((l) & 31u)) & 1u) != 0u)\n";
+  }
+  return h;
+}
+
+// A vertex or pixel shader: its interface as HLSL structs, a body function holding the
+// register file, and an entry that calls it. The host runs the lanes at its own wave size: the
+// emulated EXEC covers the lanes the host wave has.
+Translation finish_graphics(const TranslateInput& in, const Ctx& c, Translation tr, const std::string& body, bool uses_br,
+                            uint32_t nv) {
+  const bool vs = in.stage == HwStage::Vs;
+  if (c.uses_lds) {
+    tr.failure = "LDS in a vertex or pixel shader";
+    tr.unsupported[tr.failure] = 1;
+    return tr;
+  }
+  tr.profile = vs ? "vs_6_6" : "ps_6_6";
+  std::string h;
+  h += "// Translated by Project Americas' shader translator, version " + num(kTranslatorVersion) + ".\n";
+  h += kHelpers;
+  h += kTestBinding;
+  h += format_table();
+  h += kBufferHelpers;
+  if (c.uses_images) h += kImageHelpers;
+  h += "\nstruct AmIn {\n";
+  if (!vs) h += "  float4 am_pos : SV_Position;\n";
+  for (size_t k = 0; k < in.inputs.size(); ++k) {
+    h += "  float4 i" + num(static_cast<uint32_t>(k)) + " : " + in.inputs[k].semantic + num(in.inputs[k].semantic_index) + ";\n";
+  }
+  h += "};\nstruct AmOut {\n";
+  if (vs) h += "  float4 pos : SV_Position;\n";
+  for (size_t k = 0; k < in.outputs.size(); ++k) {
+    h += "  float4 o" + num(static_cast<uint32_t>(k)) + " : " + in.outputs[k].semantic + num(in.outputs[k].semantic_index) + ";\n";
+  }
+  h += "};\n";
+  h += lane_macros(c.wave64);
+  h += vs ? "#define AM_END() {}\n" : "#define AM_END() { if (AM_ACT == 0u) discard; }\n";
+  h += vs ? "void am_body(AmIn am_in, uint am_vid, uint am_iid, inout AmOut am_o) {\n" : "void am_body(AmIn am_in, inout AmOut am_o) {\n";
+  h += "  uint s[128];\n  uint v[" + num(nv) + "];\n ";
+  for (uint32_t i = 0; i < 128; ++i) h += " s[" + num(i) + "] = 0u;";
+  h += "\n ";
+  for (uint32_t j = 0; j < nv; ++j) h += " v[" + num(j) + "] = 0u;";
+  h += "\n";
+  h += "  uint am_null = 0u;\n  bool scc = false;\n  uint am_lane = WaveGetLaneIndex();\n";
+  h += "  uint am_dpp = 0u;\n  bool am_dpp_on = true;\n";
+  for (const uint32_t r : c.image_vars) h += "  AmImage am_im_" + num(r) + " = (AmImage)0;\n";
+  for (const uint32_t r : c.sampler_vars) h += "  AmSampler am_sm_" + num(r) + " = (AmSampler)0;\n";
+  for (uint32_t i = 0; i < std::min<uint32_t>(in.user_sgprs, 32); ++i) {
+    h += "  s[" + num(i) + "] = am_user[" + num(i / 4) + "][" + num(i % 4) + "];\n";
+  }
+  if (vs) {
+    h += "  v[0] = am_vid;\n  v[3] = am_iid;\n";
+    for (size_t k = 0; k < in.inputs.size(); ++k) {
+      for (uint32_t ch = 0; ch < std::min<uint32_t>(in.inputs[k].components, 4); ++ch) {
+        const uint32_t r = in.inputs[k].vgpr + ch;
+        if (r < nv) h += "  v[" + num(r) + "] = asuint(am_in.i" + num(static_cast<uint32_t>(k)) + "[" + num(ch) + "]);\n";
+      }
+    }
+  }
+  h += "  { uint4 b = WaveActiveBallot(true); s[126] = b.x; s[127] = " + std::string(c.wave64 ? "b.y" : "0u") + "; }\n";
+  if (tr.structured) {
+    if (uses_br) h += "  uint am_br = 0u;\n";
+    h += body;
+    h += "}\n";
+  } else {
+    h += "  uint pc = 0u;\n  [loop] for (;;) {\n    [forcecase] switch (pc) {\n";
+    h += body;
+    h += "    default:\n      return;\n    }\n  }\n}\n";
+  }
+  if (vs) {
+    h += "AmOut main(AmIn am_in, uint am_vid : SV_VertexID, uint am_iid : SV_InstanceID) {\n";
+    h += "  AmOut o = (AmOut)0;\n  am_body(am_in, am_vid, am_iid, o);\n  return o;\n}\n";
+  } else {
+    h += "AmOut main(AmIn am_in) {\n  AmOut o = (AmOut)0;\n  am_body(am_in, o);\n  return o;\n}\n";
+  }
+  tr.hlsl = std::move(h);
+  tr.ok = true;
+  return tr;
+}
+
 Translation translate(const TranslateInput& in, Binding binding) {
   Translation tr;
   tr.wave_size = in.wave32 ? 32 : 64;
-  if (in.stage != HwStage::Cs) {
-    tr.failure = std::string("stage ") + hw_stage_name(in.stage) + " (compute only so far)";
+  const bool graphics = in.stage == HwStage::Vs || in.stage == HwStage::Ps;
+  if (in.stage != HwStage::Cs && !graphics) {
+    tr.failure = std::string("stage ") + hw_stage_name(in.stage) + " (compute, vertex and pixel only so far)";
     tr.unsupported[tr.failure] = 1;
     return tr;
   }
@@ -2405,7 +2547,9 @@ Translation translate(const TranslateInput& in, Binding binding) {
     tr.unsupported[tr.failure] = 1;
     return tr;
   }
-  if (scan.indirect) {
+  // A vertex shader's s_swappc_b64 calls the console's vertex fetch, which returns: its
+  // attributes are inputs here.
+  if (scan.indirect && (scan.setpc || in.stage != HwStage::Vs)) {
     tr.failure = "indirect jumps (s_setpc_b64)";
     tr.unsupported[tr.failure] = 1;
     return tr;
@@ -2420,6 +2564,7 @@ Translation translate(const TranslateInput& in, Binding binding) {
     if (insn.info->flags & (rd::kBranch | rd::kTerminator)) starts.insert(scan.starts[k + 1]);
   }
   Ctx c;
+  c.input = &in;
   c.wave64 = !in.wave32;
   std::vector<CfgBlock> blocks;
   const auto& ops = table();
@@ -2447,6 +2592,10 @@ Translation translate(const TranslateInput& in, Binding binding) {
     if (flags & rd::kTerminator) {
       c.line("AM_END(); return;");
       blk.end = CfgBlock::Stop;
+    } else if (name == "s_swappc_b64" && in.stage == HwStage::Vs) {
+      // The vertex fetch: the attributes are in place already; the return address is the
+      // program's base for its own data (our code starts at address 0).
+      c.set_s64(c.f(Field::SDST), "uint64_t(" + num(uint64_t{next} * 4) + ")");
     } else if (flags & rd::kBranch) {
       const int64_t target = static_cast<int64_t>(next) + static_cast<int16_t>(insn.field(Field::SIMM16));
       std::string cond;
@@ -2493,8 +2642,9 @@ Translation translate(const TranslateInput& in, Binding binding) {
   tr.structured = Structurer(blocks).run(body, uses_br);
   if (!tr.structured) body = dispatch(blocks);
 
-  const uint32_t nv = std::max<uint32_t>({c.max_vgpr, in.vgprs ? in.vgprs : 1u, 3u});
+  const uint32_t nv = std::max<uint32_t>({c.max_vgpr, in.vgprs ? in.vgprs : 1u, 4u});
   tr.vgpr_count = nv;
+  if (graphics) return finish_graphics(in, c, std::move(tr), body, uses_br, nv);
   const uint32_t user = (in.cs_rsrc2 >> 1) & 31;
   const uint32_t tid_comps = (in.cs_rsrc2 >> 11) & 3;
   std::string h;

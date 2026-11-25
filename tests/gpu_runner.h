@@ -44,4 +44,17 @@ struct GpuRun {
 GpuRun run_compute(const std::vector<uint8_t>& dxil, uint32_t groups, const std::vector<uint32_t>& args,
                    std::vector<uint32_t> memory, size_t dump_dwords, const ImageSetup* images = nullptr);
 
+// One draw of a vertex and pixel shader pair with the tests' binding model (as run_compute),
+// into a width x height R8G8B8A8 target cleared to 0. `vertices` are floats, `stride` bytes
+// apart; `layout` names their semantics.
+struct GraphicsRun {
+  bool ran = false;
+  std::string why;
+  std::vector<uint8_t> pixels;  // rows packed tight, 4 bytes a pixel
+};
+GraphicsRun run_graphics(const std::vector<uint8_t>& vs, const std::vector<uint8_t>& ps,
+                         const std::vector<D3D12_INPUT_ELEMENT_DESC>& layout, const std::vector<float>& vertices,
+                         uint32_t stride, uint32_t vertex_count, uint32_t width, uint32_t height,
+                         const std::vector<uint32_t>& args);
+
 }  // namespace am::test

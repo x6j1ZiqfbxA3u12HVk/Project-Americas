@@ -20,6 +20,7 @@
 #include "shader/console_program.h"
 #include "shader/container.h"
 #include "shader/rdna2.h"
+#include "shader/stage_io.h"
 #include "shader/translate.h"
 #include "survey.h"
 
@@ -38,20 +39,37 @@ std::vector<fs::path> containers(const fs::path& dir) {
   return files;
 }
 
-std::optional<shader::ConsoleShader> load(const fs::path& file, std::string& error) {
+struct Loaded {
+  std::vector<uint8_t> bytes;  // the container
+  shader::ConsoleShader shader;
+};
+
+std::optional<Loaded> load(const fs::path& file, std::string& error) {
   auto view = FileView::open(file, error);
   if (!view) return std::nullopt;
-  const auto c = shader::parse_container(view->bytes(), error);
+  Loaded out;
+  out.bytes.assign(view->bytes().begin(), view->bytes().end());
+  const auto c = shader::parse_container(out.bytes, error);
   const shader::Part* dxil = c ? c->find("DXIL") : nullptr;
   if (!dxil) {
     if (error.empty()) error = "no DXIL part";
     return std::nullopt;
   }
-  return shader::read_console_shader(dxil->data, error);
+  auto s = shader::read_console_shader(dxil->data, error);
+  if (!s) return std::nullopt;
+  out.shader = std::move(*s);
+  return out;
 }
 
-shader::TranslateInput input_of(const shader::NativeBlob& b, const shader::NativeProgram& p) {
+// The translator's input for a program; vertex and pixel shaders also get their interface.
+// A failure to read it leaves the interface empty, and `io_error` says why.
+shader::TranslateInput input_of(const std::vector<uint8_t>& container, const shader::NativeBlob& b,
+                                const shader::NativeProgram& p, std::string* io_error = nullptr) {
   shader::TranslateInput in;
+  if (p.stage == shader::HwStage::Vs || p.stage == shader::HwStage::Ps) {
+    std::string why;
+    if (!shader::read_stage_io(container, b, p, in, why) && io_error) *io_error = why;
+  }
   const auto bytes = b.code(p);
   in.code = {reinterpret_cast<const uint32_t*>(bytes.data()), bytes.size() / 4};
   in.stage = p.stage;
@@ -67,7 +85,12 @@ shader::TranslateInput input_of(const shader::NativeBlob& b, const shader::Nativ
 
 int translate(const std::string& wanted, const fs::path& pack_dir, const fs::path& out_dir) {
   fs::path file;
-  for (const fs::path& f : containers(pack_dir)) {
+  // A container file given by its path (one saved at run time, under cache/shaders/runtime), or
+  // the pack's by hash prefix.
+  if (std::error_code fe; wanted.find_first_of("\\/") != std::string::npos && fs::is_regular_file(widen(wanted), fe)) {
+    file = widen(wanted);
+  }
+  for (const fs::path& f : file.empty() ? containers(pack_dir) : std::vector<fs::path>{}) {
     if (istarts_with_ascii(narrow(f.filename().wstring()), wanted)) {
       file = f;
       break;
@@ -82,9 +105,12 @@ int translate(const std::string& wanted, const fs::path& pack_dir, const fs::pat
   std::error_code ec;
   fs::create_directories(out_dir, ec);
   int index = 0, failed = 0;
-  for (const shader::NativeBlob& b : shader->blobs) {
+  for (const shader::NativeBlob& b : shader->shader.blobs) {
     for (const shader::NativeProgram& p : b.programs) {
-      const shader::Translation t = shader::translate(input_of(b, p), shader::Binding::Test);
+      std::string io_error;
+      const shader::TranslateInput in = input_of(shader->bytes, b, p, &io_error);
+      if (!io_error.empty()) std::printf("  interface: %s\n", io_error.c_str());
+      const shader::Translation t = shader::translate(in, shader::Binding::Test);
       const std::string stem = narrow(file.stem().wstring()) + "_" + std::to_string(index++);
       if (!t.ok) {
         std::printf("%s: %s: not translated: %s\n", stem.c_str(), shader::hw_stage_name(p.stage), t.failure.c_str());
@@ -120,9 +146,9 @@ int translation_survey(const fs::path& pack_dir, const fs::path& out_json, size_
         std::string error;
         const auto shader = load(files[i], error);
         if (!shader) continue;
-        for (const shader::NativeBlob& b : shader->blobs) {
+        for (const shader::NativeBlob& b : shader->shader.blobs) {
           for (const shader::NativeProgram& p : b.programs) {
-            shader::Translation t = shader::translate(input_of(b, p), shader::Binding::Test);
+            shader::Translation t = shader::translate(input_of(shader->bytes, b, p), shader::Binding::Test);
             std::lock_guard<std::mutex> g(lock);
             ++stages_total[shader::hw_stage_name(p.stage)];
             if (t.ok) {
@@ -237,9 +263,9 @@ int image_survey(const fs::path& pack_dir) {
         std::string error;
         const auto shader = load(files[i], error);
         if (!shader) continue;
-        for (const shader::NativeBlob& b : shader->blobs) {
+        for (const shader::NativeBlob& b : shader->shader.blobs) {
           for (const shader::NativeProgram& p : b.programs) {
-            const shader::TranslateInput in = input_of(b, p);
+            const shader::TranslateInput in = input_of(shader->bytes, b, p);
             const rd::ProgramScan scan = rd::scan_program(in.code);
             const bool cs = p.stage == shader::HwStage::Cs;
             for (const uint32_t at : scan.starts) {

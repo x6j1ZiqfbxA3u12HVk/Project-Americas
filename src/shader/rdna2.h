@@ -115,6 +115,7 @@ struct ProgramScan {
   std::vector<uint32_t> targets;  // branch and call targets, ascending
   bool ends = false;              // a reachable s_endpgm
   bool indirect = false;          // a reachable s_setpc / s_swappc: control we cannot follow
+  bool setpc = false;             // a reachable s_setpc: a jump (s_swappc alone is a call that returns)
   size_t errors = 0;              // reachable dwords that do not decode, bad branch targets
   size_t first_error = static_cast<size_t>(-1);
   std::string first_error_reason;

@@ -926,6 +926,36 @@ builder's `XMemVirtualQuery` calls, and the arguments logged at run time.
     in the program's own loops. That is for the IR step: registers as SSA values, each live
     only where it is used.
 
+### M3.3: vertex and pixel shaders (started)
+
+The translator takes vertex and pixel shaders (`translate.cpp`, `stage_io.cpp`; translator
+version 3), checked by a GPU test that draws with a translated pair:
+
+* **Interface.** From the container's signatures (ISG1, OSG1) and the console record's
+  attribute maps at record + 0x78. A vertex shader's map has 5-byte entries (type 6 = float,
+  signature register, mask, the first VGPR the console's vertex fetch fills, components - 1); a
+  pixel shader's has 8-byte entries (type, signature register, mask, the v_interp attribute
+  number, four bytes not read yet). Vertex parameter N is the N-th non-system output by
+  register; pixel render target N is SV_Target N.
+* **The vertex fetch.** A console vertex shader begins with `s_swappc_b64 s[4:5], s[4:5]`: a call
+  into a fetch subroutine the console's runtime made from the input layout, which loads the
+  attributes into VGPRs and returns. The translation takes the attributes as HLSL inputs and
+  sets those VGPRs at entry; the call only sets s[4:5] to the return address, which the program
+  then uses as the base of the data stored after its own code.
+* **Exports.** `exp pos0` writes SV_Position, `exp paramN` output N, `exp mrtN` SV_TargetN (two
+  halves a register with COMPR); other positions and null are dropped. `v_interp_p1/p2/mov` read
+  the attribute's channel; the host interpolates. A pixel whose EXEC bit is clear at the end is
+  discarded.
+* **Entry.** HLSL structs for the interface, a body function holding the register file, a
+  `main` that calls it. Lanes run at the host's wave size.
+
+The boot screen's shaders: its stream pipeline (a full-screen pass: a vertex shader building
+its triangle from the vertex ID, a pixel shader sampling a texture) and its slot 57 pipeline
+(`sga_dr_vs_pos_color_tex` and `default_ps_tex` from the corpus) translate and compile. The
+slot 55 pipeline's shaders are still to be found. Next: the runtime binding model (user data
+SGPRs from root arguments, console GPU addresses, descriptors), then the runtime looks the
+precompiled DXIL up by program marker and builds host pipelines.
+
 ### M2.3: console files and DirectStorage (done)
 
 * **Console paths** (`runtime/files`, `hle/files.cpp`):

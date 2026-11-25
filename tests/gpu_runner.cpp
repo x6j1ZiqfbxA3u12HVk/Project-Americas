@@ -14,7 +14,7 @@ namespace {
 struct Gpu {
   ComPtr<ID3D12Device> device;
   ComPtr<ID3D12CommandQueue> queue;
-  ComPtr<ID3D12RootSignature> root;
+  ComPtr<ID3D12RootSignature> root, graphics_root;  // the second also takes an input layout
   std::string why;
 };
 
@@ -57,6 +57,13 @@ const Gpu& gpu() {
     if (FAILED(D3D12SerializeVersionedRootSignature(&rd, &blob, &errors)) ||
         FAILED(x.device->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&x.root)))) {
       x.why = "cannot make the root signature";
+      x.device.Reset();
+      return x;
+    }
+    rd.Desc_1_1.Flags |= D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+    if (FAILED(D3D12SerializeVersionedRootSignature(&rd, &blob, &errors)) ||
+        FAILED(x.device->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&x.graphics_root)))) {
+      x.why = "cannot make the graphics root signature";
       x.device.Reset();
     }
     return x;
@@ -350,6 +357,127 @@ GpuRun run_compute(const std::vector<uint8_t>& dxil, uint32_t groups, const std:
     }
     tex_back[i]->Unmap(0, nullptr);
   }
+  run.ran = true;
+  return run;
+}
+
+GraphicsRun run_graphics(const std::vector<uint8_t>& vs, const std::vector<uint8_t>& ps,
+                         const std::vector<D3D12_INPUT_ELEMENT_DESC>& layout, const std::vector<float>& vertices,
+                         uint32_t stride, uint32_t vertex_count, uint32_t width, uint32_t height,
+                         const std::vector<uint32_t>& args) {
+  GraphicsRun run;
+  const Gpu& g = gpu();
+  if (!g.device) {
+    run.why = g.why;
+    return run;
+  }
+  ID3D12Device* d = g.device.Get();
+  D3D12_GRAPHICS_PIPELINE_STATE_DESC pd{};
+  pd.pRootSignature = g.graphics_root.Get();
+  pd.VS = {vs.data(), vs.size()};
+  pd.PS = {ps.data(), ps.size()};
+  pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+  pd.SampleMask = UINT_MAX;
+  pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+  pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+  pd.RasterizerState.DepthClipEnable = TRUE;
+  pd.InputLayout = {layout.data(), static_cast<UINT>(layout.size())};
+  pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+  pd.NumRenderTargets = 1;
+  pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+  pd.SampleDesc.Count = 1;
+  ComPtr<ID3D12PipelineState> pso;
+  if (FAILED(d->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pso)))) {
+    run.why = "the driver refused the pipeline";
+    return run;
+  }
+  const size_t vb_bytes = vertices.size() * sizeof(float);
+  auto vb = buffer(d, vb_bytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+  auto cb = buffer(d, 256 * ((args.size() * 4 + 255) / 256 + 1), D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+  auto scratch = buffer(d, 4096, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+  void* p = nullptr;
+  vb->Map(0, nullptr, &p);
+  std::memcpy(p, vertices.data(), vb_bytes);
+  vb->Unmap(0, nullptr);
+  cb->Map(0, nullptr, &p);
+  std::memset(p, 0, 256);
+  std::memcpy(p, args.data(), args.size() * 4);
+  cb->Unmap(0, nullptr);
+
+  D3D12_HEAP_PROPERTIES heap{};
+  heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+  D3D12_RESOURCE_DESC td{};
+  td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+  td.Width = width;
+  td.Height = height;
+  td.DepthOrArraySize = 1;
+  td.MipLevels = 1;
+  td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+  td.SampleDesc.Count = 1;
+  td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+  ComPtr<ID3D12Resource> target;
+  if (FAILED(d->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr,
+                                        IID_PPV_ARGS(&target)))) {
+    run.why = "no render target";
+    return run;
+  }
+  ComPtr<ID3D12DescriptorHeap> rtvs;
+  D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+  d->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rtvs));
+  const D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtvs->GetCPUDescriptorHandleForHeapStart();
+  d->CreateRenderTargetView(target.Get(), nullptr, rtv);
+  D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};
+  UINT rows = 0;
+  UINT64 row_bytes = 0, total = 0;
+  d->GetCopyableFootprints(&td, 0, 1, 0, &fp, &rows, &row_bytes, &total);
+  auto back = buffer(d, static_cast<size_t>(total), D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+
+  ComPtr<ID3D12CommandAllocator> alloc;
+  ComPtr<ID3D12GraphicsCommandList> list;
+  d->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&alloc));
+  d->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc.Get(), pso.Get(), IID_PPV_ARGS(&list));
+  const float clear[4] = {0, 0, 0, 0};
+  list->ClearRenderTargetView(rtv, clear, 0, nullptr);
+  list->SetGraphicsRootSignature(g.graphics_root.Get());
+  list->SetGraphicsRootConstantBufferView(0, cb->GetGPUVirtualAddress());
+  for (UINT k = 1; k < 4; ++k) list->SetGraphicsRootUnorderedAccessView(k, scratch->GetGPUVirtualAddress());
+  list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+  const D3D12_VIEWPORT viewport{0, 0, static_cast<float>(width), static_cast<float>(height), 0, 1};
+  const D3D12_RECT scissor{0, 0, static_cast<LONG>(width), static_cast<LONG>(height)};
+  list->RSSetViewports(1, &viewport);
+  list->RSSetScissorRects(1, &scissor);
+  list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+  const D3D12_VERTEX_BUFFER_VIEW view{vb->GetGPUVirtualAddress(), static_cast<UINT>(vb_bytes), stride};
+  list->IASetVertexBuffers(0, 1, &view);
+  list->DrawInstanced(vertex_count, 1, 0, 0);
+  const D3D12_RESOURCE_BARRIER b = transition(target.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+  list->ResourceBarrier(1, &b);
+  D3D12_TEXTURE_COPY_LOCATION src{target.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+  src.SubresourceIndex = 0;
+  D3D12_TEXTURE_COPY_LOCATION dst{back.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
+  dst.PlacedFootprint = fp;
+  list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+  list->Close();
+  ID3D12CommandList* lists[] = {list.Get()};
+  g.queue->ExecuteCommandLists(1, lists);
+  ComPtr<ID3D12Fence> fence;
+  d->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence));
+  HANDLE done = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+  g.queue->Signal(fence.Get(), 1);
+  fence->SetEventOnCompletion(1, done);
+  WaitForSingleObject(done, 10000);
+  CloseHandle(done);
+  if (fence->GetCompletedValue() != 1 || FAILED(d->GetDeviceRemovedReason())) {
+    run.why = "the GPU did not finish";
+    return run;
+  }
+  uint8_t* q = nullptr;
+  back->Map(0, nullptr, reinterpret_cast<void**>(&q));
+  run.pixels.resize(size_t{width} * height * 4);
+  for (UINT y = 0; y < height; ++y) {
+    std::memcpy(run.pixels.data() + size_t{y} * width * 4, q + fp.Offset + size_t{y} * fp.Footprint.RowPitch, size_t{width} * 4);
+  }
+  back->Unmap(0, nullptr);
   run.ran = true;
   return run;
 }

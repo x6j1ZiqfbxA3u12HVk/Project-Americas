@@ -2,8 +2,8 @@
 
 // The shader translator: console RDNA 2 programs to HLSL, compiled by DXC to DXIL (plan, 5.6).
 //
-// Version 1 emulates the wave faithfully, one HLSL thread per console lane, at the program's
-// own wave size ([WaveSize]):
+// Version 1 emulates the wave faithfully, one HLSL thread per console lane (compute at the
+// program's own wave size, [WaveSize]; vertex and pixel shaders at the host's):
 // * SGPRs, VCC, EXEC, M0 and SCC are variables that every lane holds alike; VGPRs are per lane;
 // * EXEC is kept exactly: every vector write is predicated on the lane's EXEC bit, compares
 //   build their lane masks with WaveActiveBallot;
@@ -20,15 +20,29 @@
 #include <map>
 #include <span>
 #include <string>
+#include <vector>
 
 #include "shader/console_program.h"
 
 namespace am::shader {
 
 // Bumped whenever the output for some input changes: part of the cache key.
-constexpr uint32_t kTranslatorVersion = 2;
+constexpr uint32_t kTranslatorVersion = 3;
 
 enum class Binding : uint8_t { Test, Runtime };
+
+// Graphics stages: the shader's interface, from the container's signatures and the console
+// record (stage_io.h reads both).
+struct StageInput {
+  std::string semantic;
+  uint32_t semantic_index = 0;
+  uint32_t components = 4;
+  uint32_t vgpr = 0;  // VS: the first VGPR the console's vertex fetch fills with it
+};
+struct StageOutput {
+  std::string semantic;
+  uint32_t semantic_index = 0;
+};
 
 struct TranslateInput {
   std::span<const uint32_t> code;
@@ -38,6 +52,11 @@ struct TranslateInput {
   uint32_t lds_bytes = 0;
   uint32_t cs_rsrc2 = 0;
   uint32_t cs_threads[3] = {1, 1, 1};
+  // VS: vertex attributes; PS: the attributes v_interp reads, attribute N = inputs[N].
+  std::vector<StageInput> inputs;
+  // VS: exp parameter N = outputs[N]; PS: exp mrt N = outputs[N] (an SV_Target).
+  std::vector<StageOutput> outputs;
+  uint32_t user_sgprs = 16;  // graphics: the user data SGPRs the binding fills
 };
 
 struct Translation {
