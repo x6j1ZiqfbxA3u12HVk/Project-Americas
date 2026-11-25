@@ -6,6 +6,7 @@ add_executable(am_tests
   d3d12x_tests.cpp
   files_tests.cpp
   gpu_runner.cpp
+  bcpack_tests.cpp
   inflate_tests.cpp
   memory_tests.cpp
   pe_tests.cpp

@@ -1,2 +1,2 @@
-add_library(am_formats STATIC inflate.cpp)
+add_library(am_formats STATIC bcpack.cpp inflate.cpp)
 target_link_libraries(am_formats PUBLIC am_core)

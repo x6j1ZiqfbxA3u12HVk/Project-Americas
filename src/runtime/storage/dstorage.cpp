@@ -22,6 +22,9 @@
 #include <condition_variable>
 #include <cstring>
 #include <deque>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -29,7 +32,9 @@
 
 #include "core/json.h"
 #include "core/text.h"
+#include "formats/bcpack.h"
 #include "formats/inflate.h"
+#include "runtime/process.h"
 #include "runtime/d3d12x/bindings.h"
 #include "runtime/gdk/runtime.h"
 #include "runtime/hle/registry.h"
@@ -210,7 +215,30 @@ void retire(Queue* q) {
 
 // ---- executing a request ----
 
-thread_local std::vector<uint8_t> t_source, t_out;
+thread_local std::vector<uint8_t> t_source, t_out, t_blocks;
+
+// BCPack's constant tables: not ours and not in the repository, read once from
+// <root>	oolscpack	ables.bin (AMERICAS_BCPACK_TABLES names another file). nullptr when there
+// are none: BCPack requests are then refused.
+const formats::bcpack::Tables* bcpack_tables() {
+  static const std::unique_ptr<formats::bcpack::Tables> tables = [] {
+    std::filesystem::path file;
+    wchar_t named[MAX_PATH] = {};
+    if (GetEnvironmentVariableW(L"AMERICAS_BCPACK_TABLES", named, MAX_PATH)) file = named;
+    else if (TitleProcess* p = process(); p && !p->cache_dir().empty()) file = p->cache_dir().parent_path() / "tools" / "bcpack" / "tables.bin";
+    std::string error;
+    std::vector<uint8_t> bytes;
+    if (std::ifstream in = file.empty() ? std::ifstream() : std::ifstream(file, std::ios::binary); in) {
+      bytes.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    } else {
+      error = "no table file";
+    }
+    std::unique_ptr<formats::bcpack::Tables> t = error.empty() ? formats::bcpack::Tables::load(bytes, error) : nullptr;
+    logf("dstorage: BCPack tables %s (%s)", t ? "loaded" : "unavailable", t ? narrow(file.wstring()).c_str() : error.c_str());
+    return t;
+  }();
+  return tables.get();
+}
 
 bool read_file(File* f, uint64_t offset, uint32_t size, std::vector<uint8_t>& out, HRESULT& hr) {
   out.resize(size);
@@ -253,8 +281,14 @@ void log_refused(const Request& r, const char* why) {
 }
 
 HRESULT execute(const Request& r) {
-  if (r.options & (kBcpackMask | kTransformMask | kPageSource)) {
-    log_refused(r, r.options & kBcpackMask ? "BCPack not implemented yet" : "transform not implemented yet");
+  if (r.options & (kTransformMask | kPageSource)) {
+    log_refused(r, "transform not implemented yet");
+    return E_NOTIMPL;
+  }
+  const int bc = static_cast<int>((r.options & kBcpackMask) >> 1);
+  const formats::bcpack::Tables* tables = bc ? bcpack_tables() : nullptr;
+  if (bc && !tables) {
+    log_refused(r, "no BCPack tables (tools\bcpack\tables.bin)");
     return E_NOTIMPL;
   }
   // The source's bytes.
@@ -271,16 +305,43 @@ HRESULT execute(const Request& r) {
   src = t_source.data();
   // What goes to the destination.
   std::span<const uint8_t> data(src, r.source_size);
+  // The console's order: zlib first (into the intermediate size when BCPack follows), then BCPack.
   if (r.options & kZlib) {
-    t_out.resize(r.destination_size);
+    t_out.resize(bc ? r.intermediate_size : r.destination_size);
     const auto res = formats::inflate_zlib(data, t_out);
-    if (res.status != formats::InflateStatus::Ok || res.written != r.destination_size) {
-      log_refused(r, "zlib stream does not inflate to the destination size");
+    // The destination full before the stream ends: what fits is kept, as the decompression
+    // hardware stops at the destination's size (the game reads parts of larger streams so).
+    const bool full = res.status == formats::InflateStatus::OutputFull;
+    if (full) {
+      static std::atomic<int> told{0};
+      if (told.fetch_add(1) < 4) {
+        logf("dstorage: zlib stream longer than its destination (%u -> %zu bytes): what fits is kept", r.source_size,
+             t_out.size());
+      }
+    }
+    if (res.status != formats::InflateStatus::Ok && !full) {
+      static std::atomic<int> told{0};
+      if (told.fetch_add(1) < 8) {
+        logf("dstorage: zlib %s: %u -> %llu of %zu bytes", formats::inflate_status_name(res.status), r.source_size,
+             static_cast<unsigned long long>(res.written), t_out.size());
+      }
+      log_refused(r, "zlib stream does not inflate");
       return HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
     }
-    data = t_out;
-  } else if (r.source_size != r.destination_size) {
+    data = std::span<const uint8_t>(t_out.data(), full ? t_out.size() : res.written);
+  } else if (!bc && r.source_size != r.destination_size) {
     return E_INVALIDARG;
+  }
+  if (bc) {
+    t_blocks.resize(r.destination_size);
+    const formats::bcpack::Status st = formats::bcpack::decode(bc, data, t_blocks, *tables);
+    if (st != formats::bcpack::Status::Ok) {
+      static std::atomic<int> told{0};
+      if (told.fetch_add(1) < 8) logf("dstorage: BCPack (BC%d) %s", bc, formats::bcpack::status_name(st));
+      log_refused(r, "BCPack");
+      return HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
+    }
+    data = t_blocks;
   }
   if (r.options & kPageDestination) {
     const uint64_t within = r.page_offset & 0xFFFF;
