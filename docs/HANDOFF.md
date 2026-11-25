@@ -693,3 +693,36 @@ instruction:
   for shader containers. **Next:** decode slot 67 as was done for slot 57 (blocks, the
   program's marker), make a host compute pipeline from the precompiled DXIL on the worker
   thread, then check the font atlas and the loading passes with dispatches running.
+
+## Through the first-run menus (2026-11-25, night)
+
+**Getting through the menus** (from the user; keys: Enter = A, Escape = B):
+1. The start screen (account picker): Enter.
+2. The setup pages: Enter on each.
+3. Legal Notices: Down, wait 5-6 s, Down, Enter.
+4. Rockstar Games Legal Terms & Policies: Enter, Down, Enter, Down, Enter (both boxes, then
+   Confirm).
+
+Unattended, as one `AMERICAS_PRESS`:
+`A:45,A:53,A:61,A:69,A:77,A:85,A:93,DOWN:110,DOWN:117,A:119,A:130,DOWN:136,A:142,DOWN:148,A:154`.
+
+**After Confirm the screen stays empty: the game starts streaming assets and DirectStorage
+refuses them.** BCPack-compressed requests (options 0x200002, "BCPack not implemented yet"),
+and zlib requests whose stream does not inflate to the destination size (options 0x200001).
+**Next:**
+* Implement BCPack decoding. This is the console's texture codec in DirectStorage.
+* Fix the zlib size mismatch.
+
+Then the larger pieces before the 3D world shows:
+* **Mesh shaders:** 9,282 of the game's programs; the translator does not do them yet.
+* **Compute correctness:** dispatches run with `AMERICAS_COMPUTE=1` but blank the menus.
+* GFX10 detiling, 16-bit interpolation and depth export.
+
+**This session also:**
+* Slot 67 (console compute pipelines) is decoded.
+* Compute pipelines are made in a two-thread pool, plus a lane for programs over 256 KB.
+  The driver takes up to a minute over some.
+* Writable textures (UAV views, simultaneous access) are in.
+* Slot 19 writes real descriptors.
+* The precompile does `wanted-first.txt` first and keeps `cpipe-index.tsv`. A pass now
+  starts in seconds.
