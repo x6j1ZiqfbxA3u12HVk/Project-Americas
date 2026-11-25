@@ -297,8 +297,9 @@ the 26,503 records of `shaders.rpf`.
    * SGPRs, VCC, EXEC, M0 and SCC are variables every lane holds alike; VGPRs are per lane;
    * EXEC is kept exactly: each vector write is predicated on the lane's EXEC bit, and compares
      build their lane masks with `WaveActiveBallot`;
-   * this GPU's branches are always wave-uniform, so control flow is a dispatcher loop, a
-     `switch` over block starts. That is correct for every program without structuring;
+   * this GPU's branches are always wave-uniform, so control flow can stay as the console has
+     it: nested `if`s and loops rebuilt from the CFG (structuring, below), or, for the rare
+     irreducible one, a dispatcher loop: a `switch` over block starts;
    * memory goes through a binding model's functions: the tests map GPU addresses onto one
      buffer; the runtime's model (the graphics layer's page table and descriptors) comes with
      M4.
@@ -307,7 +308,7 @@ the 26,503 records of `shaders.rpf`.
    The GPU tests check every change.
 4. **IR and analysis** (speed, after version 1).
    * SSA IR and control-flow graph;
-   * structuring (loops, branches, far jumps);
+   * structuring (loops, branches, far jumps): **done**, see M3.2;
    * EXEC-mask removal (lane masks become per-lane predicates);
    * uniformity analysis (scalar register math stays wave-uniform in DXIL);
    * resource tracing (each T#/V#/S# back to its root argument, table or heap slot).
@@ -897,13 +898,25 @@ builder's `XMemVirtualQuery` calls, and the arguments logged at run time.
     HLSL; the tests' programs too).
   * What still blocks compute: `ds_swizzle_b32` 113, LDS atomics and `st64` forms, D16 buffer
     forms, 16-bit and packed ALU ops, ray tracing (`image_bvh*`, 56).
-* **Compile time is now the problem.** The translated HLSL is large (median 242 KiB, 90th
-  percentile 1.6 MiB), and DXC's time grows faster than its size:
-  * 42 KiB: 0.4 s; 242 KiB: 6 s; 1.6 MiB: 50 s even at `-O0`, 7 to 9 minutes at `-O3`.
-  * Most of it is LLVM's value propagation and GVN (`-ftime-report`): every register flows
-    through the dispatcher's loop header from every block (811 blocks in the largest).
-  * So structured control flow (step 4: `if` / loops from the CFG instead of
-    `switch (pc)`) comes next. It is also what the GPU wants at run time.
+* **Structured control flow** (translator 2). The blocks' CFG becomes nested loops, blocks
+  and `if`s, after Ramsey's "Beyond Relooper":
+  * reverse postorder, dominators (Cooper, Harvey and Kennedy), back edges, merge points;
+  * a node's merge children follow it, each after a block (`switch (0u) { default: }`, which
+    LLVM sees no loop in) that branches to it leave;
+  * a loop header opens `for (;;)` that its back edges `continue`;
+  * a branch past more than the innermost construct sets `am_br` and unwinds;
+  * irreducible CFGs keep the dispatcher: 12 of the 2,070 compute programs.
+* **Compile time.** The dispatcher made DXC's time grow much faster than the program:
+  * with it, 1.6 MiB of HLSL took 50 s even at `-O0` and 7 to 9 minutes at `-O3`. Most of
+    that was value propagation and GVN over a loop header that every register crossed;
+  * structured, the largest program took 147 s, and about a third of that was LLVM's loop
+    passes over loops inside the inlined helpers;
+  * with the helpers loop-free (a two-slot cuckoo table for descriptors, written-out channel
+    code), it takes **38 s**. The median program takes 4.7 s;
+  * a full run over all 2,070 at `-O3` is under way: its first 200 took 22 minutes on this 4-core PC (eight at a time), so the whole set takes about 3 to 4 hours, an overnight job.
+  * What is left is mostly value propagation over the register file (`s[128]` and the VGPRs)
+    in the program's own loops. That is for the IR step: registers as SSA values, each live
+    only where it is used.
 
 ### M2.3: console files and DirectStorage (done)
 

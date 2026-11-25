@@ -49,8 +49,9 @@ ends the run.
 checked against LLVM (100 % on 2.8 M instructions). **Translator version 1 runs** (PLAN.md,
 section 11, "M3.2"): compute programs become HLSL, one thread per console lane, and are checked
 on the host GPU against the ISA. With images (a descriptor table the host keeps, SM 6.6 heaps)
-**2,070 of 2,682 compute programs (77 %) translate**. DXC compiles them, but large ones take
-minutes (7 to 9 minutes at `-O3` for the largest): structured control flow is the next step.
+**2,070 of 2,682 compute programs (77 %) translate**. Control flow is rebuilt as nested ifs
+and loops (2,058 of them; the irreducible rest keep a dispatcher), so DXC compiles the largest
+in 38 s and the median in 5 s.
 
 ## 1. Rules from the user (follow them exactly)
 
@@ -287,9 +288,11 @@ RDNA 2 decoder decodes all 26,084 programs by control flow, checked against LLVM
      (`shader/image_bindings`: the host maps T# / S# words to heap indices; misses are queued).
    * `am-shaders images` lists every image form; `tsurvey <n> --raw <dir>` writes the HLSL
      of `n` translated programs instead of compiling them (time them with `dxc.exe`).
-   * Next: **structured control flow**, because compile time grows too fast with the
-     dispatcher (PLAN.md 11, M3.2). Then the other stages (PS/VS/mesh I/O from the FSSM
-     records), the indirect jumps, and the runtime binding model (M4).
+   * Structured control flow is done (`Structurer` in `translate.cpp`; the dispatcher stays
+     for irreducible CFGs).
+   * Next: the other stages (PS/VS/mesh I/O from the FSSM records), the indirect jumps, and
+     the runtime binding model (M4). Then registers as SSA values (IR) for faster compiles
+     and faster code.
    * Then the speed work (IR, structuring, uniformity) and `am-shaders precompile`.
    * It must be resumable, run below normal priority, and be content-addressed (console bytes
      + translator version).

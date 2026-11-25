@@ -26,7 +26,7 @@
 namespace am::shader {
 
 // Bumped whenever the output for some input changes: part of the cache key.
-constexpr uint32_t kTranslatorVersion = 1;
+constexpr uint32_t kTranslatorVersion = 2;
 
 enum class Binding : uint8_t { Test, Runtime };
 
@@ -47,6 +47,7 @@ struct Translation {
   std::string profile = "cs_6_6";
   uint32_t wave_size = 64;
   uint32_t vgpr_count = 0;           // VGPRs the HLSL keeps per lane
+  bool structured = false;           // nested ifs and loops (else one loop over a switch)
   std::string failure;               // the first reason it failed
   std::map<std::string, int> unsupported;  // instruction names (or reasons) and how often
 };

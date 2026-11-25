@@ -108,7 +108,7 @@ int translation_survey(const fs::path& pack_dir, const fs::path& out_json, size_
   const auto start = std::chrono::steady_clock::now();
   SetPriorityClass(GetCurrentProcess(), BELOW_NORMAL_PRIORITY_CLASS);
   std::mutex lock;
-  std::map<std::string, uint64_t> missing, stages_total, stages_ok;  // missing: programs blocked by it
+  std::map<std::string, uint64_t> missing, stages_total, stages_ok, stages_structured;  // missing: programs blocked by it
   std::map<std::string, uint64_t> first_missing;
   std::vector<std::pair<std::string, shader::Translation>> to_compile;
   std::atomic<size_t> next{0};
@@ -126,6 +126,7 @@ int translation_survey(const fs::path& pack_dir, const fs::path& out_json, size_
             ++stages_total[shader::hw_stage_name(p.stage)];
             if (t.ok) {
               ++stages_ok[shader::hw_stage_name(p.stage)];
+              if (t.structured) ++stages_structured[shader::hw_stage_name(p.stage)];
               if (to_compile.size() < compile_sample) to_compile.emplace_back(narrow(files[i].stem().wstring()), std::move(t));
             } else {
               for (const auto& [k, n] : t.unsupported) ++missing[k];
@@ -182,7 +183,9 @@ int translation_survey(const fs::path& pack_dir, const fs::path& out_json, size_
   JsonWriter j;
   j.begin_object().field("translator_version", static_cast<uint64_t>(shader::kTranslatorVersion)).field("seconds", seconds);
   j.key("programs").begin_object();
-  for (const auto& [k, n] : stages_total) j.key(k).begin_object().field("total", n).field("translated", stages_ok[k]).end_object();
+  for (const auto& [k, n] : stages_total) {
+    j.key(k).begin_object().field("total", n).field("translated", stages_ok[k]).field("structured", stages_structured[k]).end_object();
+  }
   j.end_object();
   j.field("compile_sample", static_cast<uint64_t>(to_compile.size())).field("compiled", compiled.load());
   std::vector<std::pair<uint64_t, std::string>> m;
@@ -199,8 +202,9 @@ int translation_survey(const fs::path& pack_dir, const fs::path& out_json, size_
 
   std::printf("translation survey (translator %u), %.1f s\n", shader::kTranslatorVersion, seconds);
   for (const auto& [k, n] : stages_total) {
-    std::printf("  %-3s %6llu programs, %6llu translated (%.1f %%)\n", k.c_str(), static_cast<unsigned long long>(n),
-                static_cast<unsigned long long>(stages_ok[k]), 100.0 * stages_ok[k] / n);
+    std::printf("  %-3s %6llu programs, %6llu translated (%.1f %%), %llu structured\n", k.c_str(),
+                static_cast<unsigned long long>(n), static_cast<unsigned long long>(stages_ok[k]), 100.0 * stages_ok[k] / n,
+                static_cast<unsigned long long>(stages_structured[k]));
   }
   std::printf("DXC: %llu of %zu compiled\n", static_cast<unsigned long long>(compiled.load()), to_compile.size());
   std::sort(slowest.rbegin(), slowest.rend());

@@ -5,10 +5,20 @@
 
 namespace am::shader {
 
-// FNV-1a over the words, folded (the translated program computes the same).
+// FNV-1a over the words, folded; the second slot mixes it further (the translated program
+// computes the same).
 uint32_t binding_hash(std::span<const uint32_t, 8> words) {
   uint32_t h = 0x811C9DC5u;
   for (uint32_t w : words) h = (h ^ w) * 0x01000193u;
+  return h ^ (h >> 16);
+}
+
+uint32_t binding_hash2(uint32_t h) {
+  h ^= 0x5BD1E995u;
+  h ^= h >> 16;
+  h *= 0x85EBCA6Bu;
+  h ^= h >> 13;
+  h *= 0xC2B2AE35u;
   return h ^ (h >> 16);
 }
 
@@ -16,26 +26,37 @@ namespace {
 
 constexpr uint32_t kHeader = 32, kImageEntry = 64, kSamplerEntry = 48, kMissRecord = 48;
 
-// Places each key; false if one needs more than kProbes probes.
+// Cuckoo hashing: each key in one of its two slots. False when the table must grow.
 template <typename Key>
 bool place(const std::vector<Key>& keys, uint32_t capacity, std::vector<int>& slot_of) {
   std::vector<int> owner(capacity, -1);
-  slot_of.assign(keys.size(), -1);
-  for (size_t k = 0; k < keys.size(); ++k) {
+  const auto slot = [&](int k, int which) {
     const uint32_t h = binding_hash(keys[k]);
+    return static_cast<int>((which == 0 ? h : binding_hash2(h)) & (capacity - 1));
+  };
+  for (int k = 0; k < static_cast<int>(keys.size()); ++k) {
+    const int a = slot(k, 0), b = slot(k, 1);
+    if ((owner[a] >= 0 && keys[owner[a]] == keys[k]) || (owner[b] >= 0 && keys[owner[b]] == keys[k])) continue;  // twice
+    int cur = k, at = a;
     bool placed = false;
-    for (uint32_t p = 0; p < kProbes && !placed; ++p) {
-      const uint32_t s = (h + p) & (capacity - 1);
-      if (owner[s] < 0) {
-        owner[s] = static_cast<int>(k);
-        slot_of[k] = static_cast<int>(s);
-        placed = true;
-      } else if (keys[owner[s]] == keys[k]) {
-        slot_of[k] = static_cast<int>(s);  // the same descriptor twice: the first entry stands
-        placed = true;
-      }
+    for (int kick = 0; kick < 128 && !placed; ++kick) {
+      std::swap(cur, owner[at]);
+      if (cur < 0) placed = true;
+      else at = slot(cur, 0) == at ? slot(cur, 1) : slot(cur, 0);  // the displaced key's other slot
     }
     if (!placed) return false;
+  }
+  slot_of.assign(keys.size(), -1);
+  for (uint32_t s = 0; s < capacity; ++s) {
+    if (owner[s] >= 0) slot_of[owner[s]] = static_cast<int>(s);
+  }
+  // A repeated key points at its first copy's slot.
+  for (int k = 0; k < static_cast<int>(keys.size()); ++k) {
+    if (slot_of[k] >= 0) continue;
+    for (int which = 0; which < 2; ++which) {
+      const int s = slot(k, which);
+      if (owner[s] >= 0 && keys[owner[s]] == keys[k]) slot_of[k] = s;
+    }
   }
   return true;
 }

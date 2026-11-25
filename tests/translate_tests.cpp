@@ -20,6 +20,7 @@ using namespace am::shader;
 
 struct Result {
   bool ran = false;
+  bool structured = false;
   uint32_t nv = 0;
   std::vector<uint32_t> dump, memory, bindings;
   std::vector<std::vector<uint8_t>> textures;
@@ -41,6 +42,7 @@ Result run(const std::vector<uint32_t>& code, std::vector<uint32_t> user = {}, s
   in.cs_threads[0] = 64;
   const Translation t = translate(in, Binding::Test);
   CHECK(t.ok);
+  r.structured = t.structured;
   if (!t.ok) {
     std::printf("    not translated: %s\n", t.failure.c_str());
     return r;
@@ -629,4 +631,135 @@ TEST_CASE(translate_images) {
   // The missing T# was queued for the host.
   const uint32_t misses_at = r.bindings[4] / 4;
   CHECK(r.bindings[6] >= 1 && r.bindings[misses_at] == 1 && std::memcmp(&r.bindings[misses_at + 4], missing, 32) == 0);
+}
+
+TEST_CASE(translate_structured_control_flow) {
+  const Result r = run({
+      0xBE800380,  // s_mov_b32 s0, 0                 i
+      0xBE820380,  // s_mov_b32 s2, 0                 iterations
+      0xBE830380,  // s_mov_b32 s3, 0
+      0xBE850380,  // s_mov_b32 s5, 0
+      // outer:
+      0xBE810380,  // s_mov_b32 s1, 0                 j
+      // inner:
+      0x80028102,  // s_add_u32 s2, s2, 1
+      0xBF068301,  // s_cmp_eq_u32 s1, 3
+      0xBF840002,  // s_cbranch_scc0 skip
+      0xBF068400,  // s_cmp_eq_u32 s0, 4
+      0xBF850008,  // s_cbranch_scc1 done            out of both loops
+      // skip:
+      0x80018101,  // s_add_u32 s1, s1, 1
+      0xBF0A8501,  // s_cmp_lt_u32 s1, 5
+      0xBF85FFF8,  // s_cbranch_scc1 inner
+      0x80008100,  // s_add_u32 s0, s0, 1
+      0xBF0A8A00,  // s_cmp_lt_u32 s0, 10
+      0xBF85FFF4,  // s_cbranch_scc1 outer
+      0xBE8303FF, 0x0000006F,  // s_mov_b32 s3, 111   (only if the loops end normally)
+      // done:
+      0xBE840380,  // s_mov_b32 s4, 0
+      // count:
+      0x80048104,  // s_add_u32 s4, s4, 1
+      0x87068104,  // s_and_b32 s6, s4, 1
+      0xBF068006,  // s_cmp_eq_u32 s6, 0
+      0xBF850001,  // s_cbranch_scc1 count_next      (continue)
+      0x80050405,  // s_add_u32 s5, s5, s4
+      // count_next:
+      0xBF0A8904,  // s_cmp_lt_u32 s4, 9
+      0xBF85FFF9,  // s_cbranch_scc1 count
+      0xBF089405,  // s_cmp_gt_u32 s5, 20
+      0xBF840002,  // s_cbranch_scc0 small
+      0xBE870381,  // s_mov_b32 s7, 1
+      0xBF820001,  // s_branch joined
+      // small:
+      0xBE870382,  // s_mov_b32 s7, 2
+      // joined:
+      0x7E020285,  // v_mov_b32 v1, 5
+      0xBE88047E,  // s_mov_b64 s[8:9], exec
+      0xBEFE0480,  // s_mov_b64 exec, 0
+      0xBF880002,  // s_cbranch_execz after
+      0x7E0202FF, 0x00000063,  // v_mov_b32 v1, 99
+      // after:
+      0xBEFE0408,  // s_mov_b64 exec, s[8:9]
+      0x7D88008A,  // v_cmp_gt_u32 vcc, 10, v0
+      0xBE8A246A,  // s_and_saveexec_b64 s[10:11], vcc
+      0xBF880001,  // s_cbranch_execz no_lanes
+      0x7E040287,  // v_mov_b32 v2, 7
+      // no_lanes:
+      0xBEFE040A,  // s_mov_b64 exec, s[10:11]
+      0xBF810000,  // s_endpgm
+  });
+  CHECK(r.structured);
+  if (!r.ran) return;
+  CHECK(r.s(0) == 4 && r.s(1) == 3 && r.s(2) == 24 && r.s(3) == 0);  // 4 x 5 + 4 iterations, then out of both
+  CHECK(r.s(4) == 9 && r.s(5) == 25 && r.s(7) == 1);                   // 1 + 3 + 5 + 7 + 9
+  CHECK(r.s(126) == 0xFFFFFFFFu && r.s(127) == 0xFFFFFFFFu);
+  bool ok = true;
+  for (int l = 0; l < 64; ++l) ok = ok && r.v(l, 1) == 5 && r.v(l, 2) == (l < 10 ? 7u : 0u);
+  CHECK(ok);
+}
+
+// Two ways into one loop: not reducible, so the dispatcher runs it.
+TEST_CASE(translate_irreducible_control_flow) {
+  const std::vector<uint32_t> code = {
+      0xBE810380,  // s_mov_b32 s1, 0
+      0xBF068000,  // s_cmp_eq_u32 s0, 0
+      0xBF850001,  // s_cbranch_scc1 b
+      // a:
+      0x80018101,  // s_add_u32 s1, s1, 1
+      // b:
+      0x80018201,  // s_add_u32 s1, s1, 2
+      0xBF0A8A01,  // s_cmp_lt_u32 s1, 10
+      0xBF85FFFC,  // s_cbranch_scc1 a
+      0xBF810000,  // s_endpgm
+  };
+  const Result in_at_b = run(code, {0});
+  CHECK(!in_at_b.structured);
+  if (in_at_b.ran) CHECK(in_at_b.s(1) == 11);
+  const Result in_at_a = run(code, {1});
+  if (in_at_a.ran) CHECK(in_at_a.s(1) == 12);
+}
+
+// The bindings table on the CPU: every descriptor in one of its two slots, as the program reads it.
+TEST_CASE(image_bindings_table) {
+  namespace sh = am::shader;
+  std::vector<sh::ImageBinding> images(3000);
+  std::vector<sh::SamplerBinding> samplers(500);
+  uint32_t x = 12345;
+  const auto next = [&x] { return x = x * 1664525u + 1013904223u; };
+  for (size_t i = 0; i < images.size(); ++i) {
+    for (uint32_t& w : images[i].words) w = next();
+    images[i].srv = static_cast<uint32_t>(3 * i);
+    images[i].flags = static_cast<uint32_t>(i & 7);
+  }
+  for (size_t i = 0; i < samplers.size(); ++i) {
+    for (uint32_t& w : samplers[i].words) w = next();
+    samplers[i].index = static_cast<uint32_t>(i);
+  }
+  images.push_back(images[17]);  // a descriptor twice: the first entry stands
+  images.back().srv = 999999;
+  const std::vector<uint32_t> t = sh::build_bindings(images, samplers, 16);
+  CHECK(!t.empty());
+  if (t.empty()) return;
+  const auto find = [&](uint32_t table, uint32_t cap, uint32_t size, const uint32_t* key, int words) -> const uint32_t* {
+    uint32_t k[8] = {};
+    std::memcpy(k, key, 4 * words);
+    const uint32_t h = sh::binding_hash(std::span<const uint32_t, 8>(k, 8));
+    for (const uint32_t slot : {h & (cap - 1), sh::binding_hash2(h) & (cap - 1)}) {
+      const uint32_t* e = &t[(table + slot * size) / 4];
+      if (e[11] != 0 && std::memcmp(e, k, 32) == 0) return e;
+    }
+    return nullptr;
+  };
+  bool ok = true;
+  for (size_t i = 0; i < 3000 && ok; ++i) {
+    const uint32_t* e = find(t[0], t[1], 64, images[i].words, 8);
+    ok = e && e[8] == 3 * i && e[11] == ((i & 7) | sh::kBindingValid);
+  }
+  CHECK(ok);
+  for (size_t i = 0; i < samplers.size() && ok; ++i) {
+    const uint32_t* e = find(t[2], t[3], 48, samplers[i].words, 4);
+    ok = e && e[8] == i;
+  }
+  CHECK(ok);
+  CHECK(t[5] == 16 && t[6] == 0 && t[4] + 16 * 48 == t.size() * 4);  // the miss list: 16 records, none yet
 }

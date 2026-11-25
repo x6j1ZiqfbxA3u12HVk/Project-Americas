@@ -1308,25 +1308,20 @@ float4 am_cube(float x, float y, float z) {
   return float4(x < 0.0f ? 1.0f : 0.0f, x < 0.0f ? z : -z, -y, 2.0f * x);
 }
 uint am_wqm(uint a) {
-  uint r = 0u;
-  [unroll] for (uint q = 0u; q < 8u; ++q) if ((a >> (4u * q)) & 0xFu) r |= 0xFu << (4u * q);
-  return r;
+  uint x = a | (a >> 1);
+  x |= x >> 2;  // bit 4q: any bit of nibble q
+  return (x & 0x11111111u) * 0xFu;
 }
 // v_perm_b32: each selector byte picks a byte of {s0, s1} or a constant.
+uint am_perm_byte(uint64_t x, uint k) {
+  if (k <= 7u) return uint(x >> (8u * k)) & 0xFFu;
+  if (k <= 11u) return (uint(x >> (8u * (2u * (k - 8u) + 1u))) & 0x80u) ? 0xFFu : 0u;  // a sign, spread
+  return k == 12u ? 0u : 0xFFu;
+}
 uint am_perm(uint s0, uint s1, uint sel) {
   uint64_t x = (uint64_t(s0) << 32) | s1;
-  uint r = 0u;
-  [unroll] for (uint i = 0u; i < 4u; ++i) {
-    uint k = (sel >> (8u * i)) & 0xFFu, b;
-    if (k <= 7u) b = uint(x >> (8u * k)) & 0xFFu;
-    else if (k <= 11u) {  // the sign of byte 1, 3, 5 or 7, spread
-      uint src = 2u * (k - 8u) + 1u;
-      b = (uint(x >> (8u * src)) & 0x80u) ? 0xFFu : 0u;
-    } else if (k == 12u) b = 0u;
-    else b = 0xFFu;
-    r |= b << (8u * i);
-  }
-  return r;
+  return am_perm_byte(x, sel & 0xFFu) | (am_perm_byte(x, (sel >> 8) & 0xFFu) << 8) |
+         (am_perm_byte(x, (sel >> 16) & 0xFFu) << 16) | (am_perm_byte(x, sel >> 24) << 24);
 }
 uint am_cvt_pk_u8(float f, uint byte_index, uint into) {
   uint v = am_cvt_u32(round(f));
@@ -1391,21 +1386,25 @@ struct AmSampler { uint index; uint flags; };
 #define AM_DY(x) (WaveReadLaneAt(x, am_lane | 2u) - WaveReadLaneAt(x, am_lane & ~2u))
 uint am_bind_hash(uint4 a, uint4 b) {
   uint h = 0x811C9DC5u;
-  [unroll] for (uint i = 0u; i < 4u; ++i) h = (h ^ a[i]) * 0x01000193u;
-  [unroll] for (uint j = 0u; j < 4u; ++j) h = (h ^ b[j]) * 0x01000193u;
+  h = (h ^ a.x) * 0x01000193u; h = (h ^ a.y) * 0x01000193u; h = (h ^ a.z) * 0x01000193u; h = (h ^ a.w) * 0x01000193u;
+  h = (h ^ b.x) * 0x01000193u; h = (h ^ b.y) * 0x01000193u; h = (h ^ b.z) * 0x01000193u; h = (h ^ b.w) * 0x01000193u;
   return h ^ (h >> 16);
 }
+uint am_bind_hash2(uint h) {
+  h ^= 0x5BD1E995u;
+  h ^= h >> 16; h *= 0x85EBCA6Bu; h ^= h >> 13; h *= 0xC2B2AE35u;
+  return h ^ (h >> 16);
+}
+uint4 am_bind_slot(uint at, uint4 a, uint4 b) {
+  uint4 v = am_bindings.Load4(at + 32u);
+  return (v.w != 0u && all(am_bindings.Load4(at) == a) && all(am_bindings.Load4(at + 16u) == b)) ? v : uint4(0u, 0u, 0u, 0u);
+}
 uint4 am_bind_find(uint table, uint cap, uint size, uint4 a, uint4 b) {
-  if (cap != 0u) {
-    uint h = am_bind_hash(a, b);
-    [loop] for (uint p = 0u; p < 16u; ++p) {
-      uint at = table + ((h + p) & (cap - 1u)) * size;
-      uint4 v = am_bindings.Load4(at + 32u);
-      if (v.w == 0u) break;
-      if (all(am_bindings.Load4(at) == a) && all(am_bindings.Load4(at + 16u) == b)) return v;
-    }
-  }
-  return uint4(0u, 0u, 0u, 0u);
+  if (cap == 0u) return uint4(0u, 0u, 0u, 0u);
+  uint h = am_bind_hash(a, b);
+  uint4 v = am_bind_slot(table + (h & (cap - 1u)) * size, a, b);
+  if (v.w == 0u) v = am_bind_slot(table + (am_bind_hash2(h) & (cap - 1u)) * size, a, b);
+  return v;
 }
 // A descriptor the table lacks: queued once a wave for the host.
 void am_bind_miss(uint kind, uint4 a, uint4 b) {
@@ -1676,79 +1675,89 @@ void am_buffer_address(uint4 rs, uint index, uint offset, uint soffset, out uint
 uint am_fmt_info(uint f) { return f < 78u ? am_formats[f] : 0u; }
 uint am_fmt_width(uint info, uint k) { return (info >> (6u + 6u * k)) & 63u; }
 uint am_fmt_bytes(uint info) {
-  uint bits = 0u;
-  for (uint k = 0u; k < ((info >> 3) & 7u); ++k) bits += am_fmt_width(info, k);
-  return bits >> 3;
+  // Absent channels have width 0.
+  return (am_fmt_width(info, 0u) + am_fmt_width(info, 1u) + am_fmt_width(info, 2u) + am_fmt_width(info, 3u)) >> 3;
 }
 // The 1 a missing W reads as: 1 for the integer types, 1.0 otherwise.
 uint am_fmt_one(uint info) { uint t = info & 7u; return t == 4u || t == 5u ? 1u : 0x3F800000u; }
 
 // One typed element: its channels as the shader sees them, after the V#'s selects (word 3, three
 // bits a channel: 0, 1, or X..W as 4..7). Out of bounds reads zero.
+// One channel of a typed element: its bits at `o` in `raw`, converted by the format's type.
+uint am_fmt_chan(uint4 raw, uint info, uint k, uint o) {
+  if (k >= ((info >> 3) & 7u)) return k == 3u ? am_fmt_one(info) : 0u;
+  uint t = info & 7u, w = am_fmt_width(info, k);
+  uint m = w == 32u ? 0xFFFFFFFFu : (1u << w) - 1u;
+  uint x = (raw[o >> 5] >> (o & 31u)) & m;
+  int sx = int(x << (32u - w)) >> (32u - w);
+  if (t == 0u) return asuint(float(x) / float(m));
+  if (t == 1u) return asuint(max(float(sx) / float(m >> 1), -1.0f));
+  if (t == 2u) return asuint(float(x));
+  if (t == 3u) return asuint(float(sx));
+  if (t == 4u) return x;
+  if (t == 5u) return asuint(sx);
+  if (w == 32u) return x;
+  return asuint(f16tof32(x << (15u - min(w, 15u))));  // half, or the unsigned 11/10-bit floats
+}
+uint am_fmt_select(uint4 c, uint info, uint sel) { return sel >= 4u ? c[sel - 4u] : sel == 1u ? am_fmt_one(info) : 0u; }
 uint4 am_fmt_load(uint64_t p, uint lim, uint info, uint w3) {
   uint eb = am_fmt_bytes(info);
   if (eb == 0u || eb > lim) return uint4(0u, 0u, 0u, 0u);
-  uint raw[4] = {0u, 0u, 0u, 0u};
-  if (eb < 4u) raw[0] = am_load(p & ~uint64_t(3)) >> (uint(p & 3u) * 8u);
-  else for (uint d = 0u; d < eb / 4u; ++d) raw[d] = am_load(p + 4u * d);
-  uint t = info & 7u, n = (info >> 3) & 7u, o = 0u;
-  uint c[4];
-  for (uint k = 0u; k < 4u; ++k) {
-    if (k >= n) { c[k] = k == 3u ? am_fmt_one(info) : 0u; continue; }
-    uint w = am_fmt_width(info, k);
-    uint m = w == 32u ? 0xFFFFFFFFu : (1u << w) - 1u;
-    uint x = (raw[o >> 5] >> (o & 31u)) & m;
-    int sx = int(x << (32u - w)) >> (32u - w);
-    o += w;
-    if (t == 0u) c[k] = asuint(float(x) / float(m));
-    else if (t == 1u) c[k] = asuint(max(float(sx) / float(m >> 1), -1.0f));
-    else if (t == 2u) c[k] = asuint(float(x));
-    else if (t == 3u) c[k] = asuint(float(sx));
-    else if (t == 4u) c[k] = x;
-    else if (t == 5u) c[k] = asuint(sx);
-    else if (w == 32u) c[k] = x;
-    else c[k] = asuint(f16tof32(x << (15u - min(w, 15u))));  // half, or the unsigned 11/10-bit floats
+  uint4 raw = uint4(0u, 0u, 0u, 0u);
+  if (eb < 4u) {
+    raw.x = am_load(p & ~uint64_t(3)) >> (uint(p & 3u) * 8u);
+  } else {
+    raw.x = am_load(p);
+    if (eb >= 8u) raw.y = am_load(p + 4u);
+    if (eb >= 12u) raw.z = am_load(p + 8u);
+    if (eb >= 16u) raw.w = am_load(p + 12u);
   }
-  uint4 r;
-  for (uint ch = 0u; ch < 4u; ++ch) {
-    uint sel = (w3 >> (3u * ch)) & 7u;
-    r[ch] = sel >= 4u ? c[sel - 4u] : sel == 1u ? am_fmt_one(info) : 0u;
-  }
-  return r;
+  uint w0 = am_fmt_width(info, 0u), w1 = am_fmt_width(info, 1u), w2 = am_fmt_width(info, 2u);
+  uint4 c = uint4(am_fmt_chan(raw, info, 0u, 0u), am_fmt_chan(raw, info, 1u, w0), am_fmt_chan(raw, info, 2u, w0 + w1),
+                  am_fmt_chan(raw, info, 3u, w0 + w1 + w2));
+  return uint4(am_fmt_select(c, info, w3 & 7u), am_fmt_select(c, info, (w3 >> 3) & 7u), am_fmt_select(c, info, (w3 >> 6) & 7u),
+               am_fmt_select(c, info, (w3 >> 9) & 7u));
 }
 
+// Writes the first `n` channels of one typed element.
+// One channel's bits for a store, placed at `o` into data / mask.
+void am_fmt_put(inout uint4 data, inout uint4 mask, uint info, uint k, uint o, uint n, uint value) {
+  if (k >= ((info >> 3) & 7u) || k >= n) return;
+  uint t = info & 7u, w = am_fmt_width(info, k);
+  uint m = w == 32u ? 0xFFFFFFFFu : (1u << w) - 1u, h = m >> 1;
+  float f = asfloat(value);
+  uint x;
+  if (t == 0u) x = uint(round(saturate(f) * float(m)));
+  else if (t == 1u) x = uint(int(round(clamp(f, -1.0f, 1.0f) * float(h))));
+  else if (t == 2u) x = min(am_cvt_u32(f), m);
+  else if (t == 3u) x = uint(clamp(am_cvt_i32(f), -int(h) - 1, int(h)));
+  else if (t == 4u) x = min(value, m);
+  else if (t == 5u) x = uint(clamp(int(value), -int(h) - 1, int(h)));
+  else if (w == 32u) x = value;
+  else if (w == 16u) x = f32tof16(f);
+  else x = f32tof16(max(f, 0.0f)) >> (15u - w);
+  data[o >> 5] |= (x & m) << (o & 31u);
+  mask[o >> 5] |= m << (o & 31u);
+}
 // Writes the first `n` channels of one typed element.
 void am_fmt_store(uint64_t p, uint lim, uint info, uint n, uint4 val) {
   uint eb = am_fmt_bytes(info);
   if (eb == 0u || eb > lim) return;
-  uint t = info & 7u, o = 0u;
-  uint data[4] = {0u, 0u, 0u, 0u}, mask[4] = {0u, 0u, 0u, 0u};
-  for (uint k = 0u; k < ((info >> 3) & 7u); ++k) {
-    uint w = am_fmt_width(info, k);
-    uint m = w == 32u ? 0xFFFFFFFFu : (1u << w) - 1u, h = m >> 1;
-    if (k < n) {
-      float f = asfloat(val[k]);
-      uint x;
-      if (t == 0u) x = uint(round(saturate(f) * float(m)));
-      else if (t == 1u) x = uint(int(round(clamp(f, -1.0f, 1.0f) * float(h))));
-      else if (t == 2u) x = min(am_cvt_u32(f), m);
-      else if (t == 3u) x = uint(clamp(am_cvt_i32(f), -int(h) - 1, int(h)));
-      else if (t == 4u) x = min(val[k], m);
-      else if (t == 5u) x = uint(clamp(int(val[k]), -int(h) - 1, int(h)));
-      else if (w == 32u) x = val[k];
-      else if (w == 16u) x = f32tof16(f);
-      else x = f32tof16(max(f, 0.0f)) >> (15u - w);
-      data[o >> 5] |= (x & m) << (o & 31u);
-      mask[o >> 5] |= m << (o & 31u);
-    }
-    o += w;
-  }
+  uint4 data = uint4(0u, 0u, 0u, 0u), mask = uint4(0u, 0u, 0u, 0u);
+  uint w0 = am_fmt_width(info, 0u), w1 = am_fmt_width(info, 1u), w2 = am_fmt_width(info, 2u);
+  am_fmt_put(data, mask, info, 0u, 0u, n, val.x);
+  am_fmt_put(data, mask, info, 1u, w0, n, val.y);
+  am_fmt_put(data, mask, info, 2u, w0 + w1, n, val.z);
+  am_fmt_put(data, mask, info, 3u, w0 + w1 + w2, n, val.w);
   if (eb < 4u) {
     uint sh = uint(p & 3u) * 8u;
-    am_store_masked(p & ~uint64_t(3), data[0] << sh, mask[0] << sh);
-  } else {
-    for (uint d = 0u; d < eb / 4u; ++d) if (mask[d] != 0u) am_store_masked(p + 4u * d, data[d], mask[d]);
+    am_store_masked(p & ~uint64_t(3), data.x << sh, mask.x << sh);
+    return;
   }
+  if (mask.x != 0u) am_store_masked(p, data.x, mask.x);
+  if (eb >= 8u && mask.y != 0u) am_store_masked(p + 4u, data.y, mask.y);
+  if (eb >= 12u && mask.z != 0u) am_store_masked(p + 8u, data.z, mask.z);
+  if (eb >= 16u && mask.w != 0u) am_store_masked(p + 12u, data.w, mask.w);
 }
 )";
 
@@ -1781,6 +1790,307 @@ std::string format_table() {
 }
 
 }  // namespace
+
+
+// ---- control flow ----
+//
+// The program's blocks: their code (without the branch that ends them) and how they end.
+struct CfgBlock {
+  uint32_t start = 0;  // dword
+  std::string code;
+  enum End : uint8_t { Fall, Jump, Cond, Stop } end = Fall;
+  std::string cond;    // Cond: the branch is taken when this holds
+  uint32_t target = 0; // Jump, Cond: the branch's target (dword)
+  uint32_t next = 0;   // Fall, Cond: the dword after the block
+};
+
+// Re-indents a block's lines (emitted at six spaces) to `indent`.
+std::string indented(const std::string& code, const std::string& indent) {
+  std::string out;
+  size_t at = 0;
+  while (at < code.size()) {
+    size_t end = code.find('\n', at);
+    if (end == std::string::npos) end = code.size();
+    std::string_view line(code.data() + at, end - at);
+    if (line.substr(0, 6) == "      ") line.remove_prefix(6);
+    out += indent;
+    out += line;
+    out += '\n';
+    at = end + 1;
+  }
+  return out;
+}
+
+// Structured control flow from a reducible CFG, after Ramsey's "Beyond Relooper": a node's
+// children in the dominator tree that are merge points (two or more forward edges in) follow
+// it, each after a block that the branches to it leave; a loop header opens a loop that its
+// back edges continue; any other forward branch inlines its target. In HLSL a block is
+// `switch (0u) { default: }` (break leaves it; LLVM sees no loop) and a loop `for (;;)`; a
+// branch past more than the innermost of them
+// sets am_br to the target's depth and unwinds.
+class Structurer {
+ public:
+  explicit Structurer(const std::vector<CfgBlock>& blocks) : b_(blocks) {}
+
+  // False if the CFG is not reducible (or not what we expect); the caller then dispatches.
+  bool run(std::string& out, bool& uses_br) {
+    const int n = static_cast<int>(b_.size());
+    std::unordered_map<uint32_t, int> index;
+    for (int i = 0; i < n; ++i) index[b_[i].start] = i;
+    succ_.assign(n, {});
+    for (int i = 0; i < n; ++i) {
+      const auto to = [&](uint32_t dword) {
+        const auto it = index.find(dword);
+        return it == index.end() ? -1 : it->second;
+      };
+      const CfgBlock& x = b_[i];
+      if (x.end == CfgBlock::Fall) succ_[i] = {to(x.next)};
+      else if (x.end == CfgBlock::Jump) succ_[i] = {to(x.target)};
+      else if (x.end == CfgBlock::Cond) succ_[i] = {to(x.next), to(x.target)};
+      for (int s : succ_[i]) {
+        if (s < 0) return false;
+      }
+    }
+    // Reverse postorder from the entry (iterative DFS).
+    rpo_.assign(n, -1);
+    std::vector<int> post, state(n, 0), it(n, 0), stack{0};
+    state[0] = 1;
+    while (!stack.empty()) {
+      const int x = stack.back();
+      if (it[x] < static_cast<int>(succ_[x].size())) {
+        const int y = succ_[x][it[x]++];
+        if (state[y] == 0) {
+          state[y] = 1;
+          stack.push_back(y);
+        }
+      } else {
+        post.push_back(x);
+        stack.pop_back();
+      }
+    }
+    order_.assign(post.rbegin(), post.rend());
+    for (size_t k = 0; k < order_.size(); ++k) rpo_[order_[k]] = static_cast<int>(k);
+    // Dominators (Cooper, Harvey and Kennedy).
+    std::vector<std::vector<int>> pred(n);
+    for (int i = 0; i < n; ++i) {
+      if (rpo_[i] < 0) continue;
+      for (int s : succ_[i]) pred[s].push_back(i);
+    }
+    idom_.assign(n, -1);
+    idom_[0] = 0;
+    for (bool changed = true; changed;) {
+      changed = false;
+      for (size_t k = 1; k < order_.size(); ++k) {
+        const int x = order_[k];
+        int d = -1;
+        for (int p : pred[x]) {
+          if (idom_[p] < 0) continue;
+          if (d < 0) {
+            d = p;
+            continue;
+          }
+          int a = p, c = d;
+          while (a != c) {
+            while (rpo_[a] > rpo_[c]) a = idom_[a];
+            while (rpo_[c] > rpo_[a]) c = idom_[c];
+          }
+          d = a;
+        }
+        if (d != idom_[x]) {
+          idom_[x] = d;
+          changed = true;
+        }
+      }
+    }
+    // Back edges must go to a dominator (reducible); forward edges count toward merges.
+    header_.assign(n, false);
+    merge_.assign(n, false);
+    std::vector<int> forward_in(n, 0);
+    for (int i = 0; i < n; ++i) {
+      if (rpo_[i] < 0) continue;
+      for (int s : succ_[i]) {
+        if (rpo_[s] <= rpo_[i]) {
+          if (!dominates(s, i)) return false;
+          header_[s] = true;
+        } else {
+          ++forward_in[s];
+        }
+      }
+    }
+    children_.assign(n, {});
+    for (size_t k = 1; k < order_.size(); ++k) {
+      const int x = order_[k];
+      merge_[x] = forward_in[x] >= 2;
+      children_[idom_[x]].push_back(x);
+    }
+    ok_ = true;
+    do_tree(0);
+    if (!ok_) return false;
+    out = std::move(out_);
+    uses_br = uses_br_;
+    return true;
+  }
+
+ private:
+  enum class Kind : uint8_t { If, Loop, Block };
+  struct Frame {
+    Kind kind;
+    int node;              // Loop: its header; Block: the node that follows it
+    bool unwound = false;  // a branch passes out through it: check am_br after it
+  };
+
+  bool dominates(int a, int b) const {
+    for (int x = b;; x = idom_[x]) {
+      if (x == a) return true;
+      if (x == 0 || idom_[x] < 0) return false;
+    }
+  }
+  std::string indent() const { return std::string(2 * (frames_.size() + 1), ' '); }
+  void line(const std::string& text) { out_ += indent() + text + "\n"; }
+  int depth_of(size_t f) const {  // 1-based depth among loops and blocks
+    int d = 0;
+    for (size_t k = 0; k <= f; ++k) d += frames_[k].kind != Kind::If;
+    return d;
+  }
+
+  void do_tree(int x) {
+    std::vector<int> ys;
+    for (int c : children_[x]) {
+      if (merge_[c]) ys.push_back(c);
+    }
+    std::sort(ys.begin(), ys.end(), [&](int a, int c) { return rpo_[a] > rpo_[c]; });
+    if (header_[x]) {
+      line("[loop] for (;;) {");
+      frames_.push_back({Kind::Loop, x});
+      node_within(x, ys, 0);
+      line("break;");
+      close_loop_like("}");
+    } else {
+      node_within(x, ys, 0);
+    }
+  }
+
+  void node_within(int x, const std::vector<int>& ys, size_t i) {
+    if (!ok_) return;
+    if (i < ys.size()) {
+      line("switch (0u) { default:");
+      frames_.push_back({Kind::Block, ys[i]});
+      node_within(x, ys, i + 1);
+      line("break;");
+      close_loop_like("}");
+      do_tree(ys[i]);
+      return;
+    }
+    const CfgBlock& blk = b_[x];
+    out_ += indented(blk.code, indent());
+    switch (blk.end) {
+      case CfgBlock::Stop: break;
+      case CfgBlock::Fall:
+      case CfgBlock::Jump: do_branch(x, succ_[x][0]); break;
+      case CfgBlock::Cond:
+        if (succ_[x][0] == succ_[x][1]) {
+          do_branch(x, succ_[x][0]);
+          break;
+        }
+        line("if (" + blk.cond + ") {");
+        frames_.push_back({Kind::If, -1});
+        do_branch(x, succ_[x][1]);
+        frames_.pop_back();
+        line("} else {");
+        frames_.push_back({Kind::If, -1});
+        do_branch(x, succ_[x][0]);
+        frames_.pop_back();
+        line("}");
+        break;
+    }
+  }
+
+  void do_branch(int from, int to) {
+    if (rpo_[to] <= rpo_[from]) return branch_to(Kind::Loop, to);
+    if (merge_[to]) return branch_to(Kind::Block, to);
+    if (idom_[to] != from) {
+      ok_ = false;
+      return;
+    }
+    do_tree(to);
+  }
+
+  // A branch to the loop headed by `node` (continue) or out of the block that `node` follows.
+  void branch_to(Kind kind, int node) {
+    int f = -1, inner = -1;
+    for (int k = static_cast<int>(frames_.size()) - 1; k >= 0; --k) {
+      if (frames_[k].kind != Kind::If && inner < 0) inner = k;
+      if (frames_[k].kind == kind && frames_[k].node == node) {
+        f = k;
+        break;
+      }
+    }
+    if (f < 0) {
+      ok_ = false;
+      return;
+    }
+    if (f == inner) {
+      line(kind == Kind::Loop ? "continue;" : "break;");
+      return;
+    }
+    for (size_t k = f + 1; k < frames_.size(); ++k) {
+      if (frames_[k].kind != Kind::If) frames_[k].unwound = true;
+    }
+    uses_br_ = true;
+    line("am_br = " + std::to_string(depth_of(f)) + "u; break;");
+  }
+
+  // Closes the innermost loop or block; after it, a branch unwinding through it either has
+  // arrived (the construct now innermost is its target) or goes on outward.
+  void close_loop_like(const char* closing) {
+    const Frame f = frames_.back();
+    frames_.pop_back();
+    line(closing);
+    if (!f.unwound) return;
+    int inner = -1;
+    for (int k = static_cast<int>(frames_.size()) - 1; k >= 0; --k) {
+      if (frames_[k].kind != Kind::If) {
+        inner = k;
+        break;
+      }
+    }
+    if (inner < 0) {
+      ok_ = false;
+      return;
+    }
+    line("if (am_br != 0u) {");
+    line("  if (am_br == " + std::to_string(depth_of(inner)) + "u) { am_br = 0u; " +
+         (frames_[inner].kind == Kind::Loop ? "continue; }" : "break; }"));
+    line("  break;");
+    line("}");
+  }
+
+  const std::vector<CfgBlock>& b_;
+  std::vector<std::vector<int>> succ_, children_;
+  std::vector<int> rpo_, order_, idom_;
+  std::vector<bool> header_, merge_;
+  std::vector<Frame> frames_;
+  std::string out_;
+  bool ok_ = true, uses_br_ = false;
+};
+
+// The fallback: one loop over a switch on the block's start.
+std::string dispatch(const std::vector<CfgBlock>& blocks) {
+  std::string body;
+  for (const CfgBlock& b : blocks) {
+    body += "    case " + num(b.start) + "u:\n" + b.code;
+    switch (b.end) {
+      case CfgBlock::Fall: body += "      pc = " + num(b.next) + "u; break;\n"; break;
+      case CfgBlock::Jump: body += "      pc = " + num(b.target) + "u; break;\n"; break;
+      case CfgBlock::Cond:
+        body += "      if (" + b.cond + ") { pc = " + num(b.target) + "u; break; }\n";
+        body += "      pc = " + num(b.next) + "u; break;\n";
+        break;
+      case CfgBlock::Stop: break;
+    }
+  }
+  return body;
+}
 
 // After an instruction: the descriptor lookups whose SGPRs it may have written are dropped.
 // Vector, memory and image instructions write none (VOPC and VOP2 carries: VCC, EXEC only);
@@ -1852,21 +2162,21 @@ Translation translate(const TranslateInput& in, Binding binding) {
   }
   Ctx c;
   c.wave64 = !in.wave32;
-  std::string body;
+  std::vector<CfgBlock> blocks;
   const auto& ops = table();
-  bool open = false;  // the current block can fall through into the next
   for (size_t k = 0; k < scan.starts.size(); ++k) {
     const uint32_t at = scan.starts[k];
     rd::Instruction insn;
     rd::decode(in.code, at, insn);
     const uint32_t next = at + insn.dwords;
-    if (starts.count(at)) {
-      if (open) body += "      pc = " + num(at) + "u; break;\n";
-      body += "    case " + num(at) + "u:\n";
+    if (starts.count(at) || blocks.empty()) {
+      if (!blocks.empty() && blocks.back().end == CfgBlock::Fall) blocks.back().next = at;
+      blocks.emplace_back();
+      blocks.back().start = at;
       c.live_images.clear();
       c.live_samplers.clear();
     }
-    open = true;
+    CfgBlock& blk = blocks.back();
     c.in = &insn;
     c.pc = at;
     c.next = next;
@@ -1877,7 +2187,7 @@ Translation translate(const TranslateInput& in, Binding binding) {
     bool ok = true;
     if (flags & rd::kTerminator) {
       c.line("AM_END(); return;");
-      open = false;
+      blk.end = CfgBlock::Stop;
     } else if (flags & rd::kBranch) {
       const int64_t target = static_cast<int64_t>(next) + static_cast<int16_t>(insn.field(Field::SIMM16));
       std::string cond;
@@ -1890,12 +2200,12 @@ Translation translate(const TranslateInput& in, Binding binding) {
       else if (name == "s_cbranch_execnz") cond = "!am_exec_zero()";
       else ok = c.fail(name);
       if (ok) {
-        const std::string to = num(static_cast<uint64_t>(target)) + "u";
-        if (name == "s_branch") {
-          c.line("pc = " + to + "; break;");
-          open = false;
-        } else {
-          c.line("if (" + cond + ") { pc = " + to + "; break; }");
+        blk.target = static_cast<uint32_t>(target);
+        blk.next = next;
+        if (name == "s_branch") blk.end = CfgBlock::Jump;
+        else {
+          blk.end = CfgBlock::Cond;
+          blk.cond = cond;
         }
       }
     } else {
@@ -1910,11 +2220,19 @@ Translation translate(const TranslateInput& in, Binding binding) {
       c.failure.clear();
       continue;
     }
-    body += c.out;
+    blk.code += c.out;
     forget_written(c, insn);
   }
-  if (open) body += "      return;\n";
+  // Running off the end of the code ends the program.
+  if (!blocks.empty() && blocks.back().end == CfgBlock::Fall) {
+    blocks.back().end = CfgBlock::Stop;
+    blocks.back().code += "      return;\n";
+  }
   if (!tr.unsupported.empty()) return tr;
+  std::string body;
+  bool uses_br = false;
+  tr.structured = Structurer(blocks).run(body, uses_br);
+  if (!tr.structured) body = dispatch(blocks);
 
   const uint32_t nv = std::max<uint32_t>({c.max_vgpr, in.vgprs ? in.vgprs : 1u, 3u});
   tr.vgpr_count = nv;
@@ -1932,8 +2250,11 @@ Translation translate(const TranslateInput& in, Binding binding) {
                  tz = std::max<uint32_t>(in.cs_threads[2], 1);
   h += "\n[numthreads(" + num(tx) + ", " + num(ty) + ", " + num(tz) + ")]\n[WaveSize(" + num(tr.wave_size) + ")]\n";
   h += "void main(uint3 am_tid : SV_GroupThreadID, uint3 am_gid : SV_GroupID, uint am_flat : SV_GroupIndex) {\n";
-  h += "  uint s[128];\n  [unroll] for (uint i = 0u; i < 128u; ++i) s[i] = 0u;\n";
-  h += "  uint v[" + num(nv) + "];\n  [unroll] for (uint j = 0u; j < " + num(nv) + "u; ++j) v[j] = 0u;\n";
+  h += "  uint s[128];\n  uint v[" + num(nv) + "];\n ";
+  for (uint32_t i = 0; i < 128; ++i) h += " s[" + num(i) + "] = 0u;";
+  h += "\n ";
+  for (uint32_t j = 0; j < nv; ++j) h += " v[" + num(j) + "] = 0u;";
+  h += "\n";
   h += "  uint am_null = 0u;\n  bool scc = false;\n  uint am_lane = WaveGetLaneIndex();\n";
   h += "  uint am_dpp = 0u;\n  bool am_dpp_on = true;\n";
   for (const uint32_t r : c.image_vars) h += "  AmImage am_im_" + num(r) + " = (AmImage)0;\n";
@@ -1966,13 +2287,25 @@ Translation translate(const TranslateInput& in, Binding binding) {
     h += "#define am_lane_on(l) (((s[126] >> ((l) & 31u)) & 1u) != 0u)\n";
   }
   // At s_endpgm the tests' binding dumps the registers.
-  h += "#define AM_END() { [unroll] for (uint d = 0u; d < " + num(nv) + "u; ++d) am_dump.Store(" + num(kDumpLanes) +
-       "u + ((am_gid.x * " + num(tx * ty * tz) + "u + am_flat) * " + num(nv) + "u + d) * 4u, v[d]); " +
-       "if (am_flat == 0u && all(am_gid == 0u)) { [unroll] for (uint q = 0u; q < 128u; ++q) am_dump.Store(" +
-       num(kDumpSgprs) + "u + q * 4u, s[q]); am_dump.Store(" + num(kDumpSgprs) + "u + 512u, scc ? 1u : 0u); } }\n";
-  h += "  uint pc = 0u;\n  [loop] for (;;) {\n    [forcecase] switch (pc) {\n";
-  h += body;
-  h += "    default:\n      return;\n    }\n  }\n}\n";
+  {
+    // At s_endpgm the tests' binding dumps the registers (written out: no loop for LLVM).
+    std::string d = "#define AM_END() { uint am_at = " + num(kDumpLanes) + "u + (am_gid.x * " + num(tx * ty * tz) +
+                    "u + am_flat) * " + num(nv * 4) + "u;";
+    for (uint32_t k = 0; k < nv; ++k) d += " am_dump.Store(am_at + " + num(4 * k) + "u, v[" + num(k) + "]);";
+    d += " if (am_flat == 0u && all(am_gid == 0u)) {";
+    for (uint32_t q = 0; q < 128; ++q) d += " am_dump.Store(" + num(kDumpSgprs + 4 * q) + "u, s[" + num(q) + "]);";
+    d += " am_dump.Store(" + num(kDumpSgprs + 512) + "u, scc ? 1u : 0u); } }\n";
+    h += d;
+  }
+  if (tr.structured) {
+    if (uses_br) h += "  uint am_br = 0u;\n";
+    h += body;
+    h += "}\n";
+  } else {
+    h += "  uint pc = 0u;\n  [loop] for (;;) {\n    [forcecase] switch (pc) {\n";
+    h += body;
+    h += "    default:\n      return;\n    }\n  }\n}\n";
+  }
   tr.hlsl = std::move(h);
   tr.ok = true;
   return tr;

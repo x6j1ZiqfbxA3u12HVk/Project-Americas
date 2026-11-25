@@ -15,7 +15,8 @@
 //   samplers: capacity entries of 48 bytes: the S#'s 4 words and 4 zeros, then index, 2 zeros, flags
 //   misses:   capacity records of 48 bytes: kind (1 image, 2 sampler), 3 zeros, the 8 words
 // Both kinds keep their values as a uint4 at byte 32, flags last. A slot is free while its
-// flags are 0. Capacities are powers of two; a key sits within kProbes slots of its hash.
+// flags are 0. Capacities are powers of two. A key sits in one of two slots (cuckoo hashing):
+// binding_hash's and binding_hash2's, so a lookup is two straight reads and no loop.
 
 #include <cstdint>
 #include <span>
@@ -32,8 +33,6 @@ constexpr uint32_t kBindingValid = 0x80000000u;
 // Sampler entry flags.
 constexpr uint32_t kSamplerCompare = 1;  // a comparison sampler (SamplerComparisonState)
 
-constexpr uint32_t kProbes = 16;
-
 // One image: its T#, and the heap indices of its views. `srv` has the T#'s own type
 // (TextureCube for a cube); `alt` is a 2D-array view of a cube's faces, for loads.
 struct ImageBinding {
@@ -48,9 +47,10 @@ struct SamplerBinding {
 };
 
 uint32_t binding_hash(std::span<const uint32_t, 8> words);
+uint32_t binding_hash2(uint32_t first);
 
-// The am_bindings buffer, as dwords; empty if a key does not fit in kProbes slots of
-// the table size chosen (it grows until all fit).
+// The am_bindings buffer, as dwords (the tables grow until every key has a slot); empty if
+// they cannot.
 std::vector<uint32_t> build_bindings(std::span<const ImageBinding> images, std::span<const SamplerBinding> samplers,
                                      uint32_t miss_capacity = 64);
 
