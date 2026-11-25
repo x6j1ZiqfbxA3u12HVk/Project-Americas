@@ -678,3 +678,10 @@ instruction:
   `v_lshrrev_b64`, `v_bfm_b32` and the sub-dword buffer loads were added this evening.
 * The game's compute dispatches wait until their programs compile (frame log: "dispatches N,
   waiting M").
+* **Compute pipelines are made on a worker thread** (`create_compute_pipeline`). Six programs
+  that compiled once the float atomics translated (the `global_atomic_fmin/fmax` CAS loop)
+  stalled the game when made on its own thread: no frame, then the game's watchdog wrote to
+  address 0 (game+0x2215c35, its deliberate crash). Made on a worker, the game runs, but none
+  of them has finished in 60 s, so their dispatches still wait. Look at the HLSL of one
+  (`am-shaders precompile --raw`), e.g. 391b80d5337dff03…, and at whether the AMD driver
+  stalls on the CAS loop.

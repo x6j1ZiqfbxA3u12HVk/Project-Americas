@@ -26,6 +26,7 @@
 #include <mutex>
 #include <set>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "runtime/d3d12x/d3d12x.h"
@@ -68,6 +69,7 @@ struct PipelineState : Object {
   uint64_t extra[2] = {};
   Microsoft::WRL::ComPtr<ID3D12PipelineState> host;  // when its shaders are precompiled
   bool compute = false;
+  std::atomic<ID3D12PipelineState*> host_compute{nullptr};  // made on a worker thread, owned by `host`
   uint32_t console_programs = 0;  // slot 57: GPU programs given by address
   std::string console_name;       // slot 57: the saved blocks' file, and the programs' markers
   std::unique_ptr<ConsolePipeline> console;
@@ -236,6 +238,7 @@ ID3D12PipelineState* host_pipeline(const void* object, const void** root_signatu
   if (!o) return nullptr;
   auto* p = static_cast<PipelineState*>(o);
   if (root_signature) *root_signature = p->root_signature;
+  if (p->compute) return nullptr;  // compute pipelines: host_compute_pipeline
   if (p->host) return p->host.Get();
   return p->console ? console_host_pipeline(*p->console, targets, target_count, depth, rect_list) : nullptr;
 }
@@ -246,7 +249,7 @@ ID3D12PipelineState* host_compute_pipeline(const void* object, const void** root
   auto* p = static_cast<PipelineState*>(o);
   if (!p->compute) return nullptr;
   if (root_signature) *root_signature = p->root_signature;
-  return p->host.Get();
+  return p->host_compute.load(std::memory_order_acquire);
 }
 
 HRESULT create_compute_pipeline(const D3D12_COMPUTE_PIPELINE_STATE_DESC* desc, uint64_t extra0, uint64_t extra1,
@@ -259,19 +262,26 @@ HRESULT create_compute_pipeline(const D3D12_COMPUTE_PIPELINE_STATE_DESC* desc, u
   p->extra[0] = extra0;
   p->extra[1] = extra1;
   p->compute = true;
-  // Its host pipeline: the program's precompiled translation with the translated root signature.
+  // Its host pipeline: the program's precompiled translation with the translated root signature,
+  // made on a worker thread. The driver can take very long over some programs (the game's
+  // watchdog ended the run while one was made on its thread); dispatches wait until it is there.
   std::vector<uint8_t> code;
   const std::string marker = program_marker(p->shaders[0].bytecode, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS);
   present::HostGpu* gpu = present::host_gpu();
   if (gpu && !marker.empty() && load_precompiled(marker, code)) {
-    D3D12_COMPUTE_PIPELINE_STATE_DESC host{};
-    host.pRootSignature = translated_root_signature();
-    host.CS = {code.data(), code.size()};
-    const HRESULT hr = host.pRootSignature ? gpu->device->CreateComputePipelineState(&host, IID_PPV_ARGS(&p->host)) : E_FAIL;
-    static std::atomic<int> told{0};
-    if (FAILED(hr) && told.fetch_add(1, std::memory_order_relaxed) < 8) {
-      logf("gpu: host compute pipeline for %s refused (0x%08lx)", marker.c_str(), static_cast<unsigned long>(hr));
-    }
+    add_ref(p);  // kept alive until the worker is done
+    std::thread([p, gpu, marker, code = std::move(code)] {
+      D3D12_COMPUTE_PIPELINE_STATE_DESC host{};
+      host.pRootSignature = translated_root_signature();
+      host.CS = {code.data(), code.size()};
+      const HRESULT hr = host.pRootSignature ? gpu->device->CreateComputePipelineState(&host, IID_PPV_ARGS(&p->host)) : E_FAIL;
+      if (SUCCEEDED(hr)) p->host_compute.store(p->host.Get(), std::memory_order_release);
+      static std::atomic<int> told{0};
+      if (FAILED(hr) && told.fetch_add(1, std::memory_order_relaxed) < 8) {
+        logf("gpu: host compute pipeline for %s refused (0x%08lx)", marker.c_str(), static_cast<unsigned long>(hr));
+      }
+      release(p);
+    }).detach();
   } else {
     static std::atomic<int> told{0};
     if (told.fetch_add(1, std::memory_order_relaxed) < 16) logf("gpu: compute program %s is not precompiled", marker.c_str());
