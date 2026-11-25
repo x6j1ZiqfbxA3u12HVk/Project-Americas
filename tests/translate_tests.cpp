@@ -38,6 +38,7 @@ Result run(const std::vector<uint32_t>& code, std::vector<uint32_t> user = {}, s
   in.stage = HwStage::Cs;
   in.wave32 = false;
   in.vgprs = 12;
+  in.lds_bytes = 16384;
   in.cs_rsrc2 = rsrc2;
   in.cs_threads[0] = 64;
   const Translation t = translate(in, Binding::Test);
@@ -762,4 +763,45 @@ TEST_CASE(image_bindings_table) {
   }
   CHECK(ok);
   CHECK(t[5] == 16 && t[6] == 0 && t[4] + 16 * 48 == t.size() * 4);  // the miss list: 16 records, none yet
+}
+
+TEST_CASE(translate_lds_atomics_st64_and_swizzle) {
+  const Result r = run({
+      0x7E020280,              // v_mov_b32 v1, 0
+      0x7E040281,              // v_mov_b32 v2, 1
+      0xD8340000, 0x00000101,  // ds_write_b32 v1, v1                      lds[0] = 0
+      0xD8380201, 0x00010101,  // ds_write2_b32 v1, v1, v1 offset0:1 offset1:2   lds[1] = lds[2] = 0
+      0xBF8CC07F,              // s_waitcnt lgkmcnt(0)
+      0xBF8A0000,              // s_barrier
+      0xD8000000, 0x00000201,  // ds_add_u32 v1, v2
+      0xD8800004, 0x03000201,  // ds_add_rtn_u32 v3, v1, v2 offset:4
+      0x34080082,              // v_lshlrev_b32 v4, 2, v0
+      0xD83C0201, 0x00020004,  // ds_write2st64_b32 v4, v0, v2 offset0:1 offset1:2
+      0xBF8CC07F,              // s_waitcnt lgkmcnt(0)
+      0xD8E00102, 0x05000004,  // ds_read2st64_b32 v[5:6], v4 offset0:2 offset1:1
+      0xD8A00008, 0x07000001,  // ds_max_rtn_u32 v7, v1, v0 offset:8
+      0xD8D4003E, 0x08000000,  // ds_swizzle_b32 v8, v0 offset:swizzle(BITMASK_PERM,"pppp1")
+      0xD8D4801B, 0x09000000,  // ds_swizzle_b32 v9, v0 offset:swizzle(QUAD_PERM,3,2,1,0)
+      0xBF8CC07F,              // s_waitcnt lgkmcnt(0)
+      0xBF8A0000,              // s_barrier
+      0xD8D80000, 0x0A000001,  // ds_read_b32 v10, v1
+      0xD8D80004, 0x0B000001,  // ds_read_b32 v11, v1 offset:4
+      0xD8D80008, 0x0C000001,  // ds_read_b32 v12, v1 offset:8
+      0xBF8CC07F,              // s_waitcnt lgkmcnt(0)
+      0xBF810000,              // s_endpgm
+  });
+  if (!r.ran) return;
+  bool ok = true;
+  uint64_t seen = 0;
+  for (uint32_t l = 0; l < 64 && ok; ++l) {
+    ok = r.v(l, 5) == 1 && r.v(l, 6) == l && r.v(l, 7) <= 63 && r.v(l, 8) == (l | 1) &&
+         r.v(l, 9) == ((l & ~3u) | (3 - (l & 3))) && r.v(l, 10) == 64 && r.v(l, 11) == 64 && r.v(l, 12) == 63;
+    if (!ok) {
+      std::printf("    lane %u: v5 %u v6 %u v7 %u v8 %u v9 %u v10 %u v11 %u v12 %u\n", l, r.v(l, 5), r.v(l, 6), r.v(l, 7),
+                  r.v(l, 8), r.v(l, 9), r.v(l, 10), r.v(l, 11), r.v(l, 12));
+    }
+    if (r.v(l, 3) < 64) seen |= 1ull << r.v(l, 3);
+  }
+  CHECK(ok);
+  CHECK(seen == ~0ull);  // each lane got a different value before its add
 }

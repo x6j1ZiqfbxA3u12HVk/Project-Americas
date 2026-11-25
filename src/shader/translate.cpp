@@ -1263,6 +1263,65 @@ const std::unordered_map<std::string, Handler>& table() {
              "u]; v[" + num(d + 1) + "] = am_lds[b + " + num(c.f(Field::OFFSET1)) + "u]; }");
       return true;
     };
+    // The st64 pairs: offsets in units of 64 dwords.
+    t["ds_read2st64_b32"] = [](Ctx& c) {
+      c.uses_lds = true;
+      const uint32_t a = c.f(Field::ADDR), d = c.f(Field::VDST);
+      c.touch_v(a);
+      c.touch_v(d + 1);
+      c.line("if (AM_ACT) { uint b = v[" + num(a) + "] >> 2; v[" + num(d) + "] = am_lds[b + " + num(64 * c.f(Field::OFFSET0)) +
+             "u]; v[" + num(d + 1) + "] = am_lds[b + " + num(64 * c.f(Field::OFFSET1)) + "u]; }");
+      return true;
+    };
+    t["ds_write2st64_b32"] = [](Ctx& c) {
+      c.uses_lds = true;
+      const uint32_t a = c.f(Field::ADDR);
+      c.touch_v(a);
+      c.touch_v(c.f(Field::DATA0));
+      c.touch_v(c.f(Field::DATA1));
+      c.line("if (AM_ACT) { uint b = v[" + num(a) + "] >> 2; am_lds[b + " + num(64 * c.f(Field::OFFSET0)) + "u] = v[" +
+             num(c.f(Field::DATA0)) + "]; am_lds[b + " + num(64 * c.f(Field::OFFSET1)) + "u] = v[" + num(c.f(Field::DATA1)) + "]; }");
+      return true;
+    };
+    // LDS atomics (32-bit, unsigned forms); the _rtn forms return the value before.
+    for (const auto& [op, fn] : {std::pair{"add_u32", "InterlockedAdd"}, {"sub_u32", "InterlockedAdd"}, {"min_u32", "InterlockedMin"},
+                                 {"max_u32", "InterlockedMax"}, {"and_b32", "InterlockedAnd"}, {"or_b32", "InterlockedOr"},
+                                 {"xor_b32", "InterlockedXor"}, {"wrxchg_rtn_b32", "InterlockedExchange"}}) {
+      const std::string o = op;
+      const bool sub = o == "sub_u32";
+      for (const bool rtn : {false, true}) {
+        if (o == "wrxchg_rtn_b32" && !rtn) continue;
+        const std::string name = o == "wrxchg_rtn_b32" ? "ds_wrxchg_rtn_b32" : "ds_" + (rtn ? o.substr(0, o.find('_')) + "_rtn" + o.substr(o.find('_')) : o);
+        t[name] = [fn = std::string(fn), sub, rtn](Ctx& c) {
+          c.uses_lds = true;
+          const uint32_t a = c.f(Field::ADDR), d0 = c.f(Field::DATA0);
+          c.touch_v(a);
+          c.touch_v(d0);
+          const std::string x = sub ? "0u - v[" + num(d0) + "]" : "v[" + num(d0) + "]";
+          std::string l = "if (AM_ACT) { uint o; " + fn + "(am_lds[(v[" + num(a) + "] + " +
+                          num(c.f(Field::OFFSET0) | c.f(Field::OFFSET1) << 8) + "u) >> 2], " + x + ", o);";
+          if (rtn) l += " " + c.vdst(c.f(Field::VDST)) + " = o;";
+          c.line(l + " }");
+          return true;
+        };
+      }
+    }
+    // ds_swizzle_b32: offset bit 15 picks quad mode (four 2-bit lane selects), else bit mode in
+    // groups of 32 lanes: ((lane & and) | or) ^ xor. A disabled source lane reads 0.
+    t["ds_swizzle_b32"] = [](Ctx& c) {
+      const uint32_t a = c.f(Field::ADDR), d = c.f(Field::VDST), off = c.f(Field::OFFSET0) | c.f(Field::OFFSET1) << 8;
+      c.touch_v(a);
+      std::string lane;
+      if (off & 0x8000) {
+        lane = "((am_lane & ~3u) | ((" + num(off & 0xFF) + "u >> ((am_lane & 3u) * 2u)) & 3u))";
+      } else {
+        const uint32_t and_m = off & 31, or_m = (off >> 5) & 31, xor_m = (off >> 10) & 31;
+        lane = "((am_lane & ~31u) | ((((am_lane & 31u) & " + num(and_m) + "u) | " + num(or_m) + "u) ^ " + num(xor_m) + "u))";
+      }
+      c.line("{ uint l = " + lane + "; uint x = WaveReadLaneAt(v[" + num(a) + "], l);");
+      c.line("  if (AM_ACT) " + c.vdst(d) + " = am_lane_on(l) ? x : 0u; }");
+      return true;
+    };
     t["ds_write2_b32"] = [](Ctx& c) {
       c.uses_lds = true;
       const uint32_t a = c.f(Field::ADDR);

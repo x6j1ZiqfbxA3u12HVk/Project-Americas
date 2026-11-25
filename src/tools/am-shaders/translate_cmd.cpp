@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cstdio>
 #include <fstream>
+#include <iterator>
 #include <map>
 #include <mutex>
 #include <thread>
@@ -145,7 +146,12 @@ int translation_survey(const fs::path& pack_dir, const fs::path& out_json, size_
     std::map<std::string, int> seen;
     for (const auto& [name, t] : to_compile) {
       const std::string stem = name.substr(0, 16) + "_" + std::to_string(seen[name]++);
-      std::ofstream(hlsl_dir / widen(stem + ".hlsl"), std::ios::binary) << t.hlsl;
+      // An unchanged file is left alone, so compiles of it (dxc_corpus.py) stay current.
+      const fs::path file = hlsl_dir / widen(stem + ".hlsl");
+      std::ifstream in(file, std::ios::binary);
+      const std::string old((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+      in.close();
+      if (old != t.hlsl) std::ofstream(file, std::ios::binary) << t.hlsl;
     }
     std::printf("wrote %zu programs' HLSL to %s\n", to_compile.size(), narrow(hlsl_dir.wstring()).c_str());
     to_compile.clear();

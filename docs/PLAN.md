@@ -896,8 +896,9 @@ builder's `XMemVirtualQuery` calls, and the arguments logged at run time.
   * with typed buffers 149; with SDWA and DPP 174; with the ALU ops and atomics 296;
   * **with images 2,070 (77 %)**. DXC compiles every one sampled (48 of 48 below 400 KiB of
     HLSL; the tests' programs too).
-  * What still blocks compute: `ds_swizzle_b32` 113, LDS atomics and `st64` forms, D16 buffer
-    forms, 16-bit and packed ALU ops, ray tracing (`image_bvh*`, 56).
+  * with LDS atomics, the `st64` pairs and `ds_swizzle_b32`: **2,368 (88 %)**.
+  * What still blocks compute: D16 buffer forms, 16-bit and packed ALU ops (`v_mul_i32_i24`,
+    `v_lshrrev_b16`, `v_pk_*_f16`), signed LDS min/max, ray tracing (`image_bvh*`, 56).
 * **Structured control flow** (translator 2). The blocks' CFG becomes nested loops, blocks
   and `if`s, after Ramsey's "Beyond Relooper":
   * reverse postorder, dominators (Cooper, Harvey and Kennedy), back edges, merge points;
