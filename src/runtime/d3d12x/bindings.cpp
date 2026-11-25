@@ -108,7 +108,17 @@ struct Bindings {
   // The misses' readback: recorded into a list, then submitted (with the fence value after it).
   enum class Readback { idle, recorded, in_flight } readback_state = Readback::idle;
   uint64_t readback_fence = 0;
-  std::vector<ComPtr<ID3D12Resource>> retired;  // uploads of this submission, kept one more round
+  // Buffers the GPU may still read (uploads, a replaced table), each with the fence value after
+  // the lists that use them; kPending until those lists are submitted.
+  static constexpr uint64_t kPending = UINT64_MAX;
+  struct Retired {
+    uint64_t fence;
+    const void* list;  // the list that reads it
+    ComPtr<ID3D12Resource> resource;
+  };
+  std::vector<Retired> retired;
+  const void* recording = nullptr;  // the list being flushed into
+  const void* readback_list = nullptr;
 
   bool start() {
     started = true;
@@ -129,6 +139,14 @@ struct Bindings {
                            D3D12_TEXTURE_LAYOUT_ROW_MAJOR, flags};
     ComPtr<ID3D12Resource> r;
     device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, state, nullptr, IID_PPV_ARGS(&r));
+    if (!r) {
+      static std::atomic<int> told{0};
+      if (told.fetch_add(1, std::memory_order_relaxed) < 8) {
+        logf("gpu: no %s buffer of %s for the bindings (0x%08lx)", type == D3D12_HEAP_TYPE_UPLOAD ? "upload" : "GPU",
+             format_bytes(size).c_str(), static_cast<unsigned long>(device->GetDeviceRemovedReason()));
+      }
+    }
+    if (r) r->SetName(type == D3D12_HEAP_TYPE_UPLOAD ? L"bindings upload" : type == D3D12_HEAP_TYPE_READBACK ? L"bindings readback" : L"bindings table");
     return r;
   }
 
@@ -211,7 +229,7 @@ struct Bindings {
     }
     std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
     list->ResourceBarrier(1, &b);
-    retired.push_back(std::move(up));
+    retired.push_back({kPending, recording, std::move(up)});
   }
 
   // Every 15th flush, textures whose memory changed since their upload are marked for another:
@@ -230,8 +248,10 @@ struct Bindings {
 
   void flush(ID3D12GraphicsCommandList* list) {
     if (!usable) return;
-    // Uploads of two submissions ago have run (one queue, in order, a frame or more apart).
-    if (retired.size() > 256) retired.erase(retired.begin(), retired.begin() + static_cast<ptrdiff_t>(retired.size() / 2));
+    // Freed once the GPU has run the lists that read them.
+    present::HostGpu* gpu = present::host_gpu();
+    std::erase_if(retired, [gpu](const Retired& r) { return r.fence != kPending && gpu->done(r.fence); });
+    recording = list;
     take_misses();
     check_textures();
     for (Texture& t : textures) {
@@ -244,13 +264,16 @@ struct Bindings {
       if (words.empty()) return;
       const uint64_t bytes = words.size() * 4;
       if (!table || table_bytes < bytes) {
-        if (table) retired.push_back(table);
-        table = buffer(bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+        ComPtr<ID3D12Resource> grown =
+            buffer(bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+        if (!grown) return;  // the old table stays (and stays dirty): tried again at the next flush
+        if (table) retired.push_back({kPending, recording, table});
+        table = std::move(grown);
         table_bytes = bytes;
       }
       ComPtr<ID3D12Resource> up = buffer(bytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ, D3D12_RESOURCE_FLAG_NONE);
       void* p = nullptr;
-      up->Map(0, nullptr, &p);
+      if (!up || FAILED(up->Map(0, nullptr, &p))) return;
       std::memcpy(p, words.data(), bytes);
       up->Unmap(0, nullptr);
       misses_at = words[4];
@@ -260,7 +283,7 @@ struct Bindings {
       list->CopyBufferRegion(table.Get(), 0, up.Get(), 0, bytes);
       std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
       list->ResourceBarrier(1, &b);
-      retired.push_back(std::move(up));
+      retired.push_back({kPending, recording, std::move(up)});
       table_dirty = false;
       return;  // a fresh table has no misses to read
     }
@@ -268,10 +291,14 @@ struct Bindings {
     // The misses so far go to the readback buffer; the count starts again at 0.
     const uint64_t miss_bytes = uint64_t{misses_capacity} * 48;
     if (!readback) readback = buffer(32 + miss_bytes, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_FLAG_NONE);
+    if (!readback) return;
     if (!header_upload) {
       header_upload = buffer(4, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ, D3D12_RESOURCE_FLAG_NONE);
       void* p = nullptr;
-      header_upload->Map(0, nullptr, &p);
+      if (!header_upload || FAILED(header_upload->Map(0, nullptr, &p))) {
+        header_upload.Reset();
+        return;
+      }
       std::memset(p, 0, 4);
       header_upload->Unmap(0, nullptr);
     }
@@ -287,6 +314,7 @@ struct Bindings {
     b.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
     list->ResourceBarrier(1, &b);
     readback_state = Readback::recorded;
+    readback_list = list;
   }
 };
 
@@ -414,6 +442,7 @@ void bind_texture_view(const D3D12_RESOURCE_DESC& resource, const D3D12_SHADER_R
                                                 IID_PPV_ARGS(&t.resource)))) {
     return;
   }
+  t.resource->SetName(widen("texture " + std::to_string(width) + "x" + std::to_string(height) + " from 0x" + hex(address)).c_str());
   D3D12_CPU_DESCRIPTOR_HANDLE slot{};
   const uint32_t index = allocate_view_slot(&slot);
   if (!index) return;
@@ -448,10 +477,13 @@ void flush_bindings(ID3D12GraphicsCommandList* list) {
   if (Bindings* b = ready()) b->flush(list);
 }
 
-void bindings_submitted(uint64_t fence_value) {
+void bindings_submitted(uint64_t fence_value, const void* list) {
   std::lock_guard g(bindings().lock);
   Bindings& b = bindings();
-  if (b.readback_state == Bindings::Readback::recorded) {
+  for (auto& r : b.retired) {
+    if (r.fence == Bindings::kPending && r.list == list) r.fence = fence_value;
+  }
+  if (b.readback_state == Bindings::Readback::recorded && b.readback_list == list) {
     b.readback_state = Bindings::Readback::in_flight;
     b.readback_fence = fence_value;
   }

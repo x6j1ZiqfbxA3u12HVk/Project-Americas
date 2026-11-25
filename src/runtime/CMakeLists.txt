@@ -18,6 +18,8 @@ add_library(am_runtime STATIC
   storage/dstorage.cpp
   memory/default_alloc.cpp
   memory/title_memory.cpp
+  hle/audio.cpp
+  hle/audio_streams.cpp
   hle/d3d12x.cpp
   d3d12x/bindings.cpp
   d3d12x/descriptor_heap.cpp

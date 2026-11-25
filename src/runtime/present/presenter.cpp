@@ -289,6 +289,7 @@ bool Presenter::present(const Image& image, std::vector<uint8_t>* capture) {
   ++s.frame;
   if (FAILED(hr)) {
     logf("present: Present failed (0x%08lx)", static_cast<unsigned long>(hr));
+    if (HostGpu* gpu = host_gpu(); gpu && FAILED(gpu->device->GetDeviceRemovedReason())) report_device_removed(gpu->device.Get());
     if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET) s.fail("the device was lost");
     return false;
   }

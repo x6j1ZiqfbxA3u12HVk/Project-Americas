@@ -50,5 +50,8 @@ D3D12_GPU_VIRTUAL_ADDRESS host_gpu_address(uint64_t address, uint64_t size);
 uint32_t allocate_view_slot(D3D12_CPU_DESCRIPTOR_HANDLE* handle);
 // Records the page table's pending updates into `list` (before work that reads them).
 void flush_page_table(ID3D12GraphicsCommandList* list);
+// `list` (one that flushed) was submitted; `fence_value` follows it: its uploads are freed once
+// that completes.
+void page_table_submitted(uint64_t fence_value, const void* list);
 
 }  // namespace am::rt::d3d12x

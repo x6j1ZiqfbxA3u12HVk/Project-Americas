@@ -11,6 +11,8 @@ Registry::Registry() {
   add_network(functions_);
   add_memory(functions_);
   add_graphics(functions_);
+  add_audio(functions_);
+  add_audio_streams(functions_);
   gdk::add_runtime_exports(functions_);
   input::add_input(functions_);
   files::add_files(functions_);

@@ -331,6 +331,11 @@ void draw(HostList& h, ID3D12GraphicsCommandList* list, const Command& c) {
   list->SetPipelineState(pso);
   list->SetGraphicsRoot32BitConstants(0, kUserDataConstants, vs, 0);
   list->SetGraphicsRoot32BitConstants(1, kUserDataConstants, ps, 0);
+  if (present::dred_enabled()) {  // names the draw in DRED's breadcrumbs
+    const std::string d = describe_pipeline(h.pipeline);
+    const std::wstring w(d.begin(), d.end());
+    list->SetMarker(0, w.c_str(), static_cast<UINT>((w.size() + 1) * sizeof(wchar_t)));
+  }
   if (c.op == kDrawIndexedInstanced) {
     list->DrawIndexedInstanced(static_cast<UINT>(c.a[0]), static_cast<UINT>(c.a[1]), static_cast<UINT>(c.a[2]),
                                static_cast<INT>(c.a[3]), static_cast<UINT>(c.a[4]));
@@ -816,13 +821,14 @@ void submit_lists(UINT count, void* const* lists) {
   }
   const uint64_t done = gpu->submit(static_cast<UINT>(host_lists.size()), host_lists.data());
   if (!writes.empty()) value_writer().add(done, std::move(writes));
-  bool flushed = false;
   for (HostList* h : owners) {
     h->allocators[h->current].fence = done;
     h->ready = false;
-    flushed = flushed || h->flushed;
+    if (h->flushed) {  // this list holds the page table's and the bindings' upkeep
+      page_table_submitted(done, h->list.Get());
+      bindings_submitted(done, h->list.Get());
+    }
   }
-  if (flushed) bindings_submitted(done);  // the misses' readback is in these lists
 }
 
 void frame_execute(const void* list) {

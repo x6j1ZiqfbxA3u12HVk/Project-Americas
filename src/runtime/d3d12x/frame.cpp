@@ -4,7 +4,9 @@
 //       game asks for 33,333 us, its 30 fps;
 //   79  ScheduleFrameEventX(event type, offset in microseconds, ?, flags);
 //   80  WaitFrameEventX(event type, timeout in ms, ?, flags, &frame token): the game's render
-//       loop waits here once a frame and numbers its frames by the token.
+//       loop waits here once a frame and numbers its frames by the token;
+//   81  GetFrameStatisticsX(frame token, event kinds, &count, statistics): none are kept, so the
+//       count is 0 (the game asks once a frame).
 //
 // Frames start at multiples of the interval from the first wait. Each event type keeps the last
 // frame it returned: a wait returns at the start of the next one, or at once with the latest
@@ -108,6 +110,11 @@ HRESULT WINAPI wait_frame_event(Object* self, UINT type, UINT timeout_ms, uint64
   return S_OK;
 }
 
+HRESULT WINAPI frame_statistics(Object* /*self*/, uint64_t /*token*/, UINT /*kinds*/, UINT* count, void* /*out*/) {
+  if (count) *count = 0;
+  return S_OK;
+}
+
 }  // namespace
 
 void add_frame_methods(std::vector<Method>& out) {
@@ -115,6 +122,7 @@ void add_frame_methods(std::vector<Method>& out) {
       {78, "SetFrameIntervalX", reinterpret_cast<void*>(&set_frame_interval)},
       {79, "ScheduleFrameEventX", reinterpret_cast<void*>(&schedule_frame_event)},
       {80, "WaitFrameEventX", reinterpret_cast<void*>(&wait_frame_event)},
+      {81, "GetFrameStatisticsX", reinterpret_cast<void*>(&frame_statistics)},
   });
 }
 

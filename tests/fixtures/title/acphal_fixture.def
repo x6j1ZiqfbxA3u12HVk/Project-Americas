@@ -1,5 +1,5 @@
-; Import library for the fixture: a console module function we do not implement (yet), which the
-; loader binds to a stub returning 0.
+; Import library for the fixture: a console module function we do not implement (a name no title
+; uses), which the loader binds to a stub returning 0.
 LIBRARY AcpHal.dll
 EXPORTS
-    AcpHalCreate
+    AcpHalFixtureUnimplemented

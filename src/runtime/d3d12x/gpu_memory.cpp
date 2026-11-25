@@ -37,7 +37,15 @@ struct GpuMemory {
   ComPtr<ID3D12DescriptorHeap> heap;
   ComPtr<ID3D12RootSignature> root, graphics_root;
   ComPtr<ID3D12Resource> table;   // default heap, R32 entries
-  ComPtr<ID3D12Resource> upload;  // the entries to copy in at the next flush
+  // Uploads of entries the GPU may still copy from, each with the fence value after the lists
+  // that copy them (kPending until those are submitted).
+  static constexpr uint64_t kPending = UINT64_MAX;
+  struct Upload {
+    uint64_t fence;
+    const void* list;  // the list that copies from it
+    ComPtr<ID3D12Resource> resource;
+  };
+  std::vector<Upload> uploads;
   std::vector<Window> windows;
   // Ranges of entries changed since the last flush, and their values. Its own lock: the title
   // memory's view listener adds to it while holding the title memory's lock.
@@ -64,6 +72,7 @@ struct GpuMemory {
                                                IID_PPV_ARGS(&table)))) {
       return fail("no page table");
     }
+    table->SetName(L"page table");
     D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
     sv.Format = DXGI_FORMAT_R32_TYPELESS;
     sv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
@@ -146,6 +155,7 @@ struct GpuMemory {
     if (FAILED(device->CreatePlacedResource(w.heap.Get(), 0, &bd, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&w.buffer)))) {
       return fail("no buffer over an opened allocation");
     }
+    w.buffer->SetName(widen("window over 0x" + hex(base) + " (" + format_bytes(size) + ")").c_str());
     const uint32_t n = add_window(std::move(w));
     std::vector<uint32_t> entries(size / kPage);
     for (uint32_t k = 0; k < entries.size(); ++k) entries[k] = (n << 16) | k;
@@ -189,6 +199,7 @@ struct GpuMemory {
       pool_window = UINT32_MAX;
       return;
     }
+    w.buffer->SetName(L"window over the physical page pool");
     pool_window = add_window(std::move(w));
     logf("gpu memory: window %u over the physical page pool, %s", pool_window, format_bytes(pages * kPage).c_str());
   }
@@ -206,6 +217,9 @@ struct GpuMemory {
 
   void flush(ID3D12GraphicsCommandList* list) {
     std::lock_guard drain(pending_lock);
+    if (present::HostGpu* gpu = present::host_gpu()) {
+      std::erase_if(uploads, [gpu](const Upload& u) { return u.fence != kPending && gpu->done(u.fence); });
+    }
     if (pending.empty()) return;
     size_t bytes = 0;
     for (const auto& [first, entries] : pending) bytes += entries.size() * 4;
@@ -213,11 +227,12 @@ struct GpuMemory {
     hp.Type = D3D12_HEAP_TYPE_UPLOAD;
     D3D12_RESOURCE_DESC bd{D3D12_RESOURCE_DIMENSION_BUFFER, 0, bytes, 1, 1, 1, DXGI_FORMAT_UNKNOWN, {1, 0}, D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
                            D3D12_RESOURCE_FLAG_NONE};
-    // Kept until the next flush: the list that copies from it has run by then (one queue, in order).
+    ComPtr<ID3D12Resource> upload;
     if (FAILED(device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
                                                IID_PPV_ARGS(&upload)))) {
       return;
     }
+    upload->SetName(L"page table entries");
     uint8_t* p = nullptr;
     upload->Map(0, nullptr, reinterpret_cast<void**>(&p));
     D3D12_RESOURCE_BARRIER b{};
@@ -234,6 +249,7 @@ struct GpuMemory {
     std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
     list->ResourceBarrier(1, &b);
     pending.clear();
+    uploads.push_back({kPending, list, std::move(upload)});
   }
 };
 
@@ -337,6 +353,13 @@ uint32_t allocate_view_slot(D3D12_CPU_DESCRIPTOR_HANDLE* handle) {
   std::lock_guard g(memory().lock);
   GpuMemory* m = ready();
   return m ? m->allocate_view(handle) : 0;
+}
+
+void page_table_submitted(uint64_t fence_value, const void* list) {
+  std::lock_guard g(memory().lock);
+  for (auto& u : memory().uploads) {
+    if (u.fence == GpuMemory::kPending && u.list == list) u.fence = fence_value;
+  }
 }
 
 void flush_page_table(ID3D12GraphicsCommandList* list) {

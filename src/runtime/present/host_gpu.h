@@ -41,4 +41,9 @@ struct HostGpu {
 
 HostGpu* host_gpu();
 
+// AMERICAS_D3D12_DRED: D3D12's device-removed data (breadcrumbs, page faults) is kept, and
+// written to the log when the device is lost.
+bool dred_enabled();
+void report_device_removed(ID3D12Device* device);
+
 }  // namespace am::rt::present

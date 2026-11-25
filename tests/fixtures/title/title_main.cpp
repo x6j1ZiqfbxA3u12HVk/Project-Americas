@@ -26,7 +26,7 @@ extern "C" __declspec(dllimport) void* XMemMapPhysicalPages(void* address, unsig
 extern "C" __declspec(dllimport) int XMemGetWorkingSetStatistics(unsigned long which, void* out);
 extern "C" __declspec(dllimport) long D3D12ConfigureVirtualMemoryX(void* config);
 // A console function we do not implement: the loader binds a stub returning 0.
-extern "C" __declspec(dllimport) void* AcpHalCreate(void* a, void* b);
+extern "C" __declspec(dllimport) void* AcpHalFixtureUnimplemented(void* a, void* b);
 // From the title DLL beside this executable.
 extern "C" __declspec(dllimport) int am_fixture_dll_value();
 extern "C" __declspec(dllimport) int am_fixture_dll_tls_on_new_thread();
@@ -212,7 +212,7 @@ int main(int argc, char** argv) {
   _mm_clwb(&f);
   check(true, "CLWB");
 
-  check(AcpHalCreate(nullptr, nullptr) == nullptr, "unimplemented console import returns 0");
+  check(AcpHalFixtureUnimplemented(nullptr, nullptr) == nullptr, "unimplemented console import returns 0");
   check_console_memory();
   check_runtime();
   check_files();

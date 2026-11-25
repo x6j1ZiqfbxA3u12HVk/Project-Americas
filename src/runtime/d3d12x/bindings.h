@@ -29,8 +29,9 @@ void bind_texture_view(const D3D12_RESOURCE_DESC& resource, const D3D12_SHADER_R
 void notify_title_write(uint64_t address, uint64_t size);
 // Records the uploads and the table's upkeep into `list`, before its draws.
 void flush_bindings(ID3D12GraphicsCommandList* list);
-// The lists holding the last flush's readback were submitted; `fence_value` follows them.
-void bindings_submitted(uint64_t fence_value);
+// `list` (one that flushed) was submitted; `fence_value` follows it: what it reads is freed and
+// its readback read once that completes.
+void bindings_submitted(uint64_t fence_value, const void* list);
 // The table (root UAV u0 of translated programs) and the shader-visible sampler heap.
 D3D12_GPU_VIRTUAL_ADDRESS bindings_table();
 ID3D12DescriptorHeap* sampler_heap();
