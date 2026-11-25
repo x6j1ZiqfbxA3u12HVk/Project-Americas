@@ -813,3 +813,10 @@ Then the larger pieces before the 3D world shows:
   * **Habit: after a run that reached new screens, run `am-shaders precompile`.** Round 0
     does what the game waited for, in minutes.
   * Do not run two precompiles at once.
+* **The intro video is still solid green** (frames 400 to 800, before the start screen).
+  During it the GPU runs one compute pass and two 4-vertex video draws a frame (slot 57
+  `db5a5d…` and `efeabc…`), so Bink decodes on the CPU.
+  * Checking textures every submission instead of every 15th did not help (reverted), so
+    the planes never get data at all.
+  * **Next:** log the T#s the video draws read, and whether Bink writes them. Bink plays
+    its sound through the host's XAudio2 and may wait on that clock.
