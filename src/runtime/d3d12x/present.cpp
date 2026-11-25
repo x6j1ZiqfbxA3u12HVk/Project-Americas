@@ -5,9 +5,8 @@
 //   +0x10 resources                             +0x18 source rectangles (one per resource)
 //   +0x20 destination placement                 +0x28 color space (DXGI_COLOR_SPACE_TYPE)
 //
-// The first resource of the first plane is shown in the game window (runtime/present). Until
-// the GPU back end runs the title's commands, nothing draws into it: the window shows what
-// the title's memory holds, black.
+// The first resource of the first plane is shown in the game window (runtime/present): from its
+// host texture when the back end has one (GPU to GPU), else from the title's memory.
 
 #include <windows.h>
 #include <d3d12.h>
@@ -20,6 +19,7 @@
 #include "core/text.h"
 #include "runtime/d3d12x/commands.h"
 #include "runtime/d3d12x/d3d12x.h"
+#include "runtime/d3d12x/host.h"
 #include "runtime/d3d12x/layout.h"
 #include "runtime/d3d12x/object.h"
 #include "runtime/log.h"
@@ -65,7 +65,7 @@ void count_frame(bool shown) {
   if (seconds < 1.0) return;
   wchar_t text[160];
   std::swprintf(text, 160, L"%.0f fps, frame %llu%s", frames / seconds, static_cast<unsigned long long>(total),
-                shown ? L" (no GPU rendering yet)" : L" (not shown: see run.log)");
+                shown ? L" (draws wait for their shaders)" : L" (not shown: see run.log)");
   present::set_window_status(text);
   frames = 0;
   since = now;
@@ -93,6 +93,10 @@ HRESULT WINAPI queue_present_x(Object* self, UINT plane_count, const void* plane
         height = std::min<uint32_t>(static_cast<uint32_t>(r->bottom) - upper, height - std::min(upper, height));
       }
       present::Image image;
+      // A target the back end draws into is on the GPU: shown from there. Else the title's memory.
+      image.gpu = host_texture(plane.resources[0], false);
+      image.left = left;
+      image.top = upper;
       image.memory = reinterpret_cast<const uint8_t*>(address) + top.offset + uint64_t{upper} * top.row_pitch +
                      uint64_t{left} * layout.element_bytes;
       image.width = width;

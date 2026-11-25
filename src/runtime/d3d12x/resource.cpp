@@ -16,6 +16,7 @@
 
 #include "core/text.h"
 #include "runtime/d3d12x/d3d12x.h"
+#include "runtime/d3d12x/host.h"
 #include "runtime/d3d12x/object.h"
 #include "runtime/hle/xmem.h"
 #include "runtime/log.h"
@@ -37,6 +38,7 @@ struct Resource : Object {
   Object* device = nullptr;
 
   ~Resource() {
+    forget_host_texture(this);
     if (owned && address) hle::xmem_free(reinterpret_cast<void*>(address), attributes);
   }
 };

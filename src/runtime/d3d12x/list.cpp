@@ -1,6 +1,8 @@
-// Command allocators and command lists. Lists record the commands the title gives them
-// (commands.h); the null back end runs nothing, and each frame's commands are summed up in the
-// log.
+// Command allocators and command lists. Each console command becomes, as the title makes it,
+// the host D3D12 call that does the same, in a host command list of the console list's own
+// (no recording and replaying): clears, render targets, viewports and the like so far. Draws and
+// dispatches wait for their pipelines (shaders compiled ahead of time). Lists also keep what
+// they were given (commands.h), which the log sums up per frame.
 //
 // The console's command list is partly filled by the title's own code, which writes records
 // into the list object's fields at fixed offsets. The object therefore reserves a block of
@@ -9,6 +11,7 @@
 
 #include <windows.h>
 #include <d3d12.h>
+#include <wrl/client.h>
 
 #include <algorithm>
 #include <atomic>
@@ -18,8 +21,10 @@
 
 #include "runtime/d3d12x/commands.h"
 #include "runtime/d3d12x/d3d12x.h"
+#include "runtime/d3d12x/host.h"
 #include "runtime/d3d12x/object.h"
 #include "runtime/log.h"
+#include "runtime/present/host_gpu.h"
 
 namespace am::rt::d3d12x {
 namespace {
@@ -46,11 +51,29 @@ const Kind& allocator_kind() {
 
 constexpr size_t kConsoleFields = 0x1000;
 
+using Microsoft::WRL::ComPtr;
+
+// The host command list of a console list. It opens on the first command after a Reset, keeps
+// each resource's state within itself (every resource enters and leaves the list in COMMON, so
+// lists can be submitted in any order) and closes with the console list.
+struct HostList {
+  struct Allocator {
+    ComPtr<ID3D12CommandAllocator> allocator;
+    uint64_t fence = 0;  // reusable once the host fence reaches this; UINT64_MAX while recording
+  };
+  ComPtr<ID3D12GraphicsCommandList> list;
+  std::vector<Allocator> allocators;
+  size_t current = 0;
+  bool open = false, ready = false;  // recording; closed and waiting to be submitted
+  std::vector<std::pair<ID3D12Resource*, D3D12_RESOURCE_STATES>> states;
+};
+
 struct CommandList : Object {
   uint8_t console[kConsoleFields - sizeof(void*)] = {};  // the console object's fields, as the title sees them
   uint32_t desc[4] = {};
   Object* allocator = nullptr;
   Recording rec;
+  HostList host;
 };
 
 const Kind& list_kind();
@@ -110,6 +133,160 @@ void capture(Recording& r, Command& c) {
   }
 }
 
+// ---- the host list ----
+
+ID3D12GraphicsCommandList* host_begin(CommandList* l) {
+  HostList& h = l->host;
+  if (h.open) return h.list.Get();
+  present::HostGpu* gpu = present::host_gpu();
+  if (!gpu) return nullptr;
+  size_t pick = h.allocators.size();
+  for (size_t i = 0; i < h.allocators.size(); ++i) {
+    if (gpu->done(h.allocators[i].fence)) {
+      pick = i;
+      break;
+    }
+  }
+  if (pick == h.allocators.size()) {
+    HostList::Allocator a;
+    if (FAILED(gpu->device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&a.allocator)))) return nullptr;
+    h.allocators.push_back(std::move(a));
+  }
+  ID3D12CommandAllocator* a = h.allocators[pick].allocator.Get();
+  a->Reset();
+  if (!h.list) {
+    if (FAILED(gpu->device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, a, nullptr, IID_PPV_ARGS(&h.list)))) return nullptr;
+  } else if (FAILED(h.list->Reset(a, nullptr))) {
+    return nullptr;
+  }
+  h.allocators[pick].fence = UINT64_MAX;
+  h.current = pick;
+  h.open = true;
+  h.ready = false;
+  h.states.clear();
+  return h.list.Get();
+}
+
+// Moves `r` into `state` within the list.
+void host_use(HostList& h, ID3D12Resource* r, D3D12_RESOURCE_STATES state) {
+  for (auto& [res, s] : h.states) {
+    if (res != r) continue;
+    if (s != state) {
+      D3D12_RESOURCE_BARRIER b{};
+      b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+      b.Transition = {r, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, s, state};
+      h.list->ResourceBarrier(1, &b);
+      s = state;
+    }
+    return;
+  }
+  if (state != D3D12_RESOURCE_STATE_COMMON) {
+    D3D12_RESOURCE_BARRIER b{};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition = {r, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_COMMON, state};
+    h.list->ResourceBarrier(1, &b);
+  }
+  h.states.emplace_back(r, state);
+}
+
+void host_close(HostList& h) {
+  if (!h.open) return;
+  std::vector<D3D12_RESOURCE_BARRIER> back;
+  for (auto& [r, s] : h.states) {
+    if (s == D3D12_RESOURCE_STATE_COMMON) continue;
+    D3D12_RESOURCE_BARRIER b{};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition = {r, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, s, D3D12_RESOURCE_STATE_COMMON};
+    back.push_back(b);
+  }
+  if (!back.empty()) h.list->ResourceBarrier(static_cast<UINT>(back.size()), back.data());
+  h.states.clear();
+  const bool ok = SUCCEEDED(h.list->Close());
+  h.open = false;
+  h.ready = ok;
+  if (!ok) h.allocators[h.current].fence = 0;
+}
+
+// A console render-target (or depth) descriptor as a host view, the texture moved into `state`.
+D3D12_CPU_DESCRIPTOR_HANDLE host_view(HostList& h, uint64_t descriptor, bool depth) {
+  ViewInfo v;
+  if (!read_view(descriptor, v) || v.kind != (depth ? 5 : 4)) return {};
+  ID3D12Resource* t = host_texture(reinterpret_cast<const void*>(v.resource));
+  if (!t) return {};
+  const D3D12_CPU_DESCRIPTOR_HANDLE view = depth ? host_dsv(t, v.format) : host_rtv(t, v.format);
+  if (view.ptr) host_use(h, t, depth ? D3D12_RESOURCE_STATE_DEPTH_WRITE : D3D12_RESOURCE_STATE_RENDER_TARGET);
+  return view;
+}
+
+const uint8_t* data_of(const Recording& r, const Command& c) { return c.data_size ? r.data.data() + c.data_at : nullptr; }
+
+// The host call for a command, made as the title makes the console one.
+void forward(CommandList* l, const Command& c) {
+  switch (c.op) {
+    case kClearRenderTargetView:
+    case kClearDepthStencilView:
+    case kSetRenderTargets:
+    case kSetViewports:
+    case kSetScissorRects:
+    case kSetPrimitiveTopology:
+    case kSetBlendFactor:
+    case kSetStencilRef: break;
+    default: return;  // draws, dispatches and bindings wait for pipelines and the binding model
+  }
+  ID3D12GraphicsCommandList* list = host_begin(l);
+  if (!list) return;
+  HostList& h = l->host;
+  const Recording& r = l->rec;
+  const uint8_t* data = data_of(r, c);
+  switch (c.op) {
+    case kClearRenderTargetView: {
+      const D3D12_CPU_DESCRIPTOR_HANDLE view = host_view(h, c.a[0], false);
+      if (!view.ptr || c.data_size < 16) return;
+      const UINT rects = static_cast<UINT>(c.a[2]);
+      list->ClearRenderTargetView(view, reinterpret_cast<const float*>(data), rects && c.data_size >= 16 + rects * 16 ? rects : 0,
+                                  rects ? reinterpret_cast<const D3D12_RECT*>(data + 16) : nullptr);
+      return;
+    }
+    case kClearDepthStencilView: {
+      const D3D12_CPU_DESCRIPTOR_HANDLE view = host_view(h, c.a[0], true);
+      if (!view.ptr) return;
+      const UINT rects = data ? static_cast<UINT>(c.a[4]) : 0;
+      list->ClearDepthStencilView(view, static_cast<D3D12_CLEAR_FLAGS>(c.a[1]), c.f[0], static_cast<UINT8>(c.a[3]), rects,
+                                  rects ? reinterpret_cast<const D3D12_RECT*>(data) : nullptr);
+      return;
+    }
+    case kSetRenderTargets: {
+      const UINT count = std::min<UINT>(static_cast<UINT>(c.a[0]), D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT);
+      const bool range = (c.a[2] & 0xFF) != 0;
+      const uint64_t* handles = reinterpret_cast<const uint64_t*>(data);
+      const size_t given = (range ? (count ? 1 : 0) : count);
+      if (given * 8 > c.data_size) return;
+      D3D12_CPU_DESCRIPTOR_HANDLE views[D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
+      for (UINT i = 0; i < count; ++i) {
+        const uint64_t console = range ? handles[0] + uint64_t{i} * descriptor_size(D3D12_DESCRIPTOR_HEAP_TYPE_RTV) : handles[i];
+        views[i] = host_view(h, console, false);
+        if (!views[i].ptr) return;  // a target we cannot show: the draws after it are skipped anyway
+      }
+      D3D12_CPU_DESCRIPTOR_HANDLE depth{};
+      if (c.a[3] && c.data_size >= given * 8 + 8) {
+        depth = host_view(h, handles[given], true);
+      }
+      list->OMSetRenderTargets(count, count ? views : nullptr, FALSE, depth.ptr ? &depth : nullptr);
+      return;
+    }
+    case kSetViewports:
+      if (data) list->RSSetViewports(static_cast<UINT>(c.data_size / sizeof(D3D12_VIEWPORT)), reinterpret_cast<const D3D12_VIEWPORT*>(data));
+      return;
+    case kSetScissorRects:
+      if (data) list->RSSetScissorRects(static_cast<UINT>(c.data_size / sizeof(D3D12_RECT)), reinterpret_cast<const D3D12_RECT*>(data));
+      return;
+    case kSetPrimitiveTopology: list->IASetPrimitiveTopology(static_cast<D3D12_PRIMITIVE_TOPOLOGY>(c.a[0])); return;
+    case kSetBlendFactor: list->OMSetBlendFactor(reinterpret_cast<const float*>(data)); return;
+    case kSetStencilRef: list->OMSetStencilRef(static_cast<UINT>(c.a[0])); return;
+    default: return;
+  }
+}
+
 template <int S>
 uint64_t WINAPI record(CommandList* self, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5,
                        uint64_t a6, uint64_t a7) {
@@ -118,6 +295,7 @@ uint64_t WINAPI record(CommandList* self, uint64_t a1, uint64_t a2, uint64_t a3,
   c.a[0] = a1, c.a[1] = a2, c.a[2] = a3, c.a[3] = a4, c.a[4] = a5, c.a[5] = a6, c.a[6] = a7;
   capture(self->rec, c);
   self->rec.commands.push_back(c);
+  forward(self, self->rec.commands.back());
   return 0;
 }
 
@@ -131,10 +309,12 @@ void WINAPI clear_depth_stencil(CommandList* self, uint64_t handle, UINT flags, 
   c.f[0] = depth;
   keep(self->rec, c, reinterpret_cast<uint64_t>(rect), count_of(rects) * sizeof(D3D12_RECT));
   self->rec.commands.push_back(c);
+  forward(self, self->rec.commands.back());
 }
 
 HRESULT WINAPI list_close(CommandList* self) {
   self->rec.closed = true;
+  host_close(self->host);
   return S_OK;
 }
 
@@ -142,6 +322,11 @@ HRESULT WINAPI list_reset(CommandList* self, Object* allocator, Object* /*pipeli
   self->rec.commands.clear();
   self->rec.data.clear();
   self->rec.closed = false;
+  // A host list never submitted gives its allocator back.
+  HostList& h = self->host;
+  if (h.open) host_close(h);
+  if (h.ready) h.allocators[h.current].fence = 0;
+  h.ready = false;
   if (allocator) self->allocator = allocator;
   return S_OK;
 }
@@ -267,6 +452,28 @@ const char* op_name(uint16_t op) {
 const Recording* recording_of(const void* list) {
   Object* o = object_of_kind(list, list_kind());
   return o ? &static_cast<CommandList*>(o)->rec : nullptr;
+}
+
+void submit_lists(UINT count, void* const* lists) {
+  present::HostGpu* gpu = present::host_gpu();
+  if (!gpu || !lists) return;
+  std::vector<ID3D12CommandList*> host_lists;
+  std::vector<HostList*> owners;
+  for (UINT i = 0; i < count; ++i) {
+    Object* o = object_of_kind(lists[i], list_kind());
+    if (!o) continue;
+    HostList& h = static_cast<CommandList*>(o)->host;
+    if (h.open) host_close(h);  // the title submits only closed lists; be safe
+    if (!h.ready) continue;
+    host_lists.push_back(h.list.Get());
+    owners.push_back(&h);
+  }
+  if (host_lists.empty()) return;
+  const uint64_t done = gpu->submit(static_cast<UINT>(host_lists.size()), host_lists.data());
+  for (HostList* h : owners) {
+    h->allocators[h->current].fence = done;
+    h->ready = false;
+  }
 }
 
 void frame_execute(const void* list) {

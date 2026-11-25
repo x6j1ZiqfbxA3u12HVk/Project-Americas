@@ -130,6 +130,7 @@ void WINAPI queue_execute_command_lists(Queue* self, UINT count, void* const* li
 void WINAPI queue_execute_command_lists_x(Queue* self, UINT count, void* const* lists, uint64_t token, UINT flags) {
   trace(self, 35, "ExecuteCommandListsX", count, token, flags);
   for (UINT i = 0; lists && i < count; ++i) frame_execute(lists[i]);
+  submit_lists(count, lists);
 }
 
 const Kind& queue_kind() {

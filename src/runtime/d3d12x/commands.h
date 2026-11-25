@@ -90,6 +90,9 @@ struct Recording {
 };
 const Recording* recording_of(const void* list);
 
+// queue.cpp's ExecuteCommandListsX: submits the lists' host command lists, in order.
+void submit_lists(unsigned count, void* const* lists);
+
 // queue.cpp's ExecuteCommandLists hands each list here; PresentX ends the frame.
 void frame_execute(const void* list);
 void frame_present();

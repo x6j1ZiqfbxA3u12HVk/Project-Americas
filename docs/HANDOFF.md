@@ -261,11 +261,13 @@ DirectStorage and files are done (PLAN.md section 11, "M2.3").
      saved in `cache\shaders\runtime` (not in `shaders.rpf`);
    * pipeline 2, slot 55: shaders not found yet (its description is fixed-function state);
    * pipeline 3, slot 57: GPU programs from the corpus, markers in the frame log.
-   To draw it: host resources for render targets and the textures it samples (PLAN.md 5.2,
-   class A and B), descriptor translation for its two tables and root SRV, the VS/PS
-   translation of those programs (the shader track), host PSOs, then running the recorded
-   commands at `ExecuteCommandListsX` and presenting the host back buffer. Clears alone show
-   nothing new: the only one is the back buffer to black.
+   Done: the host back end without replay (PLAN.md 11, M2.4, "The host back end"): console
+   commands go straight to host command lists; render targets and depth live on the GPU; the
+   window shows the host back buffer GPU to GPU. **The user's rule: nothing is translated
+   while the game runs.** Console calls map to host calls one for one; shaders are compiled
+   ahead of time and looked up. Still to do for the boot screen: the textures it samples
+   (class B), descriptor translation for its two tables and root SRV, the VS/PS translation of
+   its programs (the shader track) and host PSOs from them, then forwarding draws.
    * Most game pipelines come from slot 57 (programs already in GPU memory); all 911 of their
      programs are in the corpus, found by the 24-byte marker. The translator's output should be
      looked up by that marker at run time.

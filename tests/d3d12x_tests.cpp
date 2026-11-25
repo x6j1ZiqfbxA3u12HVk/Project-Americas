@@ -9,6 +9,9 @@
 
 #include "runtime/d3d12x/commands.h"
 #include "runtime/d3d12x/d3d12x.h"
+#include "runtime/d3d12x/host.h"
+#include "runtime/present/host_gpu.h"
+#include "runtime/present/presenter.h"
 #include "runtime/d3d12x/layout.h"
 #include "runtime/d3d12x/object.h"
 #include "runtime/d3d12x/root_signature.h"
@@ -371,4 +374,75 @@ TEST_CASE(d3d12x_command_lists_record_commands) {
   }
   CHECK(slot<HRESULT(WINAPI*)(void*, void*, void*)>(list, 139)(list, nullptr, nullptr) == S_OK);
   CHECK(recording_of(list)->commands.empty());
+}
+
+TEST_CASE(d3d12x_clear_runs_on_the_host_gpu_and_presents) {
+  using namespace am::rt;
+  void* device = make_device();
+  // A 64 x 48 render target (slot 127) and a view of it in a render-target heap of ours.
+  D3D12_HEAP_PROPERTIES heap{};
+  heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+  D3D12_RESOURCE_DESC desc{};
+  desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+  desc.Width = 64;
+  desc.Height = 48;
+  desc.DepthOrArraySize = 1;
+  desc.MipLevels = 1;
+  desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+  desc.SampleDesc.Count = 1;
+  desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+  using CreateFn = HRESULT(WINAPI*)(void*, const D3D12_HEAP_PROPERTIES*, UINT, const D3D12_RESOURCE_DESC*, UINT,
+                                    const D3D12_CLEAR_VALUE*, void*, UINT, const DXGI_FORMAT*, const GUID*, void**);
+  void* target = nullptr;
+  CHECK(slot<CreateFn>(device, 127)(device, &heap, 0, &desc, 2, nullptr, nullptr, 0, nullptr, nullptr, &target) == S_OK);
+  struct {
+    uint32_t type, count, flags, node_mask;
+    uint64_t address, size;
+  } heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 4, 0, 1, 0, 0};
+  void* rtv_heap = nullptr;
+  CHECK(slot<HRESULT(WINAPI*)(void*, const void*, const GUID*, void**)>(device, 14)(device, &heap_desc, nullptr, &rtv_heap) == S_OK);
+  const uint64_t rtv = slot<uint64_t(WINAPI*)(void*)>(rtv_heap, 9)(rtv_heap);
+  slot<void(WINAPI*)(void*, void*, const void*, uint64_t)>(device, 20)(device, target, nullptr, rtv);
+
+  // The console list clears it; the console queue submits it.
+  const uint32_t list_desc[4] = {0, 2, 1, 0};
+  void* list = nullptr;
+  CHECK(slot<HRESULT(WINAPI*)(void*, const uint32_t*, void*, void*, const GUID*, void**)>(device, 73)(
+            device, list_desc, nullptr, nullptr, nullptr, &list) == S_OK);
+  const float color[4] = {1.0f, 0.5f, 0.0f, 1.0f};
+  slot<void(WINAPI*)(void*, uint64_t, const float*, UINT, const D3D12_RECT*)>(list, 52)(list, rtv, color, 0, nullptr);
+  CHECK(slot<HRESULT(WINAPI*)(void*)>(list, 9)(list) == S_OK);
+  D3D12_COMMAND_QUEUE_DESC qd{};
+  void* queue = nullptr;
+  CHECK(slot<HRESULT(WINAPI*)(void*, const void*, const GUID*, void**)>(device, 8)(device, &qd, nullptr, &queue) == S_OK);
+  slot<void(WINAPI*)(void*, UINT, void* const*, uint64_t, UINT)>(queue, 35)(queue, 1, &list, 0, 0);
+
+  ID3D12Resource* host = host_texture(target, false);
+  if (!present::host_gpu()) {
+    CHECK(host == nullptr);  // no D3D12 here: nothing ran
+    return;
+  }
+  CHECK(host != nullptr);
+  WNDCLASSW wc{};
+  wc.lpfnWndProc = DefWindowProcW;
+  wc.hInstance = GetModuleHandleW(nullptr);
+  wc.lpszClassName = L"AmericasClearTest";
+  RegisterClassW(&wc);
+  HWND window = CreateWindowExW(0, wc.lpszClassName, L"clear test", WS_OVERLAPPEDWINDOW, 0, 0, 320, 200, nullptr, nullptr,
+                                wc.hInstance, nullptr);
+  present::Presenter presenter(window);
+  present::Image image;
+  image.gpu = host;
+  image.width = 64;
+  image.height = 48;
+  image.format = DXGI_FORMAT_R8G8B8A8_UNORM;
+  std::vector<uint8_t> shown;
+  CHECK(presenter.present(image, &shown));
+  CHECK(shown.size() == 64u * 48 * 4);
+  bool all = shown.size() == 64u * 48 * 4;
+  for (size_t i = 0; all && i < shown.size(); i += 4) {
+    all = shown[i] == 255 && (shown[i + 1] == 127 || shown[i + 1] == 128) && shown[i + 2] == 0 && shown[i + 3] == 255;
+  }
+  CHECK(all);
+  DestroyWindow(window);
 }

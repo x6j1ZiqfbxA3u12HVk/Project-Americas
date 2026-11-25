@@ -1076,6 +1076,21 @@ containers as `<HASH digest>.dxbc`, slot 57 pipelines as `<digest>.cpipe` (for e
 address, size and kind, then its bytes). The stream pipeline's containers are not in
 `shaders.rpf` (they come from another file), so the corpus alone is not the whole set.
 
+**The host back end, no replay (`d3d12x/list.cpp`, `d3d12x/host_resources.cpp`,
+`present/host_gpu.cpp`).** No translation runs while the game runs: each console command is
+turned, as the title makes it, into the host D3D12 call that does the same, in a host command
+list of the console list's own (the work a PC port's own D3D12 calls do); shaders come compiled
+ahead of time. One host device serves the back end and the presenter. So far: clears (render
+target, depth), render targets, viewports, scissors, topology, blend factor, stencil reference.
+GPU-written resources (render target, depth, storage flags) get a host texture on first use
+(PLAN 5.2, class A) and host views; a host list keeps each resource's state within itself
+(COMMON at its start and end). `ExecuteCommandListsX` submits the host lists; `PresentX` copies
+a host back buffer to the swap chain GPU to GPU. Draws, dispatches and bindings wait for the
+pipelines (precompiled shaders looked up by program marker) and the binding model. Console
+fences still signal at once, ahead of the host GPU: to be tied to the host fence once the GPU
+does real work. The boot screen runs this way at 30 fps: two 3840x2160 back buffers, a render
+target and a depth buffer on the GPU, cleared black.
+
 **Where the game is now: its frame loop, at 30 fps, in a window.** It records command lists,
 presents once a frame into the game window and waits for frame events between frames, for
 the whole of a run without a crash. The window is black: nothing runs the title's GPU

@@ -9,8 +9,8 @@
 #include <mutex>
 #include <string>
 
-#include "core/text.h"
 #include "runtime/log.h"
+#include "runtime/present/host_gpu.h"
 
 namespace am::rt::present {
 
@@ -100,17 +100,11 @@ ComPtr<ID3D12Resource> make_buffer(ID3D12Device* device, D3D12_HEAP_TYPE heap_ty
 struct Presenter::State {
   HWND window = nullptr;
   std::mutex lock;
-  bool started = false, failed = false;
-
-  ComPtr<IDXGIFactory4> factory;
-  ComPtr<ID3D12Device> device;
-  ComPtr<ID3D12CommandQueue> queue;
-  ComPtr<ID3D12GraphicsCommandList> list;
-  ComPtr<ID3D12Fence> fence;
-  HANDLE event = nullptr;
-  uint64_t next_value = 1;
+  HostGpu* gpu = nullptr;
+  bool failed = false;
   uint64_t frame = 0;
 
+  ComPtr<ID3D12GraphicsCommandList> list;
   ComPtr<IDXGISwapChain3> swap;
   DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
   uint32_t width = 0, height = 0;
@@ -127,49 +121,20 @@ struct Presenter::State {
   ComPtr<ID3D12Resource> readback;
   uint64_t readback_size = 0;
 
-  void wait_for(uint64_t value) {
-    if (!value || fence->GetCompletedValue() >= value) return;
-    fence->SetEventOnCompletion(value, event);
-    WaitForSingleObject(event, INFINITE);
-  }
-  void wait_idle() {
-    if (!queue || !fence) return;
-    const uint64_t v = next_value++;
-    queue->Signal(fence.Get(), v);
-    wait_for(v);
-  }
-
   bool start() {
-    started = true;
-    if (FAILED(CreateDXGIFactory2(0, IID_PPV_ARGS(&factory)))) return fail("no DXGI factory");
-    ComPtr<IDXGIAdapter1> adapter;
-    ComPtr<IDXGIFactory6> factory6;
-    if (SUCCEEDED(factory.As(&factory6))) {
-      factory6->EnumAdapterByGpuPreference(0, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE, IID_PPV_ARGS(&adapter));
-    }
-    if (!adapter) factory->EnumAdapters1(0, &adapter);
-    if (FAILED(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)))) {
-      return fail("no D3D12 device");
-    }
-    D3D12_COMMAND_QUEUE_DESC qd{};
-    qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
-    if (FAILED(device->CreateCommandQueue(&qd, IID_PPV_ARGS(&queue)))) return fail("no command queue");
+    gpu = host_gpu();
+    if (!gpu) return fail("no D3D12 device");
     for (Slot& s : slots) {
-      if (FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&s.allocator)))) {
+      if (FAILED(gpu->device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&s.allocator)))) {
         return fail("no command allocator");
       }
     }
-    if (FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, slots[0].allocator.Get(), nullptr,
-                                         IID_PPV_ARGS(&list)))) {
+    if (FAILED(gpu->device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, slots[0].allocator.Get(), nullptr,
+                                              IID_PPV_ARGS(&list)))) {
       return fail("no command list");
     }
     list->Close();
-    if (FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)))) return fail("no fence");
-    event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    factory->MakeWindowAssociation(window, DXGI_MWA_NO_ALT_ENTER);
-    DXGI_ADAPTER_DESC1 ad{};
-    if (adapter) adapter->GetDesc1(&ad);
-    logf("present: D3D12 on %s", narrow(ad.Description).c_str());
+    gpu->factory->MakeWindowAssociation(window, DXGI_MWA_NO_ALT_ENTER);
     return true;
   }
 
@@ -181,7 +146,7 @@ struct Presenter::State {
 
   bool ensure_swap_chain(DXGI_FORMAT f, uint32_t w, uint32_t h) {
     if (swap && f == format && w == width && h == height) return true;
-    wait_idle();
+    gpu->wait_idle();
     swap.Reset();
     DXGI_SWAP_CHAIN_DESC1 d{};
     d.Width = w;
@@ -194,7 +159,7 @@ struct Presenter::State {
     d.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
     d.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
     ComPtr<IDXGISwapChain1> s1;
-    const HRESULT hr = factory->CreateSwapChainForHwnd(queue.Get(), window, &d, nullptr, nullptr, &s1);
+    const HRESULT hr = gpu->factory->CreateSwapChainForHwnd(gpu->queue.Get(), window, &d, nullptr, nullptr, &s1);
     if (FAILED(hr) || FAILED(s1.As(&swap))) {
       logf("present: no swap chain for %ux%u, format %u (0x%08lx)", w, h, f, static_cast<unsigned long>(hr));
       return false;
@@ -209,7 +174,7 @@ struct Presenter::State {
 
   bool ensure_upload(Slot& s, uint64_t size) {
     if (s.upload && s.upload_size >= size) return true;
-    s.upload = make_buffer(device.Get(), D3D12_HEAP_TYPE_UPLOAD, size, D3D12_RESOURCE_STATE_GENERIC_READ);
+    s.upload = make_buffer(gpu->device.Get(), D3D12_HEAP_TYPE_UPLOAD, size, D3D12_RESOURCE_STATE_GENERIC_READ);
     s.mapped = nullptr;
     s.upload_size = 0;
     void* p = nullptr;
@@ -238,72 +203,89 @@ Presenter::Presenter(HWND window) : s_(new State) { s_->window = window; }
 Presenter::~Presenter() {
   {
     std::lock_guard g(s_->lock);
-    s_->wait_idle();
-    if (s_->event) CloseHandle(s_->event);
+    if (s_->gpu) s_->gpu->wait_idle();
   }
   delete s_;
 }
 
-bool Presenter::usable() const { return !s_->failed; }
+bool Presenter::usable() const { return !s_->failed && host_gpu() != nullptr; }
 
 bool Presenter::present(const Image& image, std::vector<uint8_t>* capture) {
   State& s = *s_;
   std::lock_guard g(s.lock);
   if (s.failed || !s.window) return false;
-  if (!s.started && !s.start()) return false;
+  if (!s.gpu && !s.start()) return false;
   const DXGI_FORMAT f = swap_chain_format(image.format);
   const uint32_t pixel = swap_chain_pixel_bytes(f);
-  if (!pixel || !image.memory || !image.width || !image.height) return false;
+  if (!pixel || (!image.gpu && !image.memory) || !image.width || !image.height) return false;
   if (!s.ensure_swap_chain(f, image.width, image.height)) return false;
 
   const uint64_t row_bytes = uint64_t{image.width} * pixel;
   const uint64_t pitch = align_up(row_bytes, D3D12_TEXTURE_DATA_PITCH_ALIGNMENT);
   State::Slot& slot = s.slots[s.frame % kBuffers];
-  s.wait_for(slot.fence_value);
-  if (!s.ensure_upload(slot, pitch * image.height)) return false;
-  if (!copy_rows(slot.mapped, pitch, image.memory, image.row_pitch, std::min<uint64_t>(row_bytes, image.row_pitch),
-                 image.height)) {
-    return false;
-  }
+  s.gpu->wait(slot.fence_value);
 
   slot.allocator->Reset();
   s.list->Reset(slot.allocator.Get(), nullptr);
   ComPtr<ID3D12Resource> target;
   s.swap->GetBuffer(s.swap->GetCurrentBackBufferIndex(), IID_PPV_ARGS(&target));
-  D3D12_RESOURCE_BARRIER b = transition(target.Get(), D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST);
-  s.list->ResourceBarrier(1, &b);
+  D3D12_RESOURCE_BARRIER b[2] = {transition(target.Get(), D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST)};
+  UINT barriers = 1;
+  if (image.gpu) b[barriers++] = transition(image.gpu, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
+  s.list->ResourceBarrier(barriers, b);
   D3D12_TEXTURE_COPY_LOCATION dst{};
   dst.pResource = target.Get();
   dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-  D3D12_TEXTURE_COPY_LOCATION src{};
-  src.pResource = slot.upload.Get();
-  src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-  src.PlacedFootprint.Footprint = {f, image.width, image.height, 1, static_cast<UINT>(pitch)};
-  s.list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+  D3D12_TEXTURE_COPY_LOCATION footprint{};
+  footprint.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+  footprint.PlacedFootprint.Footprint = {f, image.width, image.height, 1, static_cast<UINT>(pitch)};
+  if (image.gpu) {
+    // GPU to GPU: the region of the title's render target.
+    D3D12_TEXTURE_COPY_LOCATION src{};
+    src.pResource = image.gpu;
+    src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    const D3D12_BOX box{image.left, image.top, 0, image.left + image.width, image.top + image.height, 1};
+    s.list->CopyTextureRegion(&dst, 0, 0, 0, &src, &box);
+  } else {
+    if (!s.ensure_upload(slot, pitch * image.height) ||
+        !copy_rows(slot.mapped, pitch, image.memory, image.row_pitch, std::min<uint64_t>(row_bytes, image.row_pitch),
+                   image.height)) {
+      s.list->Close();
+      return false;
+    }
+    footprint.pResource = slot.upload.Get();
+    s.list->CopyTextureRegion(&dst, 0, 0, 0, &footprint, nullptr);
+  }
+  barriers = 0;
   if (capture) {
     if (!s.readback || s.readback_size < pitch * image.height) {
-      s.readback = make_buffer(s.device.Get(), D3D12_HEAP_TYPE_READBACK, pitch * image.height, D3D12_RESOURCE_STATE_COPY_DEST);
+      s.readback = make_buffer(s.gpu->device.Get(), D3D12_HEAP_TYPE_READBACK, pitch * image.height,
+                               D3D12_RESOURCE_STATE_COPY_DEST);
       s.readback_size = s.readback ? pitch * image.height : 0;
     }
-    b = transition(target.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
-    s.list->ResourceBarrier(1, &b);
+    const D3D12_RESOURCE_BARRIER to_source = transition(target.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    s.list->ResourceBarrier(1, &to_source);
     if (s.readback) {
-      D3D12_TEXTURE_COPY_LOCATION back = src;
+      D3D12_TEXTURE_COPY_LOCATION back = footprint;
       back.pResource = s.readback.Get();
       s.list->CopyTextureRegion(&back, 0, 0, 0, &dst, nullptr);
     }
-    b = transition(target.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PRESENT);
+    b[barriers++] = transition(target.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PRESENT);
   } else {
-    b = transition(target.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT);
+    b[barriers++] = transition(target.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT);
   }
-  s.list->ResourceBarrier(1, &b);
+  if (image.gpu) b[barriers++] = transition(image.gpu, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+  s.list->ResourceBarrier(barriers, b);
   if (FAILED(s.list->Close())) return false;
-  ID3D12CommandList* lists[] = {s.list.Get()};
-  s.queue->ExecuteCommandLists(1, lists);
-  s.set_color_space(image.color_space);
-  const HRESULT hr = s.swap->Present(1, 0);
-  slot.fence_value = s.next_value++;
-  s.queue->Signal(s.fence.Get(), slot.fence_value);
+  HRESULT hr;
+  {
+    std::lock_guard q(s.gpu->submit_lock);
+    ID3D12CommandList* lists[] = {s.list.Get()};
+    s.gpu->queue->ExecuteCommandLists(1, lists);
+    s.set_color_space(image.color_space);
+    hr = s.swap->Present(1, 0);
+  }
+  slot.fence_value = s.gpu->signal();
   ++s.frame;
   if (FAILED(hr)) {
     logf("present: Present failed (0x%08lx)", static_cast<unsigned long>(hr));
@@ -311,7 +293,7 @@ bool Presenter::present(const Image& image, std::vector<uint8_t>* capture) {
     return false;
   }
   if (capture && s.readback) {
-    s.wait_for(slot.fence_value);
+    s.gpu->wait(slot.fence_value);
     void* p = nullptr;
     if (FAILED(s.readback->Map(0, nullptr, &p))) return false;
     capture->resize(row_bytes * image.height);
