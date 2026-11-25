@@ -124,14 +124,14 @@ Set-Location "C:\Users\Admin\Documents\GitHub\Project Americas"; . .\scripts\env
 ### Run the game (safe, unattended)
 
 ```powershell
-& "C:\Project Americas\build\release\bin\americas.exe" --memory-limit 12288 --timeout 120
+& "C:\Project Americas\build\release\bin\americas.exe" --timeout 120
 ```
 
 * Without `--title`, it runs the executable `MicrosoftGame.Config` names.
 * `--memory-limit` caps private commit (a job object) and, separately, the physical page pool's
   commit, which a job does not count. The game commits about 4.4 GiB at start-up (no RAM until
   touched), and once its runtime queries are answered it maps a 6.1 GiB physical page pool: 8192
-  is now too tight (the mapping fails, error 1450), 12288 holds it.
+  is now too tight (the mapping fails, error 1450) and so is 12288: run without the limit.
 * `--console auto|series_s|series_x` overrides `americas.ini`'s `console`. Auto gives Series S
   on this 16 GB PC.
 * Logs go to `C:\Project Americas\logs`:
@@ -520,8 +520,18 @@ After that, from the plan:
   4 GiB free), XDisplay HDR (off): `gdk/offline.cpp`. Every area the game asks for is now
   offered but XSpeechSynthesizer. With them **the game maps its 6.1 GiB physical page pool**
   (about 7 GiB of physical pages in all), which `--memory-limit 8192` cannot hold: the mapping
-  fails with error 1450 and the game stops on its own `int 3` (game+0x1e6c29f). Run with
-  `--memory-limit 12288` (or none) from now on. It still sits on the black boot screen.
+  fails with error 1450 and the game stops on its own `int 3` (game+0x1e6c29f, or +0x19f5291
+  when the allocation itself is refused). Even 12288 is too little, since the cap counts the
+  pool and private memory together: **run without `--memory-limit`** (or 16384+) from now on.
+  * The physical pool's GPU part (committed, 1 GiB) now comes on top of the console budget
+    (`title_memory.cpp`), so the 6.1 GiB allocation fits however the small batches land.
+  * **Open: system commit leaked across runs.** After about 40 game runs on 2026-11-25 the
+    system had 58.4 GiB committed with no process holding it (free RAM 10 GiB), and the
+    committed GPU pool could not be created (error 1455). Suspect: host heaps opened over title
+    memory (`OpenExistingHeapFromAddress` / `FromFileMapping`) or driver allocations not
+    released at exit. Check `\Memory\Committed Bytes` before and after a run after a reboot.
+  * It still sits on the black boot screen, in the game's "System Init" state (its own crash
+    report, `userdata\temp\*.crash.log`, names the state; it also says "Anaconda", Series X).
 * **Next: why the boot sequence does not move on.** The frame loop runs, but the game keeps
   drawing its black boot screen (fill, transparent fade, composite). Find what it waits for:
   `hang.txt` (every thread's stack at the timeout, named with `scripts\symbolize.py`),

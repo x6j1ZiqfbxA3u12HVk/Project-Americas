@@ -312,10 +312,15 @@ bool TitleMemory::ensure_pool() {
     SetLastError(ERROR_NOT_ENOUGH_MEMORY);
     return false;
   }
-  // The committed pool: at most half the pool, and never more than the cap leaves room for.
+  // The committed pool comes on top of the console's budget, which stays whole in the lazy pool:
+  // the game asks for most of its budget in one allocation (6.1 GiB of a Series S's 7.6 GiB),
+  // which must fit even when its small batches sit in the lazy pool too. At most half the
+  // budget, and never more than the cap leaves room for.
   uint64_t gpu_pages = std::min(options_.gpu_pool_bytes / kPage, capacity_ / 2);
   if (options_.commit_cap && gpu_pages * kPage > options_.commit_cap / 4) gpu_pages = options_.commit_cap / 4 / kPage;
-  lazy_pages_ = capacity_ - gpu_pages;
+  if (capacity_ + gpu_pages > kMaxPages) gpu_pages = kMaxPages - capacity_;
+  lazy_pages_ = capacity_;
+  capacity_ += gpu_pages;
   const uint64_t bytes = lazy_pages_ * kPage;
   section_ = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE | SEC_RESERVE,
                                 static_cast<DWORD>(bytes >> 32), static_cast<DWORD>(bytes), nullptr);
