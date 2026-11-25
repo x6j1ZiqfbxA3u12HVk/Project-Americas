@@ -53,5 +53,8 @@ void flush_page_table(ID3D12GraphicsCommandList* list);
 // `list` (one that flushed) was submitted; `fence_value` follows it: its uploads are freed once
 // that completes.
 void page_table_submitted(uint64_t fence_value, const void* list);
+// The GPU's own page mapping (queue slot 31): the 64 KiB pages from `address` read GPU pool
+// pages `pages` (-1: unmapped), whatever the CPU sees there.
+void map_gpu_pages(uint64_t address, const int64_t* pages, uint64_t count);
 
 }  // namespace am::rt::d3d12x

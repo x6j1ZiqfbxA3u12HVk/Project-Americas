@@ -2,6 +2,7 @@
 // attributes, physical pages, and XMemAlloc through the title's own allocator hooks.
 
 #include <windows.h>
+#include <intrin.h>
 #include <psapi.h>
 
 #include <atomic>
@@ -198,8 +199,13 @@ void* WINAPI my_XMemAllocDefault(SIZE_T size, ULONG64 attributes) {
 void WINAPI my_XMemFreeDefault(void* address, ULONG64 attributes) { mem::default_allocator().free(address, attributes); }
 
 void* WINAPI my_XMemAlloc(SIZE_T size, ULONG64 attributes) {
-  if (void* const* t = hook_table(); t && t[0] && t[1]) return reinterpret_cast<AllocHook>(t[0])(size, attributes);
-  return my_XMemAllocDefault(size, attributes);
+  void* p = nullptr;
+  if (void* const* t = hook_table(); t && t[0] && t[1]) p = reinterpret_cast<AllocHook>(t[0])(size, attributes);
+  else p = my_XMemAllocDefault(size, attributes);
+  if (GetEnvironmentVariableA("AMERICAS_TRACE_MAPS", nullptr, 0)) {
+    logf("XMemAlloc(%s, attributes 0x%s) = %p (from %p)", format_bytes(size).c_str(), hex(attributes).c_str(), p, _ReturnAddress());
+  }
+  return p;
 }
 void WINAPI my_XMemFree(void* address, ULONG64 attributes) {
   if (void* const* t = hook_table(); t && t[0] && t[1]) return reinterpret_cast<FreeHook>(t[1])(address, attributes);

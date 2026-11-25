@@ -383,6 +383,18 @@ uint32_t allocate_view_slot(D3D12_CPU_DESCRIPTOR_HANDLE* handle) {
   return m ? m->allocate_view(handle) : 0;
 }
 
+void map_gpu_pages(uint64_t address, const int64_t* pages, uint64_t count) {
+  open_pool_if_ready();
+  GpuMemory& m = memory();
+  if (!m.pool_window || m.pool_window == UINT32_MAX || (address >> kAddressBits) || address % kPage) return;
+  std::vector<uint32_t> entries(count, 0u);
+  for (uint64_t k = 0; k < count; ++k) {
+    if (pages[k] >= 0) entries[k] = (m.pool_window << 16) | static_cast<uint32_t>(pages[k]);
+  }
+  std::lock_guard p(m.pending_lock);
+  m.pending.emplace_back(address / kPage, std::move(entries));
+}
+
 void page_table_submitted(uint64_t fence_value, const void* list) {
   std::lock_guard g(memory().lock);
   for (auto& u : memory().uploads) {

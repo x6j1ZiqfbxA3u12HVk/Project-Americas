@@ -3,6 +3,7 @@
 #include <windows.h>
 #include <intrin.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstring>
 #include <fstream>
@@ -428,11 +429,46 @@ LONG CALLBACK on_illegal_instruction(EXCEPTION_POINTERS* info) {
   return EXCEPTION_CONTINUE_EXECUTION;
 }
 
+// The title's soft asserts: an int 3 followed by the code that carries on (a debugger would stop
+// there and continue). A retail console without a debugger does not stop the title on them, so
+// we step over each one, in title code only (our mapped images), and
+// never into int 3 padding. Each site is logged once.
+// (Not by asking Windows for the module: host import tables are redirected to answer for title
+// images too.)
+std::atomic<bool (*)(const void*)> g_is_title_code{nullptr};
+
+LONG CALLBACK on_breakpoint(EXCEPTION_POINTERS* info) {
+  if (info->ExceptionRecord->ExceptionCode != EXCEPTION_BREAKPOINT) return EXCEPTION_CONTINUE_SEARCH;
+  CONTEXT* c = info->ContextRecord;
+  const auto is_title_code = g_is_title_code.load();
+  if (!is_title_code || !is_title_code(reinterpret_cast<const void*>(c->Rip))) return EXCEPTION_CONTINUE_SEARCH;
+  uint8_t code[16] = {};
+  if (read_code(reinterpret_cast<const uint8_t*>(c->Rip), code) < 2 || code[0] != 0xCC || code[1] == 0xCC) {
+    return EXCEPTION_CONTINUE_SEARCH;
+  }
+  static std::mutex lock;
+  static std::vector<uint64_t> seen;
+  {
+    std::lock_guard g(lock);
+    if (std::find(seen.begin(), seen.end(), c->Rip) == seen.end() && seen.size() < 256) {
+      seen.push_back(c->Rip);
+      logf("cpu: the title's assert at 0x%s stepped over (int 3, no debugger)", hex(c->Rip).c_str());
+    }
+  }
+  c->Rip += 1;
+  return EXCEPTION_CONTINUE_EXECUTION;
+}
+
 }  // namespace
+
+void set_title_code_test(bool (*is_title_code)(const void* address)) { g_is_title_code = is_title_code; }
 
 void install_cpu_emulation() {
   static std::once_flag once;
-  std::call_once(once, [] { AddVectoredExceptionHandler(1, &on_illegal_instruction); });
+  std::call_once(once, [] {
+    AddVectoredExceptionHandler(1, &on_illegal_instruction);
+    AddVectoredExceptionHandler(1, &on_breakpoint);
+  });
 }
 
 std::vector<EmulationHit> emulation_hits() {

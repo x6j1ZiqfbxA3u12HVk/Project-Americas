@@ -5,7 +5,8 @@
 //   XGCreateTextureComputer(description, &computer): an object answering a texture's layout.
 //
 // Both describe textures by D3D12's resource description. The computer has no IUnknown: slot 0
-// is AddRef and slot 1 Release. The game calls slot 8 with (texture memory, plane, subresource,
+// is AddRef and slot 1 Release. Slot 2 fills the texture's layout (size, planes, each mip's
+// offset, size and pitch). The game calls slot 8 with (texture memory, plane, subresource,
 // linear data, row pitch, slice pitch): the copy of linear data into the texture's layout. Its
 // other slots are probes until the game's calls show them. Every answer comes from layout.h, the
 // model GetResourceAllocationInfo uses.
@@ -37,6 +38,76 @@ void log_desc(const char* what, const D3D12_RESOURCE_DESC& d, uint32_t mode) {
        d.SampleDesc.Count, static_cast<uint32_t>(d.Layout), d.Flags, static_cast<unsigned long long>(d.Alignment), mode);
 }
 
+// What slot 2 fills: the texture, then up to 4 planes of up to 15 mips each.
+struct MipLayout {
+  uint64_t size, offset, slice_size;
+  uint32_t pitch_texels, pitch_bytes, alignment;
+  uint32_t padded[3];      // width and height in elements, depth or array size
+  uint32_t elements[2], texels[2];
+  uint32_t depth_or_array, samples, swizzle_mode;
+  uint64_t bank_rotation[2];
+  uint32_t slice_depth, in_tail, tail_position;
+};
+struct PlaneLayout {
+  uint32_t usage;  // 1 data, 7 depth, 8 stencil
+  uint64_t size, slice_size, offset, alignment;
+  uint32_t element_bytes, standard_mips, tail_mips;
+  MipLayout mips[15];
+};
+struct ResourceLayout {
+  uint64_t size, alignment;
+  uint32_t mips, planes;
+  PlaneLayout plane[4];
+  uint32_t dimension;
+};
+static_assert(sizeof(MipLayout) == 0x70 && sizeof(PlaneLayout) == 0x6c8 && sizeof(ResourceLayout) == 0x1b40);
+
+// Slot 2: GetResourceLayout(&layout). One plane (no separate stencil plane yet); every mip is
+// reported as a standard one (our layouts keep no mip tail).
+HRESULT WINAPI get_resource_layout(TextureComputer* self, ResourceLayout* out) {
+  if (!out) return E_INVALIDARG;
+  std::memset(out, 0, sizeof *out);
+  const TextureLayout& l = self->layout;
+  const D3D12_RESOURCE_DESC& d = self->desc;
+  const bool three_d = d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+  const uint32_t mips = std::min<uint32_t>(l.mips, 15), array = three_d ? 1 : std::max<uint32_t>(d.DepthOrArraySize, 1);
+  out->size = l.size;
+  out->alignment = l.alignment;
+  out->mips = l.mips;
+  out->planes = 1;
+  out->dimension = d.Dimension;
+  PlaneLayout& p = out->plane[0];
+  p.usage = (d.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) && l.mips == 1 ? 7 : 1;
+  p.size = l.size;
+  p.slice_size = l.size / array;
+  p.alignment = l.alignment;
+  p.element_bytes = l.element_bytes;
+  p.standard_mips = mips;
+  for (uint32_t i = 0; i < mips && i < l.subresources.size(); ++i) {
+    const SubresourceLayout& s = l.subresources[i];
+    MipLayout& m = p.mips[i];
+    const uint32_t pitch_elements = l.element_bytes ? s.row_pitch / l.element_bytes : 0;
+    m.offset = s.offset;
+    m.slice_size = uint64_t{s.row_pitch} * s.padded_rows * l.samples;
+    m.size = m.slice_size * (three_d ? s.depth : 1);
+    m.pitch_texels = pitch_elements * l.element_texels;
+    m.pitch_bytes = s.row_pitch;
+    m.alignment = static_cast<uint32_t>(std::min<uint64_t>(l.alignment, UINT32_MAX));
+    m.padded[0] = pitch_elements;
+    m.padded[1] = s.padded_rows;
+    m.padded[2] = three_d ? s.depth : array;
+    m.elements[0] = s.width_elements;
+    m.elements[1] = s.rows;
+    m.texels[0] = std::max<uint32_t>(static_cast<uint32_t>(d.Width >> i), 1);
+    m.texels[1] = std::max<uint32_t>(d.Height >> i, 1);
+    m.depth_or_array = three_d ? s.depth : array;
+    m.samples = l.samples;
+    m.swizzle_mode = l.swizzle_mode;
+    m.slice_depth = 1;
+  }
+  return S_OK;
+}
+
 // Slot 8: CopyIntoSubresource(texture memory, plane, subresource, linear data, row pitch,
 // slice pitch).
 HRESULT WINAPI copy_into_subresource(TextureComputer* self, void* memory, UINT plane, UINT subresource,
@@ -63,7 +134,7 @@ const Kind& computer_kind() {
                       {
                           {0, "AddRef", reinterpret_cast<void*>(&add_ref)},
                           {1, "Release", reinterpret_cast<void*>(&release)},
-                          {2, nullptr, kProbe},
+                          {2, "GetResourceLayout", reinterpret_cast<void*>(&get_resource_layout)},
                           {8, "CopyIntoSubresource", reinterpret_cast<void*>(&copy_into_subresource)},
                       });
   return k;

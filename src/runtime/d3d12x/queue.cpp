@@ -8,6 +8,7 @@
 #include <windows.h>
 #include <d3d12.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstring>
 #include <mutex>
@@ -17,6 +18,7 @@
 #include "core/text.h"
 #include "runtime/d3d12x/commands.h"
 #include "runtime/d3d12x/d3d12x.h"
+#include "runtime/d3d12x/gpu_memory.h"
 #include "runtime/d3d12x/object.h"
 #include "runtime/log.h"
 #include "runtime/memory/title_memory.h"
@@ -137,10 +139,11 @@ void WINAPI queue_execute_command_lists_x(Queue* self, UINT count, void* const* 
 
 // Slot 31: CopyPageMappingsBatchX(batch count, batches, pool, pool pages, flags). The pool is
 // memory the title mapped physical pages into; each batch maps some of them at its destination
-// address, range by range (64 KiB pages): kind 0 maps pool pages [start, start + count) in a
-// row, 1 maps pool page `start` `count` times, 2 unmaps, 3 leaves the pages as they are. The
-// game streams textures into pool pages and maps them into its tiled heaps this way.
-// Done at once (ahead of the GPU work queued before it).
+// address for the GPU, range by range (64 KiB pages): kind 0 maps pool pages [start, start +
+// count) in a row, 1 maps pool page `start` `count` times, 2 unmaps, 3 leaves the pages as they
+// are. The game streams textures into pool pages and maps them into its tiled heaps this way.
+// These are the GPU's mappings only: what the CPU sees at those addresses does not change. Done
+// at once (ahead of the GPU work queued before it).
 struct PageRange {
   uint32_t kind, start, count;
 };
@@ -156,31 +159,35 @@ HRESULT WINAPI queue_copy_page_mappings(Queue* self, UINT count, const PageBatch
   (void)flags;
   if (count && !batches) return E_INVALIDARG;
   constexpr uint64_t kPage = 64 << 10;
-  mem::TitleMemory& memory = mem::title_memory();
+  const mem::TitleMemory& memory = mem::title_memory();
   static std::atomic<int> refused{0};
+  std::vector<int64_t> pages;
   for (UINT b = 0; b < count; ++b) {
     uint64_t at = batches[b].destination;
     for (uint32_t r = 0; batches[b].ranges && r < batches[b].count; ++r) {
       const PageRange range = batches[b].ranges[r];
-      const uint64_t bytes = uint64_t{range.count} * kPage;
-      bool ok = true;
-      switch (range.kind) {
-        case 0:
-          ok = uint64_t{range.start} + range.count <= pool_pages &&
-               memory.copy_mappings(at, pool + uint64_t{range.start} * kPage, range.count, false);
-          break;
-        case 1:
-          ok = range.start < pool_pages && memory.copy_mappings(at, pool + uint64_t{range.start} * kPage, range.count, true);
-          break;
-        case 2: ok = memory.map_pages(reinterpret_cast<void*>(at), range.count, nullptr) != nullptr; break;
-        case 3: break;
-        default: ok = false; break;
+      const bool valid = range.kind == 2 || range.kind == 3 ||
+                         (range.kind == 0 && uint64_t{range.start} + range.count <= pool_pages) ||
+                         (range.kind == 1 && range.start < pool_pages);
+      if (!valid) {
+        if (refused.fetch_add(1, std::memory_order_relaxed) < 8) {
+          logf("d3d12x: page mapping (kind %u, pool page %u, %u pages) at 0x%s refused", range.kind, range.start, range.count,
+               hex(at).c_str());
+        }
+      } else if (range.kind != 3) {
+        static std::atomic<int> told{0};
+        if (told.fetch_add(1, std::memory_order_relaxed) < (GetEnvironmentVariableA("AMERICAS_TRACE_MAPS", nullptr, 0) ? 1000000 : 16)) {
+          logf("d3d12x: page mapping kind %u, pool page %u, %u pages at 0x%s", range.kind, range.start, range.count, hex(at).c_str());
+        }
+        pages.assign(range.count, -1);
+        if (range.kind == 0) memory.gpu_pages_at(pool + uint64_t{range.start} * kPage, range.count, pages.data());
+        if (range.kind == 1 && range.count) {
+          memory.gpu_pages_at(pool + uint64_t{range.start} * kPage, 1, pages.data());
+          std::fill(pages.begin(), pages.end(), pages[0]);
+        }
+        map_gpu_pages(at, pages.data(), range.count);
       }
-      if (!ok && refused.fetch_add(1, std::memory_order_relaxed) < 8) {
-        logf("d3d12x: page mapping (kind %u, pool page %u, %u pages) at 0x%s refused", range.kind, range.start, range.count,
-             hex(at).c_str());
-      }
-      at += bytes;
+      at += uint64_t{range.count} * kPage;
     }
   }
   return S_OK;

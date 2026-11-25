@@ -104,6 +104,7 @@ bool TitleProcess::load(std::string& error) {
   build_command_line();
   SetUnhandledExceptionFilter(&top_level_filter);
   install_cpu_emulation();
+  set_title_code_test([](const void* address) { return g_process && g_process->module_containing(address) != nullptr; });
   if (!tls_.discover(error)) return false;
   // Host DLLs (a host C++ runtime, say) asking which image a title address belongs to get our answer.
   if (const hle::Function* f = registry_.find_wrapper("RtlPcToFileHeader")) {

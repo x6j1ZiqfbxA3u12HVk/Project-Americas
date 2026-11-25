@@ -92,6 +92,11 @@ D3D12_SAMPLER_DESC sampler_from(const uint32_t w[4], bool& compare) {
   return d;
 }
 
+struct Bindings;
+void add_texture(Bindings* b, const D3D12_RESOURCE_DESC& resource, const D3D12_SHADER_RESOURCE_VIEW_DESC& view, uint64_t address,
+                 const uint32_t words[8], ID3D12Resource* host, const TextureLayout& layout);
+bool texture_from_descriptor(const uint32_t words[8], D3D12_RESOURCE_DESC& desc, uint64_t& address);
+
 struct Bindings {
   std::mutex lock;
   bool started = false, usable = false;
@@ -182,13 +187,37 @@ struct Bindings {
       uint32_t r[12];
       std::memcpy(r, p + 32 + size_t{k} * 48, sizeof r);
       if (r[0] == 2) add_sampler(r + 4);
-      else if (r[0] == 1 && unknown_images.fetch_add(1) < 8) {
+      else if (r[0] == 1 && add_from_descriptor(r + 4)) {
+      } else if (r[0] == 1 && unknown_images.fetch_add(1) < 8) {
         logf("gpu: a shader used a texture we did not make (T# %08x %08x %08x %08x %08x %08x %08x %08x)", r[4], r[5], r[6], r[7],
              r[8], r[9], r[10], r[11]);
       }
     }
     D3D12_RANGE none{0, 0};
     readback->Unmap(0, &none);
+  }
+
+  // A texture the title described itself (it wrote the T# into memory, no view call of ours):
+  // made from the descriptor's own fields.
+  bool add_from_descriptor(const uint32_t words[8]) {
+    for (const auto& i : images) {
+      if (std::equal(i.words, i.words + 8, words)) return true;
+    }
+    D3D12_RESOURCE_DESC desc{};
+    uint64_t address = 0;
+    TextureLayout layout;
+    if (!texture_from_descriptor(words, desc, address) || !texture_layout(desc, layout)) return false;
+    D3D12_SHADER_RESOURCE_VIEW_DESC view{};
+    view.Format = desc.Format;
+    const size_t before = images.size();
+    add_texture(this, desc, view, address, words, nullptr, layout);
+    static std::atomic<int> told{0};
+    if (images.size() > before && told.fetch_add(1, std::memory_order_relaxed) < 16) {
+      logf("gpu: texture from the title's own descriptor: %llux%u, %u mips, format %u, mode %u, at 0x%s",
+           static_cast<unsigned long long>(desc.Width), desc.Height, desc.MipLevels, desc.Format, layout.swizzle_mode,
+           hex(address).c_str());
+    }
+    return images.size() > before;
   }
 
   void upload_texture(ID3D12GraphicsCommandList* list, Texture& t) {
@@ -409,6 +438,38 @@ uint32_t image_format(uint32_t dxgi) {
   }
 }
 
+namespace {
+
+// The texture an RDNA 2 image descriptor (T#) describes: 2D, one slice, from its first mip.
+bool texture_from_descriptor(const uint32_t w[8], D3D12_RESOURCE_DESC& desc, uint64_t& address) {
+  const uint32_t type = w[3] >> 28, base_level = (w[3] >> 12) & 15, last_level = (w[3] >> 16) & 15;
+  const uint32_t image = (w[1] >> 20) & 0x1FF, mode = (w[3] >> 20) & 31, depth = w[4] & 0x1FFF;
+  if (type != 9 || base_level || depth) return false;  // 2D, whole chain, one slice: the rest later
+  address = (uint64_t{w[0]} | (uint64_t{w[1] & 0xFF} << 32)) << 8;
+  const uint32_t width = (((w[2] & 0x3FFF) << 2) | (w[1] >> 30)) + 1, height = ((w[2] >> 14) & 0xFFFF) + 1;
+  // The DXGI format with this image format; channels swapped (z y x w) means B8G8R8A8.
+  DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+  for (uint32_t f = 1; f < 120 && !format; ++f) {
+    if (image_format(f) == image) format = static_cast<DXGI_FORMAT>(f);
+  }
+  if (!format || !address || !width || !height) return false;
+  const bool swapped = (w[3] & 0xFFF) == (6u | (5u << 3) | (4u << 6) | (7u << 9));
+  if (swapped && format == DXGI_FORMAT_R8G8B8A8_UNORM) format = DXGI_FORMAT_B8G8R8A8_UNORM;
+  if (swapped && format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB) format = DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+  desc = {};
+  desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+  desc.Width = width;
+  desc.Height = height;
+  desc.DepthOrArraySize = 1;
+  desc.MipLevels = static_cast<UINT16>(last_level + 1);
+  desc.Format = format;
+  desc.SampleDesc.Count = 1;
+  desc.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(kLayoutSwizzleFlag | mode);
+  return true;
+}
+
+}  // namespace
+
 void bind_texture_view(const D3D12_RESOURCE_DESC& resource, const D3D12_SHADER_RESOURCE_VIEW_DESC& view, uint64_t address,
                        uint32_t words[8], ID3D12Resource* host) {
   std::memset(words, 0, 32);
@@ -435,6 +496,17 @@ void bind_texture_view(const D3D12_RESOURCE_DESC& resource, const D3D12_SHADER_R
   std::lock_guard g(bindings().lock);
   Bindings* b = ready();
   if (!b) return;
+  add_texture(b, resource, view, address, words, host, layout);
+}
+
+namespace {
+
+// Under the bindings' lock: the table entry for `words`, with its host texture (or `host`'s own).
+void add_texture(Bindings* b, const D3D12_RESOURCE_DESC& resource, const D3D12_SHADER_RESOURCE_VIEW_DESC& view, uint64_t address,
+                 const uint32_t words[8], ID3D12Resource* host, const TextureLayout& layout) {
+  const uint32_t format = view.Format ? view.Format : resource.Format;
+  const uint32_t mips = std::max<uint32_t>(resource.MipLevels, 1);
+  const uint32_t width = static_cast<uint32_t>(resource.Width), height = resource.Height;
   for (const auto& i : b->images) {
     if (std::equal(i.words, i.words + 8, words)) return;  // the same view again
   }
@@ -501,6 +573,8 @@ void bind_texture_view(const D3D12_RESOURCE_DESC& resource, const D3D12_SHADER_R
          hex(address).c_str(), index);
   }
 }
+
+}  // namespace
 
 void notify_title_write(uint64_t address, uint64_t size) {
   std::lock_guard g(bindings().lock);

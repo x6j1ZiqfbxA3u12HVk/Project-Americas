@@ -44,6 +44,9 @@ bool patch_clzero_loop_at(MappedImage& image, uint32_t rva);
 
 // Installs the emulating exception handler (once per process).
 void install_cpu_emulation();
+// Whether an address is in the title's own code (set by the process; breakpoints there are the
+// title's soft asserts).
+void set_title_code_test(bool (*is_title_code)(const void* address));
 
 // How often emulation ran, per instruction address (for the run report).
 struct EmulationHit {
