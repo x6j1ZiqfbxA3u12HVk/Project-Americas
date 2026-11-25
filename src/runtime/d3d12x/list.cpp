@@ -354,6 +354,13 @@ D3D12_GPU_VIRTUAL_ADDRESS set_heaps(HostList& h, ID3D12GraphicsCommandList* list
 // signature with the user data and the binding table, the dispatch, then a barrier so what it
 // wrote is seen by the work after it.
 void dispatch(HostList& h, ID3D12GraphicsCommandList* list, const Command& c) {
+  // AMERICAS_NO_COMPUTE=1: dispatches are skipped (compute passes do not write textures yet, so
+  // with them some screens lose what they showed without them).
+  static const bool no_compute = GetEnvironmentVariableA("AMERICAS_NO_COMPUTE", nullptr, 0) != 0;
+  if (no_compute) {
+    ++g_dispatches_skipped;
+    return;
+  }
   const void* rs_object = nullptr;
   ID3D12PipelineState* pso = host_compute_pipeline(h.pipeline, &rs_object);
   const RootSignatureDesc* rs = root_signature_desc(h.compute_root_signature ? h.compute_root_signature : rs_object);
@@ -951,6 +958,7 @@ void frame_present() {
          static_cast<unsigned long long>(f.frame), f.lists, f.commands, ops.c_str(),
          static_cast<unsigned long long>(g_draws_run.load()), static_cast<unsigned long long>(g_draws_skipped.load()),
          static_cast<unsigned long long>(g_dispatches_run.load()), static_cast<unsigned long long>(g_dispatches_skipped.load()));
+    logf("frame %llu: compute pipelines %s", static_cast<unsigned long long>(f.frame), compute_pipeline_counts().c_str());
     if (!f.clears.empty()) logf("frame %llu: render-target clears:%s", static_cast<unsigned long long>(f.frame), f.clears.c_str());
     if (!f.pipelines.empty()) logf("frame %llu: pipelines and draws:%s", static_cast<unsigned long long>(f.frame), f.pipelines.c_str());
   }

@@ -219,11 +219,12 @@ bool is_shader(uint32_t type) {
 // of memory).
 class PipelineMaker {
  public:
+  explicit PipelineMaker(int threads) : threads_(threads) {}
   void add(std::function<void()> job, bool front = false) {
     std::lock_guard g(lock_);
     if (!started_) {
       started_ = true;
-      for (int k = 0; k < 2; ++k) {
+      for (int k = 0; k < threads_; ++k) {
         std::thread([this] {
           SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
           for (;;) {
@@ -249,44 +250,91 @@ class PipelineMaker {
   std::condition_variable wake_;
   std::deque<std::function<void()>> jobs_;
   bool started_ = false;
+  int threads_;
 };
 
+std::atomic<uint64_t> g_compute_queued{0}, g_compute_made{0}, g_compute_missing{0}, g_compute_refused{0};
+
 PipelineMaker& pipeline_maker() {
-  static PipelineMaker* const m = new PipelineMaker;
+  static PipelineMaker* const m = new PipelineMaker(2);
   return *m;
+}
+// Programs over kLargeDxil bytes are made on a lane of their own: the driver can take minutes
+// over one (a 1.4 MB program held both workers, and every pipeline after it, for good).
+constexpr size_t kLargeDxil = 256 << 10;
+PipelineMaker& large_pipeline_maker() {
+  static PipelineMaker* const m = new PipelineMaker(1);
+  return *m;
+}
+
+// One host pipeline a program: pipelines sharing a program share it, and it is made once.
+struct MadeCompute {
+  std::once_flag once;
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> pso;
+  HRESULT hr = E_FAIL;
+};
+std::shared_ptr<MadeCompute> made_compute(const std::string& marker) {
+  static std::mutex lock;
+  static std::map<std::string, std::shared_ptr<MadeCompute>> made;
+  std::lock_guard g(lock);
+  auto& m = made[marker];
+  if (!m) m = std::make_shared<MadeCompute>();
+  return m;
 }
 
 // A compute pipeline's host pipeline: its program's precompiled translation (by marker) with the
 // translated root signature, made by the pipeline maker; dispatches wait until it is there. A
 // pipeline a dispatch waits for is queued again at the front (the job that runs second finds it
 // made and does nothing).
+void make_host_compute(PipelineState* p, present::HostGpu* gpu, bool large_lane) {
+  const std::string& marker = p->compute_marker;
+  std::vector<uint8_t> code;
+  if (!load_precompiled(marker, code)) {  // a dispatch that waits for it lists it for the precompile
+    ++g_compute_missing;
+    release(p);
+    return;
+  }
+  if (code.size() > kLargeDxil && !large_lane) {
+    large_pipeline_maker().add([p, gpu] { make_host_compute(p, gpu, true); });
+    return;
+  }
+  const std::shared_ptr<MadeCompute> m = made_compute(marker);
+  std::call_once(m->once, [&] {
+    D3D12_COMPUTE_PIPELINE_STATE_DESC host{};
+    host.pRootSignature = translated_root_signature();
+    host.CS = {code.data(), code.size()};
+    const ULONGLONG start = GetTickCount64();
+    m->hr = host.pRootSignature ? gpu->device->CreateComputePipelineState(&host, IID_PPV_ARGS(&m->pso)) : E_FAIL;
+    const ULONGLONG took = GetTickCount64() - start;
+    ++(SUCCEEDED(m->hr) ? g_compute_made : g_compute_refused);
+    static std::atomic<int> told{0};
+    if ((FAILED(m->hr) || took > 2000) && told.fetch_add(1, std::memory_order_relaxed) < 16) {
+      logf("gpu: compute pipeline for %s (%zu bytes of DXIL) %s in %llu ms (0x%08lx)", marker.c_str(), code.size(),
+           SUCCEEDED(m->hr) ? "made" : "refused", static_cast<unsigned long long>(took), static_cast<unsigned long>(m->hr));
+    }
+  });
+  if (SUCCEEDED(m->hr)) {
+    p->host = m->pso;
+    p->host_compute.store(p->host.Get(), std::memory_order_release);
+  }
+  release(p);
+}
+
+// Queues the making of a compute pipeline's host pipeline (its program's precompiled
+// translation with the translated root signature); dispatches wait until it is there. A
+// pipeline a dispatch waits for is queued again at the front (the job that runs second finds it
+// tried and does nothing).
 void queue_host_compute(PipelineState* p, bool front) {
   present::HostGpu* gpu = present::host_gpu();
   if (!gpu || p->compute_marker.empty()) return;
   add_ref(p);  // kept alive until its job is done
+  ++g_compute_queued;
   pipeline_maker().add([p, gpu] {
     if (p->compute_tried.exchange(true)) {
       release(p);
       return;
     }
-    const std::string& marker = p->compute_marker;
-    std::vector<uint8_t> code;
-    if (!load_precompiled(marker, code)) {  // listed for the precompile to do first
-      static std::atomic<int> told{0};
-      if (told.fetch_add(1, std::memory_order_relaxed) < 16) logf("gpu: compute program %s is not precompiled", marker.c_str());
-      release(p);
-      return;
-    }
-    D3D12_COMPUTE_PIPELINE_STATE_DESC host{};
-    host.pRootSignature = translated_root_signature();
-    host.CS = {code.data(), code.size()};
-    const HRESULT hr = host.pRootSignature ? gpu->device->CreateComputePipelineState(&host, IID_PPV_ARGS(&p->host)) : E_FAIL;
-    if (SUCCEEDED(hr)) p->host_compute.store(p->host.Get(), std::memory_order_release);
-    static std::atomic<int> told{0};
-    if (FAILED(hr) && told.fetch_add(1, std::memory_order_relaxed) < 8) {
-      logf("gpu: host compute pipeline for %s refused (0x%08lx)", marker.c_str(), static_cast<unsigned long>(hr));
-    }
-    release(p);
+    make_host_compute(p, gpu, false);
   }, front);
 }
 
@@ -306,6 +354,11 @@ void log_first_bytes(const char* how, const void* desc, const PipelineState* p) 
 }
 
 }  // namespace
+
+std::string compute_pipeline_counts() {
+  return std::to_string(g_compute_made.load()) + " made, " + std::to_string(g_compute_missing.load()) + " not precompiled, " +
+         std::to_string(g_compute_refused.load()) + " refused, of " + std::to_string(g_compute_queued.load()) + " queued";
+}
 
 std::string describe_pipeline(const void* object) {
   Object* o = object_of_kind(object, pipeline_kind());
