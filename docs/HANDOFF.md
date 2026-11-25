@@ -620,3 +620,46 @@ Leads, in order:
 
 The captured frames (300, 600, 900) are still black. The loading draws are the next thing to
 look at once the device survives.
+
+## To the start screen and beyond (2026-11-25, evening)
+
+**State:** the game shows its own screens. The sequence is the start screen ("Account picker /
+Screen narration / Player"), A signs in the local user, then the first-time setup (subtitles)
+and the Legal Notices screen, in the "Game Running" state. Frames are captured with
+`AMERICAS_CAPTURE` and presses scripted with `AMERICAS_PRESS="A:45,A:53,..."` (stand-in pad).
+
+What got it there, in order:
+
+* **Stencil views:** a stencil SRV of an R32G8X24 depth target must use plane 1. Plane 0
+  removed the device (0x887a0001) during loading. `host_view_desc` in `bindings.cpp` now
+  checks every host texture view (depth twins, stencil plane, shader-readable formats).
+  Lesson: the debug layer's log budget was used up by a per-frame warning, so warnings are
+  now logged 5 times per id and errors have their own budget.
+* **Pool window without the leak:** a mirror view of the pool section, opened by address
+  (`open_pool`). It leaks nothing (checked) and puts vertex and index buffers in pool pages
+  back in reach. `AMERICAS_NO_GPU_POOL_WINDOW=1` turns it off.
+* **GameInput devices** (`input/game_input.cpp`): XInput pads, a keyboard stand-in pad (keys
+  listed in the file) and the keyboard itself. Readings are kept as a per-device history;
+  device callbacks run with enumeration.
+* **XG slot 2, GetResourceLayout** (`xg.cpp`): it was a probe that left the game's layout
+  struct as stack garbage. Video planes pointed anywhere, and Bink2Scarlett crashed writing
+  to them in about half the runs after the start screen. The struct is 0x1b40 bytes: 4
+  planes of 15 mips; offsets in `xg.cpp`.
+* **Queue slot 31 maps pages for the GPU only** (`map_gpu_pages`). CPU views stay as they
+  are.
+* **Title soft asserts** (`int 3` then the code that carries on, e.g. game+0x4ffd879) are
+  stepped over in title code, as on a retail console without a debugger.
+* **T# misses** (descriptors the title wrote itself) become textures from the descriptor's
+  own fields.
+* **Compute dispatches run on the host** (`list.cpp` `dispatch`, `host_compute_pipeline`),
+  once their programs are precompiled. Rerun `am-shaders precompile` after new runs: it picks
+  up the compute shaders the game hands over (`cache\shaders\runtime\*.dxbc`).
+
+**Open, next:**
+1. **Text misses its x-height letters** (o r e s a n c m u w; letters with ascenders and
+   descenders draw). Look at the font atlas texture(s): their upload, detiling (swizzle mode
+   5, 4 KB S, is uploaded linearly now), or a compute pass that fills them (dispatches were
+   not run before this commit).
+2. **GFX10 detiling** of textures from title memory (all uploads are linear now).
+3. XG slot 10 (64 KiB tiling) is still a probe.
+4. Audio is silent (no XMA, Opus or DSP decoding).
