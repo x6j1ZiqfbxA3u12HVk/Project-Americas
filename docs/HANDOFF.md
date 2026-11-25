@@ -557,3 +557,49 @@ After that, from the plan:
 * Depth export (exp target 8).
 * The missing CS ops.
 * Record pypdf (tools/pylib) in PLAN.md "Local tools".
+
+## Past the boot screen (2026-11-25, afternoon)
+
+The boot stall is solved. The game now leaves "System Init" for "Game Init", sets up audio,
+loads its texture databases (`data\ttdb\*.ttpf`) and draws its first loading frames: a
+dispatch and 18 indexed draws a frame, through a new slot 67 pipeline.
+
+* **The cause: ReadFile was never wrapped.** `hle/xmem.cpp` has wrappers that commit the
+  title's pages before the kernel writes them, but `loader/import_policy.cpp` did not list
+  ReadFile, ReadFileEx, WriteFile or WriteFileEx. A read into a page that is committed on
+  first touch failed inside the kernel, and the game retried it forever (game+0x314259:
+  Sleep(1) on any error but 6, 38 and 87). The earlier "no ReadFile failures logged" lead was
+  wrong for the same reason: the logger was never bound. **Lesson: `am-inspect` shows each
+  import's route; check it shows `wrap` before trusting a wrapper's silence.**
+* **Command list slots 70-75** (`commands.h`): depth bounds; bottom-of-pipe memory value writes
+  (71: 32 bits, 72: 64 bits; address, value, flush, flags; flags 1/2 write the GPU/system
+  timestamp, QPC here); memory value waits (73/74: address, comparison, reference). Writes
+  land in order from a thread of ours after the host fence that follows their lists. Waits
+  hold the submission for up to 2 s. Slots 75, 126, 131, 132 and 142 are taken quietly.
+* **Audio** (`hle/audio.cpp`, `hle/audio_streams.cpp`):
+  * AcpHal: the APU heap (32-bit device addresses), the SHAPE contexts (350 XMA), and the
+    coprocessor (commands acknowledged at once).
+  * xapu (Opus) and chad (DSP): streams and results, with silent output.
+  * Still missing: the XMA decoder, an Opus decoder and the DSP transforms.
+* **Device slot 81**, GetFrameStatisticsX: count 0.
+* **Two GPU use-after-free bugs fixed** (each showed as a driver timeout and the AMD bug
+  report box). Bindings uploads and page-table uploads are now freed only after the fence of
+  the list that copies from them (per list: another list may be submitted first).
+* **`AMERICAS_D3D12_DRED=1`** logs DRED breadcrumbs (draws marked with their pipeline) and
+  page faults with allocation names when the device is lost.
+
+**Open: the device is lost about 40 s into loading** (frame ~1200-3000), reason 0x887a0001
+(invalid call). There is no debug-layer error and no page fault. It comes right after the
+game's `XMemVirtualAlloc(3.4 GiB, type 0x20402000, flags 0x23)` at 0xfd8a00000.
+
+Leads, in order:
+1. Queue slot 31, the page mapping batch (`(count?, ranges, ...)`, called from
+   game+0xf2cc86), is not implemented. The game maps physical pages into that 3.4 GiB
+   reservation through it.
+2. Memory under an opened GPU window may be changed (decommitted, remapped, re-protected)
+   while the GPU maps it.
+3. The opened physical pool (`OpenExistingHeapFromFileMapping`) may conflict with new views
+   of the section.
+
+The captured frames (300, 600, 900) are still black. The loading draws are the next thing to
+look at once the device survives.
