@@ -726,3 +726,27 @@ Then the larger pieces before the 3D world shows:
 * Slot 19 writes real descriptors.
 * The precompile does `wanted-first.txt` first and keeps `cpipe-index.tsv`. A pass now
   starts in seconds.
+
+## Streaming works; compute correctness is next (2026-11-26, after midnight)
+
+* **BCPack** (`formats/bcpack.*`): our decoder (rANS lanes, references and residuals,
+  BC1/3/4/5/7; BC6H refused). Its constant tables (78 KB, not ours, licence unclear) stay
+  **outside the repository**: `C:\Project Americas\tools\bcpack\tables.bin`
+  (`AMERICAS_BCPACK_TABLES` overrides). They cannot be derived from the game's files. The
+  user chose to load them from outside the repo.
+* **zlib** streams longer than their destination keep what fits, as the hardware does.
+* A run past Confirm now streams **24,815 requests, 1.33 GB, 0 failures**. The game then
+  sits in its loading phase. Each frame it runs about a dozen slot 67 compute passes, then a
+  few UI draws, and the screen stays dark.
+* **Compute is off by default** (`AMERICAS_COMPUTE=1` turns it on). The dispatches run, but
+  their results are wrong: with them the menus go blank. **Next: make translated compute
+  correct.** The plan:
+  1. Capture one dispatch's inputs: user data, the memory it reads, its descriptors.
+  2. Run the program on a reference. The translator's tests already check programs on the
+     host GPU against the ISA (`tests/translate_tests.cpp`, `gpu_runner`).
+  3. Compare the outputs, starting with the loading-phase programs in the frame log, e.g.
+     the slot 67 blocks `3099c2719d231d0b` and `79f03f52e321819a`.
+* Keys for driving the menus yourself: Enter = A, Escape = B, arrows = d-pad. The title bar
+  lists the rest. The user drives faster than `AMERICAS_PRESS`.
+* The background precompile was restarted. `wanted-first.txt` holds what the game waited
+  for.
