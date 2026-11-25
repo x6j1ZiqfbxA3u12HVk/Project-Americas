@@ -121,9 +121,9 @@ void count_frame(bool shown) {
   ++total;
   const double seconds = static_cast<double>(now.QuadPart - since.QuadPart) / static_cast<double>(frequency.QuadPart);
   if (seconds < 1.0) return;
-  wchar_t text[160];
-  std::swprintf(text, 160, L"%.0f fps, frame %llu%s", frames / seconds, static_cast<unsigned long long>(total),
-                shown ? L" (draws wait for their shaders)" : L" (not shown: see run.log)");
+  wchar_t text[256];
+  std::swprintf(text, 256, L"%.0f fps, frame %llu%s   |   A Enter, B Esc, Menu Tab, d-pad arrows, sticks WASD / IJKL",
+                frames / seconds, static_cast<unsigned long long>(total), shown ? L"" : L" (not shown: see run.log)");
   present::set_window_status(text);
   frames = 0;
   since = now;

@@ -35,6 +35,10 @@ extern "C" __declspec(allocate(".CRT$XLB")) const PIMAGE_TLS_CALLBACK am_tls_cal
 
 int wmain(int argc, wchar_t** argv) {
   g_title_tls[0] = 0;  // keeps the carrier in the image
+  // Started on its own (the console is ours alone, not a terminal's): the log console is
+  // minimized so it does not cover the game's window. run.log has the same text.
+  DWORD console_processes[2];
+  if (GetConsoleWindow() && GetConsoleProcessList(console_processes, 2) == 1) ShowWindow(GetConsoleWindow(), SW_MINIMIZE);
   // First, before any DLL of ours loads: hold the range title executables are mapped at.
   void* window = VirtualAlloc(reinterpret_cast<void*>(am::rt::kImageWindow), am::rt::kImageWindowSize, MEM_RESERVE,
                               PAGE_NOACCESS);
