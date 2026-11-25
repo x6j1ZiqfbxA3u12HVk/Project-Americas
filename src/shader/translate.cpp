@@ -513,6 +513,44 @@ bool image(Ctx& c, const ImgOp& op) {
   return true;
 }
 
+// D16 typed buffer access (the format from the V# or the instruction): `hi` uses the upper half.
+bool buffer_d16(Ctx& c, int n, bool store, bool tbuffer, bool hi) {
+  if (!buffer_address(c)) return false;
+  const uint32_t vd = c.f(Field::VDATA);
+  c.touch_v(vd + (n - 1) / 2);
+  const std::string fmt = tbuffer ? num(c.f(Field::FORMAT)) + "u" : "((rs.w >> 12) & 0x7Fu)";
+  c.line("  uint info = am_fmt_info(" + fmt + "); bool ints = (info & 7u) == 4u || (info & 7u) == 5u;");
+  const auto half_of = [&](int k) {
+    const std::string v = "v[" + num(vd + k / 2) + "]";
+    return "((" + v + " >> " + (k % 2 || hi ? "16u" : "0u") + ") & 0xFFFFu)";
+  };
+  if (store) {
+    std::string val = "uint4(";
+    for (int k = 0; k < 4; ++k) {
+      const std::string h = k < n ? half_of(k) : std::string("0u");
+      val += (k ? ", " : "") + (k < n ? "(ints ? (((info & 7u) == 5u) ? asuint(int(" + h + " << 16) >> 16) : " + h +
+                                         ") : asuint(f16tof32(" + h + ")))"
+                                       : std::string("0u"));
+    }
+    c.line("  am_fmt_store(p, lim, info, " + num(n) + "u, " + val + "));");
+  } else {
+    c.line("  uint4 r = am_fmt_load(p, lim, info, rs.w);");
+    c.line("  uint4 h = ints ? (r & 0xFFFFu) : f32tof16(asfloat(r));");
+    if (n == 1) {
+      const std::string v = "v[" + num(vd) + "]";
+      c.line("  " + v + " = " + (hi ? "(" + v + " & 0xFFFFu) | (h.x << 16);" : "(" + v + " & 0xFFFF0000u) | h.x;"));
+    } else {
+      static const char* const kc = "xyzw";
+      for (int k = 0; k < n; k += 2) {
+        c.line("  v[" + num(vd + k / 2) + "] = h." + std::string(1, kc[k]) +
+               (k + 1 < n ? " | (h." + std::string(1, kc[k + 1]) + " << 16)" : std::string(" | (v[" + num(vd + k / 2) + "] & 0xFFFF0000u)")) + ";");
+      }
+    }
+  }
+  c.line("}");
+  return true;
+}
+
 // ---- the instruction table ----
 
 using Handler = std::function<bool(Ctx&)>;
@@ -683,6 +721,10 @@ const std::unordered_map<std::string, Handler>& table() {
     int_op(t, "v_mul_hi_u32", "uint((uint64_t(A) * uint64_t(B)) >> 32)");
     int_op(t, "v_mul_u32_u24", "((A & 0xFFFFFFu) * (B & 0xFFFFFFu))");
     int_op(t, "v_mad_u32_u24", "((A & 0xFFFFFFu) * (B & 0xFFFFFFu) + C)");
+    int_op(t, "v_mul_i32_i24", "asuint((asint(A << 8) >> 8) * (asint(B << 8) >> 8))");
+    int_op(t, "v_mul_hi_i32_i24", "uint(uint64_t(int64_t(asint(A << 8) >> 8) * int64_t(asint(B << 8) >> 8)) >> 32)");
+    int_op(t, "v_mul_hi_u32_u24", "uint((uint64_t(A & 0xFFFFFFu) * uint64_t(B & 0xFFFFFFu)) >> 32)");
+    int_op(t, "v_mad_i32_i24", "asuint((asint(A << 8) >> 8) * (asint(B << 8) >> 8) + asint(C))");
     int_op(t, "v_bfe_u32", "am_bfe_u32(A, B, C)");
     int_op(t, "v_bfe_i32", "am_bfe_i32(A, B, C)");
     int_op(t, "v_bfi_b32", "((A & B) | (~A & C))");
@@ -1132,6 +1174,10 @@ const std::unordered_map<std::string, Handler>& table() {
             return true;
           };
         }
+        for (const bool tbuffer : {false, true}) {
+          const std::string name = std::string(tbuffer ? "tbuffer_" : "buffer_") + (store ? "store" : "load") + "_format_d16_" + kChannels[n - 1];
+          t[name] = [n, store, tbuffer](Ctx& c) { return buffer_d16(c, n, store, tbuffer, false); };
+        }
         t[(store ? "buffer_store_dword" : "buffer_load_dword") + sfx] = [n, store](Ctx& c) {
           if (!buffer_address(c)) return false;
           const uint32_t vd = c.f(Field::VDATA);
@@ -1239,6 +1285,8 @@ const std::unordered_map<std::string, Handler>& table() {
         t[std::string("image_atomic_") + kAtomics[k]] = [o](Ctx& c) { return image(c, o); };
       }
     }
+    t["buffer_load_format_d16_hi_x"] = [](Ctx& c) { return buffer_d16(c, 1, false, false, true); };
+    t["buffer_store_format_d16_hi_x"] = [](Ctx& c) { return buffer_d16(c, 1, true, false, true); };
     // -- LDS --
     t["ds_read_b32"] = [](Ctx& c) {
       c.uses_lds = true;

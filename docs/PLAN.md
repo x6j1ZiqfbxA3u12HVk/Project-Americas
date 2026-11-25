@@ -897,8 +897,12 @@ builder's `XMemVirtualQuery` calls, and the arguments logged at run time.
   * **with images 2,070 (77 %)**. DXC compiles every one sampled (48 of 48 below 400 KiB of
     HLSL; the tests' programs too).
   * with LDS atomics, the `st64` pairs and `ds_swizzle_b32`: **2,368 (88 %)**.
-  * What still blocks compute: D16 buffer forms, 16-bit and packed ALU ops (`v_mul_i32_i24`,
-    `v_lshrrev_b16`, `v_pk_*_f16`), signed LDS min/max, ray tracing (`image_bvh*`, 56).
+  * with D16 typed buffers and the 24-bit multiplies: **2,387 (89 %)**.
+  * What still blocks compute: the 16-bit and packed ALU ops (`v_lshrrev_b16` 63,
+    `v_pk_mul_f16` 39, `v_pk_add_f16`, `v_pk_fma_f16`, `v_add_f16`), signed LDS min/max, ray
+    tracing (`image_bvh*`, 56). Open question for the 16-bit ops: on this GPU, does a 16-bit
+    result keep or clear the register's upper half? Settle it (AMD's ISA text, LLVM's
+    lowering) before translating them.
 * **Structured control flow** (translator 2). The blocks' CFG becomes nested loops, blocks
   and `if`s, after Ramsey's "Beyond Relooper":
   * reverse postorder, dominators (Cooper, Harvey and Kennedy), back edges, merge points;

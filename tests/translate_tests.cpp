@@ -805,3 +805,36 @@ TEST_CASE(translate_lds_atomics_st64_and_swizzle) {
   CHECK(ok);
   CHECK(seen == ~0ull);  // each lane got a different value before its add
 }
+
+TEST_CASE(translate_d16_buffers_and_24_bit_multiplies) {
+  const uint64_t base = 0x500000000ull;
+  std::vector<uint32_t> memory(256, 0);
+  const uint64_t buf = base + 0x100;
+  memory[0] = static_cast<uint32_t>(buf);
+  memory[1] = static_cast<uint32_t>(buf >> 32) & 0xFFFF;
+  memory[2] = 256;
+  memory[3] = (4 | 5 << 3 | 6 << 6 | 7 << 9) | 56u << 12;  // 8_8_8_8_UNORM
+  for (int l = 0; l < 64; ++l) memory[0x40 + l] = 0xFF0000FFu;  // (1, 0, 0, 1)
+  const Result r = run(
+      {
+          0xF4080100, 0xFA000000,  // s_load_dwordx4 s[4:7], s[0:1], 0x0
+          0xBF8CC07F,              // s_waitcnt lgkmcnt(0)
+          0x34020082,              // v_lshlrev_b32 v1, 2, v0
+          0xE20C1000, 0x80010201,  // buffer_load_format_d16_xyzw v[2:3], v1, s[4:7], 0 offen
+          0x7E0802FF, 0xABCD0000,  // v_mov_b32 v4, 0xabcd0000
+          0xE2001000, 0x80010401,  // buffer_load_format_d16_x v4, v1, s[4:7], 0 offen   (the high half stays)
+          0xBF8C3F70,              // s_waitcnt vmcnt(0)
+          0x120A00C3,              // v_mul_i32_i24 v5, -3, v0
+          0x140C00FF, 0x00800000,  // v_mul_hi_i32_i24 v6, 0x800000, v0      (-2^23 x lane)
+          0xBF810000,              // s_endpgm
+      },
+      {static_cast<uint32_t>(base), static_cast<uint32_t>(base >> 32)}, memory, base);
+  if (!r.ran) return;
+  bool ok = true;
+  for (uint32_t l = 0; l < 64 && ok; ++l) {
+    ok = r.v(l, 2) == 0x00003C00u && r.v(l, 3) == 0x3C000000u && r.v(l, 4) == 0xABCD3C00u &&
+         r.v(l, 5) == static_cast<uint32_t>(-3 * static_cast<int>(l)) && r.v(l, 6) == (l ? 0xFFFFFFFFu : 0u);
+    if (!ok) std::printf("    lane %u: %08x %08x %08x %08x %08x\n", l, r.v(l, 2), r.v(l, 3), r.v(l, 4), r.v(l, 5), r.v(l, 6));
+  }
+  CHECK(ok);
+}
