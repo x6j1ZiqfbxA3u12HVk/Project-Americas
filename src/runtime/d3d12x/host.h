@@ -44,4 +44,8 @@ ID3D12PipelineState* make_host_graphics_pipeline(D3D12_GRAPHICS_PIPELINE_STATE_D
 ID3D12PipelineState* host_pipeline(const void* console_pipeline, const void** root_signature, const DXGI_FORMAT* targets,
                                    uint32_t target_count, DXGI_FORMAT depth, bool rect_list);
 
+// A console compute pipeline's host pipeline (nullptr when it is not a compute pipeline or its
+// program is not precompiled) and its console root signature object.
+ID3D12PipelineState* host_compute_pipeline(const void* console_pipeline, const void** root_signature);
+
 }  // namespace am::rt::d3d12x

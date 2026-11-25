@@ -30,10 +30,12 @@
 
 #include "runtime/d3d12x/d3d12x.h"
 #include "host/dxc_compile.h"
+#include "runtime/d3d12x/gpu_memory.h"
 #include "runtime/d3d12x/host.h"
 #include "shader/container.h"
 #include "runtime/d3d12x/object.h"
 #include "runtime/log.h"
+#include "runtime/present/host_gpu.h"
 #include "runtime/process.h"
 
 namespace am::rt::d3d12x {
@@ -65,6 +67,7 @@ struct PipelineState : Object {
   std::vector<Shader> shaders;
   uint64_t extra[2] = {};
   Microsoft::WRL::ComPtr<ID3D12PipelineState> host;  // when its shaders are precompiled
+  bool compute = false;
   uint32_t console_programs = 0;  // slot 57: GPU programs given by address
   std::string console_name;       // slot 57: the saved blocks' file, and the programs' markers
   std::unique_ptr<ConsolePipeline> console;
@@ -237,6 +240,15 @@ ID3D12PipelineState* host_pipeline(const void* object, const void** root_signatu
   return p->console ? console_host_pipeline(*p->console, targets, target_count, depth, rect_list) : nullptr;
 }
 
+ID3D12PipelineState* host_compute_pipeline(const void* object, const void** root_signature) {
+  Object* o = object_of_kind(object, pipeline_kind());
+  if (!o) return nullptr;
+  auto* p = static_cast<PipelineState*>(o);
+  if (!p->compute) return nullptr;
+  if (root_signature) *root_signature = p->root_signature;
+  return p->host.Get();
+}
+
 HRESULT create_compute_pipeline(const D3D12_COMPUTE_PIPELINE_STATE_DESC* desc, uint64_t extra0, uint64_t extra1,
                                 const GUID* /*riid*/, void** out) {
   if (!out) return E_POINTER;
@@ -246,6 +258,24 @@ HRESULT create_compute_pipeline(const D3D12_COMPUTE_PIPELINE_STATE_DESC* desc, u
   add_shader(p, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS, desc->CS);
   p->extra[0] = extra0;
   p->extra[1] = extra1;
+  p->compute = true;
+  // Its host pipeline: the program's precompiled translation with the translated root signature.
+  std::vector<uint8_t> code;
+  const std::string marker = program_marker(p->shaders[0].bytecode, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS);
+  present::HostGpu* gpu = present::host_gpu();
+  if (gpu && !marker.empty() && load_precompiled(marker, code)) {
+    D3D12_COMPUTE_PIPELINE_STATE_DESC host{};
+    host.pRootSignature = translated_root_signature();
+    host.CS = {code.data(), code.size()};
+    const HRESULT hr = host.pRootSignature ? gpu->device->CreateComputePipelineState(&host, IID_PPV_ARGS(&p->host)) : E_FAIL;
+    static std::atomic<int> told{0};
+    if (FAILED(hr) && told.fetch_add(1, std::memory_order_relaxed) < 8) {
+      logf("gpu: host compute pipeline for %s refused (0x%08lx)", marker.c_str(), static_cast<unsigned long>(hr));
+    }
+  } else {
+    static std::atomic<int> told{0};
+    if (told.fetch_add(1, std::memory_order_relaxed) < 16) logf("gpu: compute program %s is not precompiled", marker.c_str());
+  }
   static std::atomic<int> logged{0};
   if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
     const Shader& cs = p->shaders[0];

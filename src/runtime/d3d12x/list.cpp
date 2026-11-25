@@ -82,6 +82,12 @@ struct HostList {
   uint64_t args[kParams] = {};
   std::vector<uint32_t> constants[kParams];
   bool bound = false;  // the translated root signature and heap are set in the host list
+  bool heaps_set = false;  // the shader and sampler heaps, the page table and bindings flushed
+  bool compute_bound = false;  // the translated compute root signature and table are set
+  // Compute state, kept apart from graphics as D3D12 does.
+  const void* compute_root_signature = nullptr;
+  uint64_t compute_args[kParams] = {};
+  std::vector<uint32_t> compute_constants[kParams];
   bool flushed = false;  // it holds the image bindings' upkeep (and their misses' readback)
   DXGI_FORMAT targets[8] = {};  // the bound render targets' view formats
   uint32_t target_count = 0;
@@ -190,6 +196,8 @@ ID3D12GraphicsCommandList* host_begin(CommandList* l) {
   h.ready = false;
   h.states.clear();
   h.bound = false;
+  h.heaps_set = false;
+  h.compute_bound = false;
   h.flushed = false;
   h.has_viewport = h.has_scissor = h.has_topology = false;
   return h.list.Get();
@@ -288,16 +296,90 @@ bool track(HostList& h, const Recording& r, const Command& c) {
         std::memcpy(v.data() + at, r.data.data() + c.data_at, n * 4);
       }
       return true;
+    case kSetComputeRootSignature:
+      h.compute_root_signature = reinterpret_cast<const void*>(c.a[0]);
+      for (auto& v : h.compute_constants) v.clear();
+      std::fill(std::begin(h.compute_args), std::end(h.compute_args), 0);
+      return true;
+    case kSetComputeRootDescriptorTable:
+    case kSetComputeRootCbv:
+    case kSetComputeRootSrv:
+    case kSetComputeRootUav:
+      if (index < HostList::kParams) h.compute_args[index] = c.a[1];
+      return true;
+    case kSetComputeRoot32BitConstant:
+      if (index < HostList::kParams) {
+        auto& v = h.compute_constants[index];
+        const size_t at = static_cast<size_t>(c.a[2] & 0xFFFF);
+        if (v.size() <= at) v.resize(at + 1, 0);
+        v[at] = static_cast<uint32_t>(c.a[1]);
+      }
+      return true;
+    case kSetComputeRoot32BitConstants:
+      if (index < HostList::kParams && c.data_size) {
+        auto& v = h.compute_constants[index];
+        const size_t n = c.data_size / 4, at = static_cast<size_t>(c.a[3] & 0xFFFF);
+        if (v.size() < at + n) v.resize(at + n, 0);
+        std::memcpy(v.data() + at, r.data.data() + c.data_at, n * 4);
+      }
+      return true;
     default: return false;
   }
 }
 
-std::atomic<uint64_t> g_draws_run{0}, g_draws_skipped{0};
+std::atomic<uint64_t> g_draws_run{0}, g_draws_skipped{0}, g_dispatches_run{0}, g_dispatches_skipped{0};
 constexpr uint64_t kRectListTopology = 17;
 
 void note_unreachable_buffer() {
   static std::atomic<int> logged{0};
   if (logged.fetch_add(1, std::memory_order_relaxed) < 8) logf("gpu: a vertex or index buffer outside GPU-reachable title memory (bound null)");
+}
+
+// Once a list: the page table's and the bindings' upkeep, then the shader and sampler heaps.
+// Returns the binding table's address (0: none, so nothing can run).
+D3D12_GPU_VIRTUAL_ADDRESS set_heaps(HostList& h, ID3D12GraphicsCommandList* list) {
+  if (!h.heaps_set) {
+    flush_page_table(list);
+    flush_bindings(list);  // builds the table first: it is never bound null
+    h.flushed = true;
+    ID3D12DescriptorHeap* heaps[] = {translated_shader_heap(), sampler_heap()};
+    if (!heaps[0] || !heaps[1]) return 0;
+    list->SetDescriptorHeaps(2, heaps);
+    h.heaps_set = true;
+  }
+  return bindings_table();
+}
+
+// A dispatch, when its compute pipeline has a host pipeline: the translated compute root
+// signature with the user data and the binding table, the dispatch, then a barrier so what it
+// wrote is seen by the work after it.
+void dispatch(HostList& h, ID3D12GraphicsCommandList* list, const Command& c) {
+  const void* rs_object = nullptr;
+  ID3D12PipelineState* pso = host_compute_pipeline(h.pipeline, &rs_object);
+  const RootSignatureDesc* rs = root_signature_desc(h.compute_root_signature ? h.compute_root_signature : rs_object);
+  if (!pso || !rs) {
+    ++g_dispatches_skipped;
+    return;
+  }
+  const D3D12_GPU_VIRTUAL_ADDRESS table = set_heaps(h, list);
+  if (!table) {
+    ++g_dispatches_skipped;
+    return;
+  }
+  if (!h.compute_bound) {
+    list->SetComputeRootSignature(translated_root_signature());
+    list->SetComputeRootUnorderedAccessView(1, table);
+    h.compute_bound = true;
+  }
+  uint32_t cs[kUserDataConstants] = {};
+  user_data_sgprs(*rs, D3D12_SHADER_VISIBILITY_ALL, h.compute_args, h.compute_constants, cs, kUserDataConstants);
+  list->SetPipelineState(pso);
+  list->SetComputeRoot32BitConstants(0, kUserDataConstants, cs, 0);
+  list->Dispatch(static_cast<UINT>(c.a[0]), static_cast<UINT>(c.a[1]), static_cast<UINT>(c.a[2]));
+  D3D12_RESOURCE_BARRIER b{};
+  b.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+  list->ResourceBarrier(1, &b);
+  ++g_dispatches_run;
 }
 
 // A draw, when its pipeline has a host pipeline: the translated root signature and heaps, the
@@ -311,16 +393,11 @@ void draw(HostList& h, ID3D12GraphicsCommandList* list, const Command& c) {
     return;
   }
   if (!h.bound) {
-    flush_page_table(list);
-    flush_bindings(list);  // builds the table first: it is never bound null
-    h.flushed = true;
-    const D3D12_GPU_VIRTUAL_ADDRESS table = bindings_table();
-    ID3D12DescriptorHeap* heaps[] = {translated_shader_heap(), sampler_heap()};
-    if (!table || !heaps[0] || !heaps[1]) {
+    const D3D12_GPU_VIRTUAL_ADDRESS table = set_heaps(h, list);
+    if (!table) {
       ++g_draws_skipped;
       return;
     }
-    list->SetDescriptorHeaps(2, heaps);
     list->SetGraphicsRootSignature(translated_graphics_root_signature());
     list->SetGraphicsRootUnorderedAccessView(2, table);
     h.bound = true;
@@ -351,6 +428,7 @@ void forward(CommandList* l, const Command& c) {
   switch (c.op) {
     case kDrawInstanced:
     case kDrawIndexedInstanced:
+    case kDispatch:
     case kClearRenderTargetView:
     case kClearDepthStencilView:
     case kSetRenderTargets:
@@ -361,7 +439,7 @@ void forward(CommandList* l, const Command& c) {
     case kSetStencilRef:
     case kSetVertexBuffers:
     case kSetIndexBuffer: break;
-    default: return;  // dispatches and the other bindings wait for pipelines and the binding model
+    default: return;  // the rest (copies, queries, ...) is not run on the host yet
   }
   ID3D12GraphicsCommandList* list = host_begin(l);
   if (!list) return;
@@ -458,6 +536,7 @@ void forward(CommandList* l, const Command& c) {
     case kSetStencilRef: list->OMSetStencilRef(static_cast<UINT>(c.a[0])); return;
     case kDrawInstanced:
     case kDrawIndexedInstanced: draw(h, list, c); return;
+    case kDispatch: dispatch(h, list, c); return;
     // Vertex and index buffers in place: title memory at its host GPU address (null when the
     // memory cannot be reached that way yet).
     case kSetVertexBuffers: {
@@ -862,9 +941,11 @@ void frame_present() {
       ops += (ops.empty() ? "" : ", ") + (name ? std::string(name) : "slot " + std::to_string(op)) + " " +
              std::to_string(f.counts[op]);
     }
-    logf("frame %llu: %u lists, %u commands: %s; draws so far on the GPU %llu, waiting for shaders %llu",
+    logf("frame %llu: %u lists, %u commands: %s; draws so far on the GPU %llu, waiting for shaders %llu; dispatches %llu, "
+         "waiting %llu",
          static_cast<unsigned long long>(f.frame), f.lists, f.commands, ops.c_str(),
-         static_cast<unsigned long long>(g_draws_run.load()), static_cast<unsigned long long>(g_draws_skipped.load()));
+         static_cast<unsigned long long>(g_draws_run.load()), static_cast<unsigned long long>(g_draws_skipped.load()),
+         static_cast<unsigned long long>(g_dispatches_run.load()), static_cast<unsigned long long>(g_dispatches_skipped.load()));
     if (!f.clears.empty()) logf("frame %llu: render-target clears:%s", static_cast<unsigned long long>(f.frame), f.clears.c_str());
     if (!f.pipelines.empty()) logf("frame %llu: pipelines and draws:%s", static_cast<unsigned long long>(f.frame), f.pipelines.c_str());
   }
