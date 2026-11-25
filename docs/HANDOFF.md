@@ -663,3 +663,18 @@ What got it there, in order:
 2. **GFX10 detiling** of textures from title memory (all uploads are linear now).
 3. XG slot 10 (64 KiB tiling) is still a probe.
 4. Audio is silent (no XMA, Opus or DSP decoding).
+
+**Shaders after the evening's runs** (`am-shaders precompile`, translator 4): 5,163 compiled,
+about 4,600 refused. **The precompile does not retry programs listed in
+`rt4\failures.tsv`**: move the file aside after a translator fix. Refusals by first missing
+instruction:
+* `v_interp_p1ll_f16`: 3,428 pixel shaders. These are 16-bit attributes, two to a 32-bit
+  slot (SRC0 = {attr_word, attr_chan, attr}). The vertex side's packed exports must reach
+  the host as two values for this to be right.
+* `exp` to target 8 (depth export): 888.
+* `image_get_lod` 142, `image_sample(_b)` with A16 addresses 88.
+* Compute: `ds_bpermute_b32` (non-uniform lane reads) and `v_mad_u64_u32` (VOP3B, with a
+  carry out) are the ones left. `global_atomic_fmin/fmax` (a CAS loop), `ds_write_b64`,
+  `v_lshrrev_b64`, `v_bfm_b32` and the sub-dword buffer loads were added this evening.
+* The game's compute dispatches wait until their programs compile (frame log: "dispatches N,
+  waiting M").
