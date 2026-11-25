@@ -791,6 +791,9 @@ const std::unordered_map<std::string, Handler>& table() {
     float16(t, "v_mul_f16", "(A * B)");
     float16(t, "v_max_f16", "max(A, B)");
     float16(t, "v_min_f16", "min(A, B)");
+    float16(t, "v_min3_f16", "min(A, min(B, C))");
+    float16(t, "v_max3_f16", "max(A, max(B, C))");
+    float16(t, "v_med3_f16", "max(min(A, B), min(max(A, B), C))");
     float16(t, "v_fma_f16", "mad(A, B, C)");
     float16(t, "v_rcp_f16", "rcp(A)");
     float16(t, "v_sqrt_f16", "sqrt(A)");
@@ -1022,6 +1025,9 @@ const std::unordered_map<std::string, Handler>& table() {
       compare(t, std::string(x.name) + "_u32", x.cond, false);
       compare(t, std::string(x.name) + "_i32", fill(x.cond, "asint(A)", "asint(B)"), false);
       compare(t, std::string(x.name) + "_u64", x.cond, false, true);
+      // 16-bit integer compares: the low halves (op_sel's high halves are not read yet).
+      compare(t, std::string(x.name) + "_u16", fill(x.cond, "(A & 0xFFFFu)", "(B & 0xFFFFu)"), false);
+      compare(t, std::string(x.name) + "_i16", fill(x.cond, "(asint(A << 16) >> 16)", "(asint(B << 16) >> 16)"), false);
     }
     compare(t, "class_f32", "am_class(A, asuint(B))", false);
 
@@ -1525,6 +1531,15 @@ const std::unordered_map<std::string, Handler>& table() {
       c.uses_lds = true;
       c.touch_v(c.f(Field::ADDR));
       c.vwrite(c.f(Field::VDST), "am_lds[(v[" + num(c.f(Field::ADDR)) + "] + " + num(c.f(Field::OFFSET0) | c.f(Field::OFFSET1) << 8) + "u) >> 2]");
+      return true;
+    };
+    t["ds_read_b64"] = [](Ctx& c) {
+      c.uses_lds = true;
+      const uint32_t a = c.f(Field::ADDR), d = c.f(Field::VDST);
+      c.touch_v(a);
+      c.touch_v(d + 1);
+      c.line("if (AM_ACT) { uint b = (v[" + num(a) + "] + " + num(c.f(Field::OFFSET0) | c.f(Field::OFFSET1) << 8) +
+             "u) >> 2; v[" + num(d) + "] = am_lds[b]; v[" + num(d + 1) + "] = am_lds[b + 1u]; }");
       return true;
     };
     t["ds_write_b32"] = [](Ctx& c) {
