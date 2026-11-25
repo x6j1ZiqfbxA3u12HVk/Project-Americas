@@ -122,10 +122,17 @@ void HostGpu::wait(uint64_t value) {
 
 namespace {
 
-// AMERICAS_D3D12_DEBUG: D3D12's debug layer, its warnings and errors in our log (the first 200).
+// AMERICAS_D3D12_DEBUG: D3D12's debug layer, its warnings and errors in our log.
 void CALLBACK on_debug_message(D3D12_MESSAGE_CATEGORY, D3D12_MESSAGE_SEVERITY severity, D3D12_MESSAGE_ID id, LPCSTR text, void*) {
-  static std::atomic<int> told{0};
-  if (severity > D3D12_MESSAGE_SEVERITY_WARNING || told.fetch_add(1, std::memory_order_relaxed) >= 200) return;
+  // Errors: the first 200. Warnings: the first 5 of each id (some come every frame).
+  static std::atomic<int> errors{0};
+  static std::atomic<uint8_t> warnings[4096]{};
+  if (severity > D3D12_MESSAGE_SEVERITY_WARNING) return;
+  if (severity == D3D12_MESSAGE_SEVERITY_WARNING) {
+    if (warnings[static_cast<unsigned>(id) % 4096].fetch_add(1, std::memory_order_relaxed) >= 5) return;
+  } else if (errors.fetch_add(1, std::memory_order_relaxed) >= 200) {
+    return;
+  }
   logf("d3d12 debug (%s, id %d): %s", severity <= D3D12_MESSAGE_SEVERITY_ERROR ? "error" : "warning", static_cast<int>(id), text);
 }
 

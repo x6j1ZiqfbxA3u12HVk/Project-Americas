@@ -157,6 +157,10 @@ struct GpuMemory {
     }
     w.buffer->SetName(widen("window over 0x" + hex(base) + " (" + format_bytes(size) + ")").c_str());
     const uint32_t n = add_window(std::move(w));
+    static std::atomic<int> told{0};
+    if (told.fetch_add(1, std::memory_order_relaxed) < 64) {
+      logf("gpu memory: window %u over the allocation at 0x%s (%s)", n, hex(base).c_str(), format_bytes(size).c_str());
+    }
     std::vector<uint32_t> entries(size / kPage);
     for (uint32_t k = 0; k < entries.size(); ++k) entries[k] = (n << 16) | k;
     std::lock_guard p(pending_lock);
@@ -187,11 +191,17 @@ struct GpuMemory {
     if (pool_window || !section || !pages || pages > 0x10000) return;
     Window w;
     w.size = pages * kPage;
-    if (FAILED(device->OpenExistingHeapFromFileMapping(section, IID_PPV_ARGS(&w.heap)))) {
+    // A mirror view of the whole section, opened by address: it sees what every view of the
+    // pool's pages holds. (Opening the section itself would lose its commit charge for good on
+    // some drivers; see pool_window_wanted.)
+    void* mirror = MapViewOfFile(section, FILE_MAP_ALL_ACCESS, 0, 0, w.size);
+    if (!mirror || FAILED(device->OpenExistingHeapFromAddress(mirror, IID_PPV_ARGS(&w.heap)))) {
+      if (mirror) UnmapViewOfFile(mirror);
       fail("cannot open the physical page pool for the GPU");
       pool_window = UINT32_MAX;
       return;
     }
+    w.base = reinterpret_cast<uint64_t>(mirror);  // not a title address: kept only for the record
     D3D12_RESOURCE_DESC bd{D3D12_RESOURCE_DIMENSION_BUFFER, 0, w.size, 1, 1, 1, DXGI_FORMAT_UNKNOWN, {1, 0}, D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
                            D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS};
     if (FAILED(device->CreatePlacedResource(w.heap.Get(), 0, &bd, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&w.buffer)))) {
@@ -281,13 +291,13 @@ void on_view(uint64_t address, uint64_t pages, int64_t pool_page) {
 
 // Opens the pool once it exists (the title makes it when it first asks for pages). The section
 // is asked for before the GPU memory's lock is taken: the title memory's lock comes first.
-// The pool window is opened from the pool's section (OpenExistingHeapFromFileMapping). On the
-// development PC's AMD driver that leaks the section's whole commit charge for good, even when
-// everything is released before exit: a gigabyte a run, until the system runs out of commit
-// and the device is lost (a reboot gives it back). So it is off unless AMERICAS_GPU_POOL_WINDOW
-// asks for it; shaders then read zeros from pool pages.
+// The pool window. OpenExistingHeapFromFileMapping on the pool's section lost the section's
+// whole commit charge for good on the development PC's AMD driver (a gigabyte a run, even with
+// everything released before exit, until the system ran out of commit and the device was
+// lost), so open_pool opens a mirror view by address instead, which loses nothing.
+// AMERICAS_NO_GPU_POOL_WINDOW=1 leaves the pool without a window (shaders read zeros there).
 bool pool_window_wanted() {
-  static const bool wanted = GetEnvironmentVariableA("AMERICAS_GPU_POOL_WINDOW", nullptr, 0) != 0;
+  static const bool wanted = GetEnvironmentVariableA("AMERICAS_NO_GPU_POOL_WINDOW", nullptr, 0) == 0;
   return wanted;
 }
 
@@ -298,7 +308,7 @@ void open_pool_if_ready() {
     std::lock_guard g(m.lock);
     if (!m.pool_window) {
       m.pool_window = UINT32_MAX;
-      logf("gpu memory: no window over the physical page pool (AMERICAS_GPU_POOL_WINDOW=1 opens one; see gpu_memory.cpp)");
+      logf("gpu memory: no window over the physical page pool (AMERICAS_NO_GPU_POOL_WINDOW)");
     }
     return;
   }

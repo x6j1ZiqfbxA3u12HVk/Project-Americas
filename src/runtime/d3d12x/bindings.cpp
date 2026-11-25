@@ -329,6 +329,46 @@ Bindings* ready() {
   return b.usable ? &b : nullptr;
 }
 
+// A texture view the host accepts, from the title's: depth formats as their readable twins,
+// stencil views on plane 1 (and read as unsigned integers), and only formats the device can
+// read in shaders. False when there is none: an invalid view would remove the device.
+bool host_view_desc(ID3D12Device* device, DXGI_FORMAT resource_format, D3D12_SHADER_RESOURCE_VIEW_DESC& v, UINT mips,
+                    uint32_t& image_flags) {
+  DXGI_FORMAT f = v.Format ? v.Format : resource_format;
+  UINT plane = 0;
+  image_flags = shader::kImageFloat;
+  switch (f) {
+    case DXGI_FORMAT_D32_FLOAT:
+    case DXGI_FORMAT_R32_TYPELESS: f = DXGI_FORMAT_R32_FLOAT; break;
+    case DXGI_FORMAT_D16_UNORM:
+    case DXGI_FORMAT_R16_TYPELESS: f = DXGI_FORMAT_R16_UNORM; break;
+    case DXGI_FORMAT_D24_UNORM_S8_UINT:
+    case DXGI_FORMAT_R24G8_TYPELESS: f = DXGI_FORMAT_R24_UNORM_X8_TYPELESS; break;
+    case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
+    case DXGI_FORMAT_R32G8X24_TYPELESS: f = DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS; break;
+    case DXGI_FORMAT_X24_TYPELESS_G8_UINT:
+    case DXGI_FORMAT_X32_TYPELESS_G8X24_UINT:
+      plane = 1;
+      image_flags = shader::kImageUint;
+      break;
+    default: break;
+  }
+  D3D12_FEATURE_DATA_FORMAT_SUPPORT support{f, {}, {}};
+  if (FAILED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof support)) ||
+      !(support.Support1 & (D3D12_FORMAT_SUPPORT1_SHADER_LOAD | D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE))) {
+    static std::atomic<int> told{0};
+    if (told.fetch_add(1, std::memory_order_relaxed) < 8) {
+      logf("gpu: no shader view of format %u (texture format %u): not one the host reads", f, resource_format);
+    }
+    return false;
+  }
+  v.Format = f;
+  v.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+  v.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+  v.Texture2D = {0, mips, plane, 0.0f};
+  return true;
+}
+
 }  // namespace
 
 uint32_t image_format(uint32_t dxgi) {
@@ -405,15 +445,13 @@ void bind_texture_view(const D3D12_RESOURCE_DESC& resource, const D3D12_SHADER_R
     const uint32_t index = allocate_view_slot(&slot);
     if (!index) return;
     D3D12_SHADER_RESOURCE_VIEW_DESC v = view;
-    if (!v.Format) v.Format = resource.Format;
-    v.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-    v.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-    v.Texture2D = {0, mips, 0, 0.0f};
+    uint32_t image_flags = 0;
+    if (!host_view_desc(b->device.Get(), host->GetDesc().Format, v, mips, image_flags)) return;
     b->device->CreateShaderResourceView(host, &v, slot);
     shader::ImageBinding ib;
     std::copy(words, words + 8, ib.words);
     ib.srv = ib.alt = index;
-    ib.flags = shader::kImageFloat;
+    ib.flags = image_flags;
     b->images.push_back(ib);
     b->table_dirty = true;
     static std::atomic<int> told{0};
@@ -447,14 +485,13 @@ void bind_texture_view(const D3D12_RESOURCE_DESC& resource, const D3D12_SHADER_R
   const uint32_t index = allocate_view_slot(&slot);
   if (!index) return;
   D3D12_SHADER_RESOURCE_VIEW_DESC v = view;
-  if (!v.Format) v.Format = resource.Format;
-  v.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-  v.Texture2D = {0, mips, 0, 0.0f};
+  uint32_t image_flags = 0;
+  if (!host_view_desc(b->device.Get(), resource.Format, v, mips, image_flags)) return;
   b->device->CreateShaderResourceView(t.resource.Get(), &v, slot);
   shader::ImageBinding ib;
   std::copy(words, words + 8, ib.words);
   ib.srv = ib.alt = index;
-  ib.flags = shader::kImageFloat;
+  ib.flags = image_flags;
   b->images.push_back(ib);
   b->textures.push_back(std::move(t));
   b->table_dirty = true;
