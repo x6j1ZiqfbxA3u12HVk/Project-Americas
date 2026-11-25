@@ -124,13 +124,14 @@ Set-Location "C:\Users\Admin\Documents\GitHub\Project Americas"; . .\scripts\env
 ### Run the game (safe, unattended)
 
 ```powershell
-& "C:\Project Americas\build\release\bin\americas.exe" --memory-limit 8192 --timeout 120
+& "C:\Project Americas\build\release\bin\americas.exe" --memory-limit 12288 --timeout 120
 ```
 
 * Without `--title`, it runs the executable `MicrosoftGame.Config` names.
 * `--memory-limit` caps private commit (a job object) and, separately, the physical page pool's
   commit, which a job does not count. The game commits about 4.4 GiB at start-up (no RAM until
-  touched), so 6144 is now too tight.
+  touched), and once its runtime queries are answered it maps a 6.1 GiB physical page pool: 8192
+  is now too tight (the mapping fails, error 1450), 12288 holds it.
 * `--console auto|series_s|series_x` overrides `americas.ini`'s `console`. Auto gives Series S
   on this 16 GB PC.
 * Logs go to `C:\Project Americas\logs`:
@@ -514,6 +515,13 @@ the back buffer) now runs on the GPU: 2 of the frame's 3 draws, no debug-layer e
 
 After that, from the plan:
 
+* **Runtime areas answered (2026-11-25):** XPackage (a packaged process, fully installed,
+  every chunk ready, no other packages, nothing to download), XPersistentLocalStorage (`S:\`,
+  4 GiB free), XDisplay HDR (off): `gdk/offline.cpp`. Every area the game asks for is now
+  offered but XSpeechSynthesizer. With them **the game maps its 6.1 GiB physical page pool**
+  (about 7 GiB of physical pages in all), which `--memory-limit 8192` cannot hold: the mapping
+  fails with error 1450 and the game stops on its own `int 3` (game+0x1e6c29f). Run with
+  `--memory-limit 12288` (or none) from now on. It still sits on the black boot screen.
 * **Next: why the boot sequence does not move on.** The frame loop runs, but the game keeps
   drawing its black boot screen (fill, transparent fade, composite). Find what it waits for:
   `hang.txt` (every thread's stack at the timeout, named with `scripts\symbolize.py`),

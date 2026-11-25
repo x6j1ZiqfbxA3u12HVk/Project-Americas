@@ -8,10 +8,6 @@ namespace am::rt::gdk {
 
 void add_system_interfaces(std::vector<Interface>& out) {
   constexpr auto Z = Returns::Zero;
-  out.push_back({"XDisplay (HDR)", guid("03f0fe74-fdd9-4e5c-b630-f9339c47acc5"),
-                 guid("35f07670-706e-4bfb-9476-090798c5ebf3"), {
-      {4, "XDisplayTryEnableHdrMode", nullptr, Z},
-  }});
   const GUID store = guid("0dd112ac-7c24-448c-b92b-3960fb5bd30c");
   out.push_back({"XStore (durables)", store, guid("2d42fea5-e71d-4b76-97cd-c50afbb3ae5d"), {
       {71, "XStoreAcquireLicenseForDurablesAsync", nullptr},
@@ -107,37 +103,12 @@ void add_system_interfaces(std::vector<Interface>& out) {
                  guid("22e672d7-b4e3-406c-bd50-8f0d25236f9e"), {
       {5, "XAppCaptureTakeScreenshot", nullptr},
   }});
-  out.push_back({"XPackage", guid("af406016-e850-4aa8-a88d-2f3dcb9dac7e"), guid("0b9d556e-ab70-43f4-baa0-9999ac4cb040"), {
-      {3, "XPackageGetCurrentProcessPackageIdentifier", nullptr},
-      {4, "XPackageIsPackagedProcess", nullptr, Z},
-      {5, "XPackageCreateInstallationMonitor", nullptr},
-      {6, "XPackageCloseInstallationMonitorHandle", nullptr, Z},
-      {7, "XPackageGetInstallationProgress", nullptr, Z},
-      {9, "XPackageRegisterInstallationProgressChanged", nullptr},
-      {12, "XPackageFindChunkAvailability", nullptr},
-      {14, "XPackageChangeChunkInstallOrder", nullptr},
-      {16, "XPackageInstallChunksAsync", nullptr},
-      {17, "XPackageInstallChunksResult", nullptr},
-      {18, "XPackageEstimateDownloadSize", nullptr},
-      {19, "XPackageUninstallChunks", nullptr},
-      {25, "XPackageGetMountPath", nullptr},
-      {26, "XPackageCloseMountHandle", nullptr, Z},
-      {34, "XPackageUninstallPackage", nullptr, Z},
-      {37, "XPackageMountWithUiAsync", nullptr},
-      {38, "XPackageMountWithUiResult", nullptr},
-      {39, "XPackageEnumeratePackages", nullptr},
-  }});
   out.push_back({"XGameUi", guid("dfcd4649-4ff8-4043-ba07-35d607df98b0"), guid("eaf669df-5542-4590-99a3-8dc061f837cc"), {
       {7, "XGameUiShowPlayerProfileCardAsync", nullptr},
       {8, "XGameUiShowPlayerProfileCardResult", nullptr},
       {17, "XGameUiShowTextEntryAsync", nullptr},
       {18, "XGameUiShowTextEntryResultSize", nullptr},
       {19, "XGameUiShowTextEntryResult", nullptr},
-  }});
-  out.push_back({"XPersistentLocalStorage", guid("f4faf4d4-2d04-4fce-b3e0-474a713a3e84"),
-                 guid("41a4e10c-5a7e-41d9-8c37-37bde62a07d6"), {
-      {4, "XPersistentLocalStorageGetPath", nullptr},
-      {5, "XPersistentLocalStorageGetSpaceInfo", nullptr},
   }});
 }
 

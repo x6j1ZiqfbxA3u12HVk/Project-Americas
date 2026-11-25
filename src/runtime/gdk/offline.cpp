@@ -1,5 +1,6 @@
 // The runtime areas of an offline retail console with one signed-in local user (plan, section
-// 5.4): XUser, XSystem, XGame, XNetworking (offline), the feature check and game events.
+// 5.4): XUser, XSystem, XGame, XNetworking (offline), the feature check, game events, the
+// installed package (XPackage), local storage, and HDR (off).
 // Methods take the object first, then the public function's arguments. Structures and values
 // are the public GDK API's.
 
@@ -289,6 +290,64 @@ HRESULT WINAPI game_event_write(Self, User*, const char*, const char*, const cha
   return S_OK;
 }
 
+// ---- XPackage: this process is the one package, fully installed ----
+// An installed retail package: every chunk on disk, nothing to download, launchable.
+struct InstallationProgress {
+  uint64_t total_bytes, installed_bytes, launch_bytes;
+  bool launchable, completed;
+};
+uint64_t g_monitor = 0x50ACA6E;  // the one installation monitor handle we give out
+
+bool WINAPI package_is_packaged(Self) { return true; }
+HRESULT WINAPI package_identifier(Self, size_t size, char* buffer) {
+  const TitleConfig& t = title_config();
+  return put_string(t.identity_name.empty() ? "Americas" : t.identity_name, size, buffer, nullptr);
+}
+HRESULT WINAPI package_create_monitor(Self, const char*, uint32_t, const void*, uint32_t, void*, void** out) {
+  if (!out) return E_INVALIDARG;
+  *out = &g_monitor;
+  return S_OK;
+}
+void WINAPI package_close_monitor(Self, void*) {}
+void WINAPI package_progress(Self, void*, InstallationProgress* p) {
+  if (!p) return;
+  const uint64_t size = 1ull << 30;
+  *p = {size, size, size, true, true};
+}
+// (monitor, context, callback, token): installation is complete, so the callback never runs.
+HRESULT WINAPI package_register_progress(Self, void*, void*, void*, uint64_t* token) { return new_token(token); }
+HRESULT WINAPI package_chunk_availability(Self, const char*, uint32_t, const void*, uint32_t* availability) {
+  if (!availability) return E_INVALIDARG;
+  *availability = 0;  // XPackageChunkAvailability::Ready
+  return S_OK;
+}
+// (kind, scope, context, callback): no other packages (DLC, content) are installed, so the
+// callback is never called.
+HRESULT WINAPI package_enumerate(Self, uint32_t, uint32_t, void*, void*) { return S_OK; }
+HRESULT WINAPI package_estimate_download(Self, const char*, uint32_t, const void*, uint64_t* size, bool* confirm) {
+  if (size) *size = 0;
+  if (confirm) *confirm = false;
+  return S_OK;
+}
+
+// ---- XPersistentLocalStorage: S:\ (console_paths maps it into userdata) ----
+struct LocalStorageSpace {
+  uint64_t available_free, total_free, used, total;
+};
+HRESULT WINAPI local_storage_path(Self, size_t size, char* buffer, size_t* used) { return put_string("S:\\", size, buffer, used); }
+HRESULT WINAPI local_storage_space(Self, LocalStorageSpace* out) {
+  if (!out) return E_INVALIDARG;
+  const uint64_t total = 4ull << 30;
+  *out = {total, total, 0, total};
+  return S_OK;
+}
+
+// ---- XDisplay: HDR stays off (the presenter shows SDR) ----
+uint32_t WINAPI display_try_enable_hdr(Self, uint32_t, void* info) {
+  if (info) std::memset(info, 0, 16);
+  return 2;  // XDisplayHdrModeResult::Disabled
+}
+
 }  // namespace
 
 void add_offline_interfaces(std::vector<Interface>& out) {
@@ -348,6 +407,35 @@ void add_offline_interfaces(std::vector<Interface>& out) {
   const GUID feature = guid("8836fe87-edb9-4fe3-8dad-05f0d2cd5b40");
   out.push_back({"XGameRuntimeIsFeatureAvailable", feature, feature, {
       {3, "XGameRuntimeIsFeatureAvailable", AM_GDK(feature_available), Z},
+  }});
+  out.push_back({"XDisplay (HDR)", guid("03f0fe74-fdd9-4e5c-b630-f9339c47acc5"),
+                 guid("35f07670-706e-4bfb-9476-090798c5ebf3"), {
+      {4, "XDisplayTryEnableHdrMode", AM_GDK(display_try_enable_hdr), Z},
+  }});
+  out.push_back({"XPackage", guid("af406016-e850-4aa8-a88d-2f3dcb9dac7e"), guid("0b9d556e-ab70-43f4-baa0-9999ac4cb040"), {
+      {3, "XPackageGetCurrentProcessPackageIdentifier", AM_GDK(package_identifier)},
+      {4, "XPackageIsPackagedProcess", AM_GDK(package_is_packaged), Z},
+      {5, "XPackageCreateInstallationMonitor", AM_GDK(package_create_monitor)},
+      {6, "XPackageCloseInstallationMonitorHandle", AM_GDK(package_close_monitor), Z},
+      {7, "XPackageGetInstallationProgress", AM_GDK(package_progress), Z},
+      {9, "XPackageRegisterInstallationProgressChanged", AM_GDK(package_register_progress)},
+      {12, "XPackageFindChunkAvailability", AM_GDK(package_chunk_availability)},
+      {14, "XPackageChangeChunkInstallOrder", nullptr},
+      {16, "XPackageInstallChunksAsync", nullptr},
+      {17, "XPackageInstallChunksResult", nullptr},
+      {18, "XPackageEstimateDownloadSize", AM_GDK(package_estimate_download)},
+      {19, "XPackageUninstallChunks", nullptr},
+      {25, "XPackageGetMountPath", nullptr},
+      {26, "XPackageCloseMountHandle", nullptr, Z},
+      {34, "XPackageUninstallPackage", nullptr, Z},
+      {37, "XPackageMountWithUiAsync", nullptr},
+      {38, "XPackageMountWithUiResult", nullptr},
+      {39, "XPackageEnumeratePackages", AM_GDK(package_enumerate)},
+  }});
+  out.push_back({"XPersistentLocalStorage", guid("f4faf4d4-2d04-4fce-b3e0-474a713a3e84"),
+                 guid("41a4e10c-5a7e-41d9-8c37-37bde62a07d6"), {
+      {4, "XPersistentLocalStorageGetPath", AM_GDK(local_storage_path)},
+      {5, "XPersistentLocalStorageGetSpaceInfo", AM_GDK(local_storage_space)},
   }});
   const GUID event = guid("bbfbdcc7-bfe7-409b-a5ca-edf054960b4d");
   out.push_back({"XGameEvent", event, event, {
