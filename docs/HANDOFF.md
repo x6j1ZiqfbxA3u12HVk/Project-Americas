@@ -774,3 +774,23 @@ Then the larger pieces before the 3D world shows:
   * Check root constants' size against the record's dwords.
   * Graphics may need the same per-program placement (PS from s0?): today's "from s8" works
     for the boot screen's shaders only.
+* **Compute is on by default again** (58eb52c; `AMERICAS_NO_COMPUTE=1` turns it off). With
+  the user data in the right registers, the menus' compute passes draw their text: Finish
+  Setup and Brightness render every letter, bold text and the controller glyphs. A full
+  scripted run through Confirm (300 s) did not crash. The game+0xf6349 crash (a lookup by
+  hash key that found nothing) came once, with the presses; it did not repeat.
+* **Still wrong, all likely one cause, textures the CPU writes and we upload linearly
+  (no GFX10 detiling):**
+  * the intro video is solid green: its YUV planes reach the GPU as zeros or untiled;
+  * the long scrolling legal text on the right still misses letters (the menu items on
+    the left are whole);
+  * the brightness page's calibration symbol is missing.
+  * After Confirm the loading phase stays dark.
+* **Next: GFX10 detiling** in `bindings.cpp`'s upload, by swizzle mode. Reference for the
+  patterns: AMD's addrlib, MIT (`tools\downloads\addrlib-gfx10`); anything committed from it
+  carries AMD's notice.
+  * Modes seen: 2 (256B_D), 5 (4KB_S), 21 (4KB_S_X), 24 to 27 (64KB_*_X). The _X modes XOR
+    with the pipe and bank configuration of the console's GPU, which must be found (Series
+    X/S GB_ADDR_CONFIG).
+  * Also re-upload video textures every frame: the checksum check runs every 15th flush,
+    at most 16 MiB at a time.
