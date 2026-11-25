@@ -1165,6 +1165,8 @@ slots), then the GPU back end.
 | `zstd-1.5.7\zstd.exe` | zstd v1.5.7, github.com/meta/zstd | Unpacking LLVM's packages (`-d --long=31`); Windows' own `tar` refuses their window size | — |
 | `amd-isa-xml\amdgpu_isa_rdna1.xml` | AMD machine-readable GPU ISA (same release) | RDNA 1's instructions the console GPU keeps (the MAD family) | MIT, like the RDNA 2 file |
 | `llvm-amdgpu-23.1.6\bin\llvm-mc.exe`, `llvm-objdump.exe` | built here from `llvm-project-23.1.6.src.tar.xz` (179 MB, github.com/llvm, SHA-256 `d3b86ab2…35a31da`) with only the AMDGPU target, MSVC, about an hour on Dev PC 1; script and sources in `downloads\llvm-src` | **The RDNA 2 oracle**: `scripts/rdna2_oracle.py`; also an assembler for test programs | Apache 2.0 with LLVM exceptions; local tool only |
+| `pylib\pypdf` | pypdf, pypi.org | Reading the RDNA 2 ISA PDF's text (descriptor layouts) | BSD licence; `python -I` with `PYTHONPATH` set to `pylib` |
+| `downloads\addrlib-gfx10\*` | AMD addrlib's GFX10 sources (`gfx10addrlib.*`, `gfx10SwizzlePattern.h`), github.com/GPUOpen-Drivers/pal, 2026-11-25 | Reference for GFX10 swizzle modes (texture detiling) | MIT: anything derived and committed must carry AMD's notice |
 
 
 Next, in parallel:
