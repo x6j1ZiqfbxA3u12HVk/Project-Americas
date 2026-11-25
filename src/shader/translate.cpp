@@ -1426,21 +1426,12 @@ const std::unordered_map<std::string, Handler>& table() {
         };
       }
     }
-    // -- atomics: 32-bit; GLC returns the value before --
+    // -- atomics: 32-bit; GLC returns the value before. The ops' numbers are am_atomic's: 0-10 the
+    // integer ones below, 11 and 12 the float min and max (global only so far). --
     {
       static const char* const kAtomics[] = {"swap", "cmpswap", "add", "sub", "smin", "umin", "smax", "umax", "and", "or", "xor"};
-      for (uint32_t op = 0; op < 11; ++op) {
-        t[std::string("buffer_atomic_") + kAtomics[op]] = [op](Ctx& c) {
-          if (!buffer_address(c)) return false;
-          const uint32_t vd = c.f(Field::VDATA);
-          c.touch_v(vd + (op == 1 ? 1 : 0));
-          const std::string cmp = op == 1 ? "v[" + num(vd + 1) + "]" : "0u";
-          c.line("  uint o = 4u <= lim ? am_atomic(" + num(op) + "u, p, v[" + num(vd) + "], " + cmp + ") : 0u;");
-          if (c.f(Field::GLC)) c.line("  v[" + num(vd) + "] = o;");
-          c.line("}");
-          return true;
-        };
-        t[std::string("global_atomic_") + kAtomics[op]] = [op](Ctx& c) {
+      const auto global_atomic = [](uint32_t op) {
+        return [op](Ctx& c) {
           const uint32_t sa = c.f(Field::SADDR), va = c.f(Field::ADDR), vd = c.f(Field::DATA), dst = c.f(Field::VDST);
           const int32_t imm = static_cast<int32_t>(c.f(Field::OFFSET) << 20) >> 20;
           std::string addr;
@@ -1459,7 +1450,22 @@ const std::unordered_map<std::string, Handler>& table() {
           c.line("}");
           return true;
         };
+      };
+      for (uint32_t op = 0; op < 11; ++op) {
+        t[std::string("buffer_atomic_") + kAtomics[op]] = [op](Ctx& c) {
+          if (!buffer_address(c)) return false;
+          const uint32_t vd = c.f(Field::VDATA);
+          c.touch_v(vd + (op == 1 ? 1 : 0));
+          const std::string cmp = op == 1 ? "v[" + num(vd + 1) + "]" : "0u";
+          c.line("  uint o = 4u <= lim ? am_atomic(" + num(op) + "u, p, v[" + num(vd) + "], " + cmp + ") : 0u;");
+          if (c.f(Field::GLC)) c.line("  v[" + num(vd) + "] = o;");
+          c.line("}");
+          return true;
+        };
+        t[std::string("global_atomic_") + kAtomics[op]] = global_atomic(op);
       }
+      t["global_atomic_fmin"] = global_atomic(11);
+      t["global_atomic_fmax"] = global_atomic(12);
     }
     // -- images --
     {
@@ -1708,7 +1714,17 @@ uint am_atomic(uint op, uint64_t a, uint x, uint cmp) {
   else if (op == 7u) am_memory.InterlockedMax(at, x, o);
   else if (op == 8u) am_memory.InterlockedAnd(at, x, o);
   else if (op == 9u) am_memory.InterlockedOr(at, x, o);
-  else am_memory.InterlockedXor(at, x, o);
+  else if (op == 10u) am_memory.InterlockedXor(at, x, o);
+  else {  // 11 fmin, 12 fmax: a compare-and-swap loop (float atomics have no HLSL form)
+    o = am_memory.Load(at);
+    for (uint k = 0u; k < 64u; ++k) {
+      float r = op == 11u ? min(asfloat(o), asfloat(x)) : max(asfloat(o), asfloat(x));
+      uint prev;
+      am_memory.InterlockedCompareExchange(at, o, asuint(r), prev);
+      if (prev == o) break;
+      o = prev;
+    }
+  }
   return o;
 }
 // Writes the bits of `m` only; other lanes may write the rest of the dword at the same time.
@@ -1759,7 +1775,17 @@ uint am_atomic(uint op, uint64_t a, uint x, uint cmp) {
   else if (op == 7u) w.InterlockedMax(at, x, o);
   else if (op == 8u) w.InterlockedAnd(at, x, o);
   else if (op == 9u) w.InterlockedOr(at, x, o);
-  else w.InterlockedXor(at, x, o);
+  else if (op == 10u) w.InterlockedXor(at, x, o);
+  else {  // 11 fmin, 12 fmax: a compare-and-swap loop (float atomics have no HLSL form)
+    o = w.Load(at);
+    for (uint k = 0u; k < 64u; ++k) {
+      float r = op == 11u ? min(asfloat(o), asfloat(x)) : max(asfloat(o), asfloat(x));
+      uint prev;
+      w.InterlockedCompareExchange(at, o, asuint(r), prev);
+      if (prev == o) break;
+      o = prev;
+    }
+  }
   return o;
 }
 void am_store_masked(uint64_t a, uint x, uint m) {
