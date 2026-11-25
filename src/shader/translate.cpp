@@ -866,6 +866,7 @@ const std::unordered_map<std::string, Handler>& table() {
     int_op(t, "v_mul_hi_u32_u24", "uint((uint64_t(A & 0xFFFFFFu) * uint64_t(B & 0xFFFFFFu)) >> 32)");
     int_op(t, "v_mad_i32_i24", "asuint((asint(A << 8) >> 8) * (asint(B << 8) >> 8) + asint(C))");
     int_op(t, "v_bfe_u32", "am_bfe_u32(A, B, C)");
+    int_op(t, "v_bfm_b32", "(((1u << (A & 31u)) - 1u) << (B & 31u))");
     int_op(t, "v_bfe_i32", "am_bfe_i32(A, B, C)");
     int_op(t, "v_bfi_b32", "((A & B) | (~A & C))");
     int_op(t, "v_lshl_add_u32", "((A << (B & 31u)) + C)");
@@ -940,6 +941,14 @@ const std::unordered_map<std::string, Handler>& table() {
       const uint32_t d = vop_dst(c);
       c.touch_v(d + 1);
       c.line("if (AM_ACT) { uint64_t r = " + c.src64(c.f(Field::SRC1)) + " << (" + vsrc(c, 0) + " & 63u); v[" + num(d) +
+             "] = uint(r); v[" + num(d + 1) + "] = uint(r >> 32); }");
+      return true;
+    };
+    t["v_lshrrev_b64"] = [](Ctx& c) {
+      if (!plain_form(c)) return false;
+      const uint32_t d = vop_dst(c);
+      c.touch_v(d + 1);
+      c.line("if (AM_ACT) { uint64_t r = " + c.src64(c.f(Field::SRC1)) + " >> (" + vsrc(c, 0) + " & 63u); v[" + num(d) +
              "] = uint(r); v[" + num(d + 1) + "] = uint(r >> 32); }");
       return true;
     };
@@ -1483,6 +1492,15 @@ const std::unordered_map<std::string, Handler>& table() {
       c.touch_v(c.f(Field::DATA0));
       c.line("if (AM_ACT) am_lds[(v[" + num(c.f(Field::ADDR)) + "] + " + num(c.f(Field::OFFSET0) | c.f(Field::OFFSET1) << 8) +
              "u) >> 2] = v[" + num(c.f(Field::DATA0)) + "];");
+      return true;
+    };
+    t["ds_write_b64"] = [](Ctx& c) {
+      c.uses_lds = true;
+      const uint32_t a = c.f(Field::ADDR), d = c.f(Field::DATA0);
+      c.touch_v(a);
+      c.touch_v(d + 1);
+      c.line("if (AM_ACT) { uint b = (v[" + num(a) + "] + " + num(c.f(Field::OFFSET0) | c.f(Field::OFFSET1) << 8) +
+             "u) >> 2; am_lds[b] = v[" + num(d) + "]; am_lds[b + 1u] = v[" + num(d + 1) + "]; }");
       return true;
     };
     t["ds_read2_b32"] = [](Ctx& c) {
