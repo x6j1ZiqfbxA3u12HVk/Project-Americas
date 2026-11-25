@@ -685,3 +685,10 @@ instruction:
   of them has finished in 60 s, so their dispatches still wait. Look at the HLSL of one
   (`am-shaders precompile --raw`), e.g. 391b80d5337dff03…, and at whether the AMD driver
   stalls on the CAS loop.
+* **The game's dispatches use slot 67 pipelines**, not slot 62. The log says "a dispatch
+  waits: pipeline (slot 67) (no host pipeline yet)". Slot 67 is the console's own compute
+  pipeline creation (programs given by address, like slot 57 for graphics), and its
+  description is not read yet: `create_console_pipeline` only logs its first bytes and looks
+  for shader containers. **Next:** decode slot 67 as was done for slot 57 (blocks, the
+  program's marker), make a host compute pipeline from the precompiled DXIL on the worker
+  thread, then check the font atlas and the loading passes with dispatches running.

@@ -359,6 +359,11 @@ void dispatch(HostList& h, ID3D12GraphicsCommandList* list, const Command& c) {
   const RootSignatureDesc* rs = root_signature_desc(h.compute_root_signature ? h.compute_root_signature : rs_object);
   if (!pso || !rs) {
     ++g_dispatches_skipped;
+    static std::atomic<int> told{0};
+    if (told.fetch_add(1, std::memory_order_relaxed) < 12) {
+      logf("gpu: a dispatch waits: %s (%s)", describe_pipeline(h.pipeline).c_str(),
+           !pso ? "no host pipeline yet" : "no root signature");
+    }
     return;
   }
   const D3D12_GPU_VIRTUAL_ADDRESS table = set_heaps(h, list);
