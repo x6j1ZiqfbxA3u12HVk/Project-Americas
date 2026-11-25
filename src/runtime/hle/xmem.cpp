@@ -133,9 +133,28 @@ bool commit_buffer(const void* buffer, DWORD size) {
   return false;
 }
 
+// The first failures are logged: the game retries some reads forever (Sleep(1) on any error but
+// 6, 38 and 87), so a read that keeps failing stalls it silently.
+void note_read_failure(const char* where, LPVOID buffer, DWORD size, DWORD error) {
+  static std::atomic<int> told{0};
+  if (told.fetch_add(1, std::memory_order_relaxed) < 8) {
+    logf("files: ReadFile failed (%s) into %p, %lu bytes: error %lu", where, buffer, static_cast<unsigned long>(size),
+         static_cast<unsigned long>(error));
+  }
+}
+
 BOOL WINAPI my_ReadFile(HANDLE file, LPVOID buffer, DWORD size, LPDWORD read, LPOVERLAPPED overlapped) {
-  if (!commit_buffer(buffer, size)) return FALSE;
-  return ReadFile(file, buffer, size, read, overlapped);
+  if (!commit_buffer(buffer, size)) {
+    note_read_failure("committing the buffer", buffer, size, GetLastError());
+    return FALSE;
+  }
+  const BOOL ok = ReadFile(file, buffer, size, read, overlapped);
+  if (!ok) {
+    const DWORD error = GetLastError();
+    note_read_failure("the read", buffer, size, error);
+    SetLastError(error);
+  }
+  return ok;
 }
 BOOL WINAPI my_ReadFileEx(HANDLE file, LPVOID buffer, DWORD size, LPOVERLAPPED overlapped,
                           LPOVERLAPPED_COMPLETION_ROUTINE done) {

@@ -535,6 +535,14 @@ After that, from the plan:
     heap or the windows.
   * It still sits on the black boot screen, in the game's "System Init" state (its own crash
     report, `userdata\temp\*.crash.log`, names the state; it also says "Anaconda", Series X).
+* **Leads checked on 2026-11-25 (all negative):**
+  * The Series X profile (`--console series_x`, 13.5 GiB pool): the same black boot screen.
+  * DirectStorage: 4,226 reads, 275 MB, no failure.
+  * game+0x314259 is a `ReadFile` loop that sleeps 1 ms and retries on any error but 6, 38
+    and 87; a thread was seen sleeping there. Our `ReadFile` wrapper (`hle/xmem.cpp`) now logs
+    its first failures: none in a 30 s run, so that loop is not stuck.
+  * No stub is called, and every runtime area the game asks for is offered but
+    XSpeechSynthesizer (queried once at start; probably harmless).
 * **Next: why the boot sequence does not move on.** The frame loop runs, but the game keeps
   drawing its black boot screen (fill, transparent fade, composite). Find what it waits for:
   `hang.txt` (every thread's stack at the timeout, named with `scripts\symbolize.py`),
