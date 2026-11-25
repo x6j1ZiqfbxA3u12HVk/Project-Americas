@@ -21,7 +21,9 @@
 
 #include "runtime/d3d12x/commands.h"
 #include "runtime/d3d12x/d3d12x.h"
+#include "runtime/d3d12x/gpu_memory.h"
 #include "runtime/d3d12x/host.h"
+#include "runtime/d3d12x/root_signature.h"
 #include "runtime/d3d12x/object.h"
 #include "runtime/log.h"
 #include "runtime/present/host_gpu.h"
@@ -66,6 +68,14 @@ struct HostList {
   size_t current = 0;
   bool open = false, ready = false;  // recording; closed and waiting to be submitted
   std::vector<std::pair<ID3D12Resource*, D3D12_RESOURCE_STATES>> states;
+  // Graphics state for draws: the console root signature and pipeline, each root parameter's
+  // argument (an address) or constants.
+  static constexpr size_t kParams = 64;
+  const void* root_signature = nullptr;
+  const void* pipeline = nullptr;
+  uint64_t args[kParams] = {};
+  std::vector<uint32_t> constants[kParams];
+  bool bound = false;  // the translated root signature and heap are set in the host list
 };
 
 struct CommandList : Object {
@@ -164,6 +174,7 @@ ID3D12GraphicsCommandList* host_begin(CommandList* l) {
   h.open = true;
   h.ready = false;
   h.states.clear();
+  h.bound = false;
   return h.list.Get();
 }
 
@@ -220,9 +231,77 @@ D3D12_CPU_DESCRIPTOR_HANDLE host_view(HostList& h, uint64_t descriptor, bool dep
 
 const uint8_t* data_of(const Recording& r, const Command& c) { return c.data_size ? r.data.data() + c.data_at : nullptr; }
 
+// Root arguments and pipelines are state the draws read; they need no host list yet.
+bool track(HostList& h, const Recording& r, const Command& c) {
+  const size_t index = static_cast<size_t>(c.a[0]);
+  switch (c.op) {
+    case kSetGraphicsRootSignature:
+      h.root_signature = reinterpret_cast<const void*>(c.a[0]);
+      for (auto& v : h.constants) v.clear();
+      std::fill(std::begin(h.args), std::end(h.args), 0);
+      return true;
+    case kSetPipelineState: h.pipeline = reinterpret_cast<const void*>(c.a[0]); return true;
+    case kSetGraphicsRootDescriptorTable:
+    case kSetGraphicsRootCbv:
+    case kSetGraphicsRootSrv:
+    case kSetGraphicsRootUav:
+      if (index < HostList::kParams) h.args[index] = c.a[1];
+      return true;
+    case kSetGraphicsRoot32BitConstant:
+      if (index < HostList::kParams) {
+        auto& v = h.constants[index];
+        const size_t at = static_cast<size_t>(c.a[2] & 0xFFFF);
+        if (v.size() <= at) v.resize(at + 1, 0);
+        v[at] = static_cast<uint32_t>(c.a[1]);
+      }
+      return true;
+    case kSetGraphicsRoot32BitConstants:
+      if (index < HostList::kParams && c.data_size) {
+        auto& v = h.constants[index];
+        const size_t n = c.data_size / 4, at = static_cast<size_t>(c.a[3] & 0xFFFF);
+        if (v.size() < at + n) v.resize(at + n, 0);
+        std::memcpy(v.data() + at, r.data.data() + c.data_at, n * 4);
+      }
+      return true;
+    default: return false;
+  }
+}
+
+std::atomic<uint64_t> g_draws_run{0}, g_draws_skipped{0};
+
+// A draw, when its pipeline has a host pipeline: the translated root signature and heap, each
+// stage's user data, the draw.
+void draw(HostList& h, ID3D12GraphicsCommandList* list, const Command& c) {
+  const void* rs_object = nullptr;
+  ID3D12PipelineState* pso = host_pipeline(h.pipeline, &rs_object);
+  const RootSignatureDesc* rs = root_signature_desc(h.root_signature ? h.root_signature : rs_object);
+  if (!pso || !rs || c.op != kDrawInstanced) {
+    ++g_draws_skipped;
+    return;
+  }
+  if (!h.bound) {
+    flush_page_table(list);
+    ID3D12DescriptorHeap* heaps[] = {translated_shader_heap()};
+    list->SetDescriptorHeaps(1, heaps);
+    list->SetGraphicsRootSignature(translated_graphics_root_signature());
+    h.bound = true;
+  }
+  uint32_t vs[kUserDataConstants] = {}, ps[kUserDataConstants] = {};
+  user_data_sgprs(*rs, D3D12_SHADER_VISIBILITY_VERTEX, h.args, h.constants, vs, kUserDataConstants);
+  user_data_sgprs(*rs, D3D12_SHADER_VISIBILITY_PIXEL, h.args, h.constants, ps, kUserDataConstants);
+  list->SetPipelineState(pso);
+  list->SetGraphicsRoot32BitConstants(0, kUserDataConstants, vs, 0);
+  list->SetGraphicsRoot32BitConstants(1, kUserDataConstants, ps, 0);
+  list->DrawInstanced(static_cast<UINT>(c.a[0]), static_cast<UINT>(c.a[1]), static_cast<UINT>(c.a[2]), static_cast<UINT>(c.a[3]));
+  ++g_draws_run;
+}
+
 // The host call for a command, made as the title makes the console one.
 void forward(CommandList* l, const Command& c) {
+  if (track(l->host, l->rec, c)) return;
   switch (c.op) {
+    case kDrawInstanced:
+    case kDrawIndexedInstanced:
     case kClearRenderTargetView:
     case kClearDepthStencilView:
     case kSetRenderTargets:
@@ -283,6 +362,8 @@ void forward(CommandList* l, const Command& c) {
     case kSetPrimitiveTopology: list->IASetPrimitiveTopology(static_cast<D3D12_PRIMITIVE_TOPOLOGY>(c.a[0])); return;
     case kSetBlendFactor: list->OMSetBlendFactor(reinterpret_cast<const float*>(data)); return;
     case kSetStencilRef: list->OMSetStencilRef(static_cast<UINT>(c.a[0])); return;
+    case kDrawInstanced:
+    case kDrawIndexedInstanced: draw(h, list, c); return;
     default: return;
   }
 }
@@ -507,8 +588,9 @@ void frame_present() {
       ops += (ops.empty() ? "" : ", ") + (name ? std::string(name) : "slot " + std::to_string(op)) + " " +
              std::to_string(f.counts[op]);
     }
-    logf("frame %llu: %u lists, %u commands: %s", static_cast<unsigned long long>(f.frame), f.lists, f.commands,
-         ops.c_str());
+    logf("frame %llu: %u lists, %u commands: %s; draws so far on the GPU %llu, waiting for shaders %llu",
+         static_cast<unsigned long long>(f.frame), f.lists, f.commands, ops.c_str(),
+         static_cast<unsigned long long>(g_draws_run.load()), static_cast<unsigned long long>(g_draws_skipped.load()));
     if (!f.clears.empty()) logf("frame %llu: render-target clears:%s", static_cast<unsigned long long>(f.frame), f.clears.c_str());
     if (!f.pipelines.empty()) logf("frame %llu: pipelines and draws:%s", static_cast<unsigned long long>(f.frame), f.pipelines.c_str());
   }

@@ -40,6 +40,13 @@ struct ViewInfo {
   uint64_t resource = 0;
 };
 bool read_view(uint64_t descriptor, ViewInfo& out);
+// The descriptor a shader resource view writes for translated shaders, which read it as the
+// console GPU does: a buffer descriptor (V#, 16 bytes) for buffers; for textures our record for
+// now (texture descriptors come with images in the runtime binding).
+void write_shader_view(uint64_t dest, const D3D12_RESOURCE_DESC* resource, const D3D12_SHADER_RESOURCE_VIEW_DESC& view,
+                       uint64_t address);
+// An RDNA 2 buffer descriptor: base address, bytes, stride (0: raw).
+void encode_buffer_descriptor(uint32_t out[4], uint64_t base, uint64_t bytes, uint32_t stride);
 
 // views.cpp: the bytes and alignment a resource needs (GetResourceAllocationInfo's rules).
 D3D12_RESOURCE_ALLOCATION_INFO allocation_info(const D3D12_RESOURCE_DESC& d);

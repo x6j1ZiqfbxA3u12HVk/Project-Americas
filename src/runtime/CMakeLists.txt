@@ -25,6 +25,7 @@ add_library(am_runtime STATIC
   d3d12x/formats.cpp
   d3d12x/frame.cpp
   d3d12x/gpu_memory.cpp
+  d3d12x/host_pipeline.cpp
   d3d12x/host_resources.cpp
   d3d12x/layout.cpp
   d3d12x/list.cpp
@@ -46,7 +47,7 @@ add_library(am_runtime STATIC
   hle/registry.cpp
   hle/system.cpp
   hle/xmem.cpp)
-target_link_libraries(am_runtime PUBLIC am_core am_pe am_loader am_x86 am_formats PRIVATE ws2_32 winhttp d3d12 dxgi)
+target_link_libraries(am_runtime PUBLIC am_core am_pe am_loader am_x86 am_formats am_shader PRIVATE ws2_32 winhttp d3d12 dxgi)
 
 # The runtime proper, loaded by americas.exe.
 add_library(americas_rt SHARED rt_main.cpp)

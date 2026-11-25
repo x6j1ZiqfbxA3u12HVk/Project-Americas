@@ -4,7 +4,10 @@
 #include <windows.h>
 #include <d3d12.h>
 
+#include <atomic>
+#include <cstdio>
 #include <cstring>
+#include <string>
 
 #include "runtime/d3d12x/object.h"
 #include "runtime/d3d12x/d3d12x.h"
@@ -142,6 +145,17 @@ HRESULT WINAPI create_placed_resource_x(Device* self, uint64_t address, const D3
   return create_placed_resource_at(self, address, desc, initial_layout, clear, riid, out);
 }
 
+// Slot 70: the console's view creation from a description: (resource description, view
+// description followed by the resource's GPU address at +40, destination descriptor).
+void WINAPI create_view_x(Device*, const D3D12_RESOURCE_DESC* resource, const uint8_t* view, uint64_t dest) {
+  if (!view || !dest) return;
+  D3D12_SHADER_RESOURCE_VIEW_DESC v{};
+  std::memcpy(&v, view, sizeof v);
+  uint64_t address = 0;
+  std::memcpy(&address, view + 40, sizeof address);
+  write_shader_view(dest, resource, v, address);
+}
+
 // Slot 127: committed resource creation, shaped like D3D12's CreateCommittedResource3: (heap
 // properties, heap flags, description, initial barrier layout, clear value, protected session,
 // castable format count, castable formats, riid, out). The game asks for ID3D12Resource.
@@ -169,6 +183,7 @@ std::vector<Method> device_methods() {
       {57, "CreatePipelineX (57)", reinterpret_cast<void*>(&create_pipeline_57)},
       {62, "CreateComputePipelineStateX", reinterpret_cast<void*>(&create_compute_pipeline_x)},
       {67, "CreatePipelineX (67)", reinterpret_cast<void*>(&create_pipeline_67)},
+      {70, "CreateShaderResourceViewX", reinterpret_cast<void*>(&create_view_x)},
       {73, "CreateCommandListX", reinterpret_cast<void*>(&create_command_list_x)},
       {86, "CreatePipelineState", reinterpret_cast<void*>(&create_pipeline_state)},
       {127, "CreateCommittedResourceX", reinterpret_cast<void*>(&create_committed_resource_x)},

@@ -60,6 +60,18 @@ bool parse_root_signature(const void* data, size_t size, RootSignatureDesc& out)
 // d3d12_xs!D3D12SerializeVersionedRootSignature(description, blob, error blob).
 HRESULT WINAPI serialize_versioned_root_signature(const void* desc, void** blob, void** error_blob);
 
+// The description of a root signature object of ours; nullptr for anything else.
+const RootSignatureDesc* root_signature_desc(const void* object);
+
+// The console's user data layout: each stage's root parameters (those visible to it, in order)
+// fill its user data SGPRs from 8 on: a descriptor table 1 (the low half of its GPU address),
+// a root CBV / SRV / UAV 2 (its address), root constants one each. Learned from the game's
+// shaders: their descriptor tables and root views are read from s8 (and s9), and a pixel
+// shader's primitive mask follows its last one. `visibility` is a D3D12_SHADER_VISIBILITY.
+// `args` holds each parameter's address, `constants` each parameter's 32-bit values.
+void user_data_sgprs(const RootSignatureDesc& desc, uint32_t visibility, const uint64_t* args,
+                     const std::vector<uint32_t>* constants, uint32_t* sgprs, uint32_t count);
+
 // Device slot 16, CreateRootSignature(node mask, blob, size, riid, out).
 HRESULT create_root_signature(uint32_t node_mask, const void* data, size_t size, const GUID* riid, void** out);
 

@@ -9,6 +9,9 @@
 #include <d3d12.h>
 
 #include <cstdint>
+#include <span>
+#include <string>
+#include <vector>
 
 namespace am::rt::d3d12x {
 
@@ -22,5 +25,16 @@ D3D12_CPU_DESCRIPTOR_HANDLE host_rtv(ID3D12Resource* texture, uint32_t format);
 D3D12_CPU_DESCRIPTOR_HANDLE host_dsv(ID3D12Resource* texture, uint32_t format);
 // Drops a console resource's host texture and its views (the console resource is going away).
 void forget_host_texture(const void* console_resource);
+
+// host_pipeline.cpp: the 24-byte marker (hex) of a shader container's program of a stage (a
+// stream subobject type: 1 VS, 2 PS, 6 CS); its precompiled DXIL; a host graphics pipeline
+// from a description (the translated root signature is filled in), or nullptr.
+std::string program_marker(std::span<const uint8_t> container, uint32_t subobject);
+bool load_precompiled(const std::string& marker, std::vector<uint8_t>& dxil);
+ID3D12PipelineState* make_host_graphics_pipeline(D3D12_GRAPHICS_PIPELINE_STATE_DESC desc, const char* what);
+
+// pipeline.cpp: a console pipeline's host pipeline (nullptr when there is none) and its console
+// root signature object.
+ID3D12PipelineState* host_pipeline(const void* console_pipeline, const void** root_signature);
 
 }  // namespace am::rt::d3d12x

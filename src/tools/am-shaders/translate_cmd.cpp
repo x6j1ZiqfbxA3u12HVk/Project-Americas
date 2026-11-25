@@ -9,6 +9,8 @@
 #include <fstream>
 #include <iterator>
 #include <map>
+#include <set>
+#include <span>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -302,6 +304,96 @@ int image_survey(const fs::path& pack_dir) {
   top(names, 60, "image instructions, all stages");
   top(cs_names, 40, "image instructions, compute");
   top(forms, 1000, "forms");
+  return 0;
+}
+
+// The 24-byte marker a console program starts with, as hex: the runtime's key for it.
+std::string marker_of(std::span<const uint8_t> code) {
+  static const char* const kHex = "0123456789abcdef";
+  std::string h;
+  for (size_t i = 0; i < 24 && i < code.size(); ++i) {
+    h += kHex[code[i] >> 4];
+    h += kHex[code[i] & 15];
+  }
+  return h;
+}
+
+int precompile(const fs::path& pack_dir, const fs::path& runtime_dir, const fs::path& out_dir, bool all) {
+  SetPriorityClass(GetCurrentProcess(), BELOW_NORMAL_PRIORITY_CLASS);
+  std::error_code ec;
+  fs::create_directories(out_dir, ec);
+  // The programs the game has used: the GPU programs of its slot 57 pipelines (by marker).
+  std::set<std::string> wanted;
+  std::vector<fs::path> files;
+  for (const auto& e : fs::directory_iterator(runtime_dir, ec)) {
+    if (e.path().extension() == L".dxbc") files.push_back(e.path());
+    if (e.path().extension() != L".cpipe") continue;
+    std::string error;
+    auto view = FileView::open(e.path(), error);
+    if (!view) continue;
+    const auto b = view->bytes();
+    for (size_t at = 0; at + 16 <= b.size();) {
+      uint64_t address;
+      uint32_t size, kind;
+      std::memcpy(&address, b.data() + at, 8);
+      std::memcpy(&size, b.data() + at + 8, 4);
+      std::memcpy(&kind, b.data() + at + 12, 4);
+      at += 16;
+      if (kind == 1 && at + 24 <= b.size()) wanted.insert(marker_of(b.subspan(at, 24)));
+      at += size;
+    }
+  }
+  for (const fs::path& f : containers(pack_dir)) files.push_back(f);
+  std::printf("precompile: %zu programs wanted from the game's pipelines, %zu containers to look through%s\n", wanted.size(),
+              files.size(), all ? " (all of their programs)" : "");
+  std::atomic<size_t> next{0}, done{0}, skipped{0}, failed{0};
+  std::mutex lock;
+  std::ofstream failures(out_dir / L"failures.tsv", std::ios::app);
+  std::vector<std::thread> workers;
+  for (unsigned w = 0; w < std::max(1u, std::thread::hardware_concurrency()); ++w) {
+    workers.emplace_back([&] {
+      for (size_t i; (i = next.fetch_add(1)) < files.size();) {
+        const bool runtime_file = files[i].parent_path() == runtime_dir;
+        std::string error;
+        const auto shader = load(files[i], error);
+        if (!shader) continue;
+        for (const shader::NativeBlob& b : shader->shader.blobs) {
+          for (const shader::NativeProgram& p : b.programs) {
+            if (p.stage != shader::HwStage::Vs && p.stage != shader::HwStage::Ps && p.stage != shader::HwStage::Cs) continue;
+            const std::string marker = marker_of(b.code(p));
+            if (!all && !runtime_file && !wanted.count(marker)) continue;
+            const fs::path out = out_dir / widen(marker + ".dxil");
+            if (fs::exists(out, ec)) {
+              ++skipped;
+              continue;
+            }
+            const shader::Translation t = shader::translate(input_of(shader->bytes, b, p), shader::Binding::Runtime);
+            std::string why = t.ok ? std::string() : t.failure;
+            host::CompileResult c;
+            if (t.ok) {
+              c = host::compile_hlsl(t.hlsl, t.entry, t.profile);
+              if (!c.ok) why = "DXC: " + c.messages.substr(0, 200);
+            }
+            std::lock_guard<std::mutex> g(lock);
+            if (!why.empty()) {
+              for (char& ch : why) {
+                if (ch == '\n' || ch == '\t') ch = ' ';
+              }
+              failures << marker << '\t' << shader::hw_stage_name(p.stage) << '\t' << why << '\n';
+              ++failed;
+              continue;
+            }
+            std::ofstream(out, std::ios::binary).write(reinterpret_cast<const char*>(c.dxil.data()), static_cast<std::streamsize>(c.dxil.size()));
+            ++done;
+            std::printf("  %s %s\n", shader::hw_stage_name(p.stage), marker.c_str());
+          }
+        }
+      }
+    });
+  }
+  for (std::thread& t : workers) t.join();
+  std::printf("precompile: %zu compiled, %zu there already, %zu failed (%s)\n", done.load(), skipped.load(), failed.load(),
+              narrow((out_dir / L"failures.tsv").wstring()).c_str());
   return 0;
 }
 

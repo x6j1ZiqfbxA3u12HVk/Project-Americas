@@ -323,6 +323,34 @@ HRESULT WINAPI serialize_versioned_root_signature(const void* desc, void** blob,
   return S_OK;
 }
 
+const RootSignatureDesc* root_signature_desc(const void* object) {
+  Object* o = object_of_kind(object, root_signature_kind());
+  return o ? &static_cast<RootSignature*>(o)->desc : nullptr;
+}
+
+void user_data_sgprs(const RootSignatureDesc& desc, uint32_t visibility, const uint64_t* args,
+                     const std::vector<uint32_t>* constants, uint32_t* sgprs, uint32_t count) {
+  uint32_t at = 8;
+  for (size_t k = 0; k < desc.parameters.size() && at < count; ++k) {
+    const RootParameter& p = desc.parameters[k];
+    if (p.visibility != D3D12_SHADER_VISIBILITY_ALL && p.visibility != visibility) continue;
+    switch (p.type) {
+      case D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE:
+        sgprs[at++] = static_cast<uint32_t>(args[k]);
+        break;
+      case D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS:
+        for (uint32_t c = 0; c < p.constants && at < count; ++c) {
+          sgprs[at++] = c < constants[k].size() ? constants[k][c] : 0u;
+        }
+        break;
+      default:  // root CBV / SRV / UAV
+        sgprs[at++] = static_cast<uint32_t>(args[k]);
+        if (at < count) sgprs[at++] = static_cast<uint32_t>(args[k] >> 32);
+        break;
+    }
+  }
+}
+
 HRESULT create_root_signature(uint32_t node_mask, const void* data, size_t size, const GUID* /*riid*/, void** out) {
   if (!out) return E_POINTER;
   *out = nullptr;

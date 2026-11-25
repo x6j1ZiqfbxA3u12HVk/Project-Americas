@@ -37,6 +37,9 @@ bool open_gpu_window(uint64_t address);
 // host GPU.
 ID3D12DescriptorHeap* translated_shader_heap();
 ID3D12RootSignature* translated_root_signature();
+// Graphics: the vertex stage's user data at root parameter 0, the pixel stage's at 1 (both b0,
+// 32 constants, each visible to its stage).
+ID3D12RootSignature* translated_graphics_root_signature();
 // Records the page table's pending updates into `list` (before work that reads them).
 void flush_page_table(ID3D12GraphicsCommandList* list);
 

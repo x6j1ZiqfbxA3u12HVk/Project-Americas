@@ -11,8 +11,11 @@
 
 #include <windows.h>
 #include <d3d12.h>
+#include <wrl/client.h>
 
+#include <algorithm>
 #include <atomic>
+#include <type_traits>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -23,6 +26,7 @@
 #include <vector>
 
 #include "runtime/d3d12x/d3d12x.h"
+#include "runtime/d3d12x/host.h"
 #include "runtime/d3d12x/object.h"
 #include "runtime/log.h"
 #include "runtime/process.h"
@@ -40,6 +44,7 @@ struct PipelineState : Object {
   Object* root_signature = nullptr;  // referenced
   std::vector<Shader> shaders;
   uint64_t extra[2] = {};
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> host;  // when its shaders are precompiled
   uint32_t console_programs = 0;  // slot 57: GPU programs given by address
   std::string console_name;       // slot 57: the saved blocks' file, and the programs' markers
 
@@ -198,6 +203,14 @@ std::string describe_pipeline(const void* object) {
   return text;
 }
 
+ID3D12PipelineState* host_pipeline(const void* object, const void** root_signature) {
+  Object* o = object_of_kind(object, pipeline_kind());
+  if (!o) return nullptr;
+  auto* p = static_cast<PipelineState*>(o);
+  if (root_signature) *root_signature = p->root_signature;
+  return p->host.Get();
+}
+
 HRESULT create_compute_pipeline(const D3D12_COMPUTE_PIPELINE_STATE_DESC* desc, uint64_t extra0, uint64_t extra1,
                                 const GUID* /*riid*/, void** out) {
   if (!out) return E_POINTER;
@@ -226,6 +239,23 @@ HRESULT create_pipeline_from_stream(const D3D12_PIPELINE_STATE_STREAM_DESC* desc
   PipelineState* p = new_pipeline("stream (slot 86)", nullptr);
   std::string types;
   size_t at = 0;
+  // The host description, with D3D12's defaults where the stream says nothing.
+  D3D12_GRAPHICS_PIPELINE_STATE_DESC host{};
+  host.SampleMask = UINT_MAX;
+  host.SampleDesc.Count = 1;
+  host.RasterizerState = {D3D12_FILL_MODE_SOLID, D3D12_CULL_MODE_BACK, FALSE, 0, 0.0f, 0.0f, TRUE, FALSE, FALSE, 0,
+                          D3D12_CONSERVATIVE_RASTERIZATION_MODE_OFF};
+  for (auto& rt : host.BlendState.RenderTarget) rt = {FALSE, FALSE, D3D12_BLEND_ONE, D3D12_BLEND_ZERO, D3D12_BLEND_OP_ADD,
+                                                      D3D12_BLEND_ONE, D3D12_BLEND_ZERO, D3D12_BLEND_OP_ADD, D3D12_LOGIC_OP_NOOP,
+                                                      D3D12_COLOR_WRITE_ENABLE_ALL};
+  host.DepthStencilState.DepthEnable = TRUE;
+  host.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+  host.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
+  host.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+  std::vector<D3D12_INPUT_ELEMENT_DESC> elements;
+  std::vector<std::string> names;
+  names.reserve(32);
+  const auto read = [&](auto& value) { std::memcpy(&value, stream + at + data_offset<std::remove_reference_t<decltype(value)>>(), sizeof value); };
   while (at + sizeof(UINT) <= desc->SizeInBytes) {
     uint32_t type = 0;
     std::memcpy(&type, stream + at, sizeof type);
@@ -246,8 +276,63 @@ HRESULT create_pipeline_from_stream(const D3D12_PIPELINE_STATE_STREAM_DESC* desc
       D3D12_SHADER_BYTECODE b{};
       std::memcpy(&b, stream + at + data_offset<D3D12_SHADER_BYTECODE>(), sizeof b);
       add_shader(p, type, b);
+    } else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND) {
+      read(host.BlendState);
+    } else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK) {
+      read(host.SampleMask);
+    } else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER) {
+      read(host.RasterizerState);
+    } else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL) {
+      read(host.DepthStencilState);
+    } else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1) {
+      D3D12_DEPTH_STENCIL_DESC1 d1{};
+      read(d1);
+      std::memcpy(&host.DepthStencilState, &d1, sizeof host.DepthStencilState);  // the same fields, then DepthBoundsTestEnable
+    } else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT) {
+      D3D12_INPUT_LAYOUT_DESC il{};
+      read(il);
+      for (UINT k = 0; il.pInputElementDescs && k < il.NumElements && k < 32; ++k) {
+        D3D12_INPUT_ELEMENT_DESC e = il.pInputElementDescs[k];
+        names.emplace_back(e.SemanticName ? e.SemanticName : "");
+        elements.push_back(e);
+      }
+    } else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_IB_STRIP_CUT_VALUE) {
+      read(host.IBStripCutValue);
+    } else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY) {
+      read(host.PrimitiveTopologyType);
+    } else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS) {
+      D3D12_RT_FORMAT_ARRAY f{};
+      read(f);
+      host.NumRenderTargets = std::min<UINT>(f.NumRenderTargets, 8);
+      for (UINT k = 0; k < host.NumRenderTargets; ++k) host.RTVFormats[k] = f.RTFormats[k];
+    } else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT) {
+      read(host.DSVFormat);
+    } else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC) {
+      read(host.SampleDesc);
     }
     at += size;
+  }
+  // The host pipeline, when every shader has been compiled ahead of time.
+  std::vector<std::vector<uint8_t>> dxil;
+  bool all = !p->shaders.empty();
+  for (const Shader& sh : p->shaders) {
+    std::vector<uint8_t> code;
+    if (sh.stage != D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS && sh.stage != D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS) all = false;
+    if (!all || !load_precompiled(program_marker(sh.bytecode, sh.stage), code)) {
+      all = false;
+      break;
+    }
+    (sh.stage == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS ? host.VS : host.PS) = {nullptr, 0};
+    dxil.push_back(std::move(code));
+    D3D12_SHADER_BYTECODE& b = sh.stage == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS ? host.VS : host.PS;
+    b = {dxil.back().data(), dxil.back().size()};
+  }
+  if (all) {
+    for (size_t k = 0; k < elements.size(); ++k) elements[k].SemanticName = names[k].c_str();
+    host.InputLayout = {elements.empty() ? nullptr : elements.data(), static_cast<UINT>(elements.size())};
+    // The host's typeless or sRGB render-target formats come from the title's view at draw time;
+    // the pipeline takes the description's.
+    p->host.Attach(make_host_graphics_pipeline(host, "a stream pipeline"));
   }
   static std::atomic<int> logged{0};
   if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {

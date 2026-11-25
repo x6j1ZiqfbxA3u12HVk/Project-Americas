@@ -13,6 +13,7 @@
 #include <cstring>
 
 #include "runtime/d3d12x/d3d12x.h"
+#include "runtime/d3d12x/formats.h"
 #include "runtime/d3d12x/layout.h"
 #include "runtime/d3d12x/object.h"
 #include "runtime/log.h"
@@ -41,9 +42,14 @@ void write_record(uint64_t dest, ViewKind kind, uint32_t format, uint64_t resour
   std::memcpy(reinterpret_cast<void*>(dest), &r, sizeof r);
 }
 
+// A CBV is a buffer descriptor (V#) over its range: translated shaders read it with
+// s_buffer_load as the console GPU does.
 void WINAPI create_cbv(Object* self, const D3D12_CONSTANT_BUFFER_VIEW_DESC* desc, uint64_t dest) {
   trace(self, 17, "CreateConstantBufferView", reinterpret_cast<uint64_t>(desc), dest, 0);
-  write_record(dest, ViewKind::Cbv, 0, desc ? desc->BufferLocation : 0);
+  if (!dest) return;
+  uint32_t v[8] = {};
+  if (desc) encode_buffer_descriptor(v, desc->BufferLocation, desc->SizeInBytes, 0);
+  std::memcpy(reinterpret_cast<void*>(dest), v, sizeof v);
 }
 
 void WINAPI create_srv(Object* self, Object* resource, const D3D12_SHADER_RESOURCE_VIEW_DESC* desc, uint64_t dest) {
@@ -164,6 +170,36 @@ D3D12_RESOURCE_ALLOCATION_INFO* WINAPI get_resource_allocation_info2(uint64_t a0
 }
 
 }  // namespace
+
+// RDNA 2's buffer descriptor: base address (48 bits), stride (14 bits), number of records, then
+// the destination channel selects (x y z w), a 32-bit float format, resource level 1, and an
+// out-of-bounds mode of 3 (raw: bounds by bytes) when the stride is 0, else 0 (by index).
+void encode_buffer_descriptor(uint32_t out[4], uint64_t base, uint64_t bytes, uint32_t stride) {
+  constexpr uint32_t kFormat32Float = 22;  // BUF_FMT_32_FLOAT
+  out[0] = static_cast<uint32_t>(base);
+  out[1] = static_cast<uint32_t>(base >> 32) & 0xFFFFu;
+  out[1] |= (stride & 0x3FFFu) << 16;
+  out[2] = static_cast<uint32_t>(stride ? bytes / stride : std::min<uint64_t>(bytes, 0xFFFFFFFFu));
+  out[3] = 4u | (5u << 3) | (6u << 6) | (7u << 9) | (kFormat32Float << 12) | (1u << 24) | ((stride ? 0u : 3u) << 28);
+}
+
+void write_shader_view(uint64_t dest, const D3D12_RESOURCE_DESC* resource, const D3D12_SHADER_RESOURCE_VIEW_DESC& view,
+                       uint64_t address) {
+  if (!dest) return;
+  if (view.ViewDimension == D3D12_SRV_DIMENSION_BUFFER) {
+    const uint32_t stride = view.Buffer.StructureByteStride;
+    const bool raw = (view.Buffer.Flags & D3D12_BUFFER_SRV_FLAG_RAW) != 0;
+    const FormatSize f = format_size(view.Format);
+    const uint64_t element = raw ? 4 : stride ? stride : std::max<uint32_t>(f.bytes, 1);
+    uint32_t v[8] = {};
+    encode_buffer_descriptor(v, address + view.Buffer.FirstElement * element, view.Buffer.NumElements * element,
+                             raw ? 0u : static_cast<uint32_t>(element));
+    std::memcpy(reinterpret_cast<void*>(dest), v, sizeof v);
+    return;
+  }
+  write_record(dest, ViewKind::Srv, view.Format, address);
+  (void)resource;
+}
 
 bool read_view(uint64_t descriptor, ViewInfo& out) {
   if (!descriptor) return false;

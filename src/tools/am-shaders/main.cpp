@@ -20,6 +20,10 @@
 //       on a sample, in <cache>\shaders\translation.json.
 //   am-shaders images [--out <dir>]
 //       Every image instruction of the corpus by its form and stage.
+//   am-shaders precompile [all] [--out <dir>]
+//       The programs the game's pipelines use (saved by the runtime in <cache>\shadersuntime),
+//       or with `all` every program, translated with the runtime's binding and compiled to
+//       <cache>\shaders\dxilt\<marker>.dxil, where the runtime loads them. Resumable.
 
 #include <windows.h>
 
@@ -57,7 +61,8 @@ int usage() {
                "       am-shaders disasm <hash prefix> [--out <dir>] [--raw <dir>]\n"
                "       am-shaders translate <hash prefix> [--out <dir>] [--raw <hlsl dir>]\n"
                "       am-shaders tsurvey [<programs to compile>] [--out <dir>] [--raw <hlsl dir>]\n"
-               "       am-shaders images [--out <dir>]\n");
+               "       am-shaders images [--out <dir>]\n"
+               "       am-shaders precompile [all] [--out <dir>]\n");
   return 2;
 }
 
@@ -264,6 +269,10 @@ int wmain(int argc, wchar_t** argv) {
     return tools::translate(narrow(positional[0]), out, raw.empty() ? out.parent_path() / L"hlsl" : raw);
   }
   if (command == L"images" && positional.empty()) return tools::image_survey(out);
+  if (command == L"precompile" && positional.size() <= 1) {
+    const bool all = !positional.empty() && positional[0] == L"all";
+    return tools::precompile(out, out.parent_path() / L"runtime", out.parent_path() / L"dxil" / L"rt", all);
+  }
   if (command == L"tsurvey" && positional.size() <= 1) {
     const size_t sample = positional.empty() ? 200 : std::stoul(positional[0]);
     return tools::translation_survey(out, out.parent_path() / L"translation.json", sample, raw);

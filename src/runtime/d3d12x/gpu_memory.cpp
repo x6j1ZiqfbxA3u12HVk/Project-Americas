@@ -34,7 +34,7 @@ struct GpuMemory {
   bool started = false, usable = false;
   ComPtr<ID3D12Device3> device;
   ComPtr<ID3D12DescriptorHeap> heap;
-  ComPtr<ID3D12RootSignature> root;
+  ComPtr<ID3D12RootSignature> root, graphics_root;
   ComPtr<ID3D12Resource> table;   // default heap, R32 entries
   ComPtr<ID3D12Resource> upload;  // the entries to copy in at the next flush
   std::vector<Window> windows;
@@ -80,6 +80,17 @@ struct GpuMemory {
     if (FAILED(D3D12SerializeVersionedRootSignature(&rd, &blob, &errors)) ||
         FAILED(device->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&root)))) {
       return fail("no root signature for translated programs");
+    }
+    D3D12_ROOT_PARAMETER1 stages[2]{};
+    stages[0].ParameterType = stages[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    stages[0].Constants = stages[1].Constants = {0, 0, kUserDataConstants};
+    stages[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+    stages[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    rd.Desc_1_1 = {2, stages, 0, nullptr, rd.Desc_1_1.Flags};
+    blob.Reset();
+    if (FAILED(D3D12SerializeVersionedRootSignature(&rd, &blob, &errors)) ||
+        FAILED(device->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&graphics_root)))) {
+      return fail("no graphics root signature for translated programs");
     }
     windows.emplace_back();  // window numbers start at 1: entry 0 means none
     usable = true;
@@ -268,6 +279,12 @@ ID3D12RootSignature* translated_root_signature() {
   std::lock_guard g(memory().lock);
   GpuMemory* m = ready();
   return m ? m->root.Get() : nullptr;
+}
+
+ID3D12RootSignature* translated_graphics_root_signature() {
+  std::lock_guard g(memory().lock);
+  GpuMemory* m = ready();
+  return m ? m->graphics_root.Get() : nullptr;
 }
 
 void flush_page_table(ID3D12GraphicsCommandList* list) {
