@@ -62,7 +62,8 @@ in 38 s and the median in 5 s.
 
 1. **Read your memory notes first** (`MEMORY.md` in your project memory). They hold standing
    rules not repeated here.
-2. **The game folder is read-only:** `E:\Movies\GTA6.Xbox.v1.0.2.1`. Open its files for reading
+2. **The game folder is read-only:** `C:\GTA6.Xbox.v1.0.2.1` (the user's copy on the fast drive; the original
+   `E:\Movies\GTA6.Xbox.v1.0.2.1` stays read-only too). Open its files for reading
    only. Never write, rename or delete anything there. Patches happen in memory, never on disk.
 3. **Everything generated goes under `C:\Project Americas`:** build trees, caches, logs, tools,
    save data. Nothing from the game, and nothing derived from it, goes into the repository.
@@ -101,7 +102,7 @@ in 38 s and the median in 5 s.
 * **Repository:** `C:\Users\Admin\Documents\GitHub\Project Americas`, remote `origin` on
   GitHub. A stale local branch `m0-foundations` exists; leave it unless the user says
   otherwise.
-* **Settings:** `C:\Project Americas\americas.ini` (`game_dir = E:\Movies\GTA6.Xbox.v1.0.2.1`).
+* **Settings:** `C:\Project Americas\americas.ini` (`game_dir = C:\GTA6.Xbox.v1.0.2.1`, a copy on the fast drive since 2026-11-25).
   `%AMERICAS_ROOT%` overrides the root, and the tests use that to log elsewhere.
 
 ### Build and test

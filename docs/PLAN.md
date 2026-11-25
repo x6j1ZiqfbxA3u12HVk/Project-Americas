@@ -30,7 +30,7 @@ plan targets all three:
 
 ## 2. Ground rules
 
-1. **The dump is read-only.** `E:\Movies\GTA6.Xbox.v1.0.2.1` is never written, renamed or
+1. **The dump is read-only.** `C:\GTA6.Xbox.v1.0.2.1` (the copy in use) and `E:\Movies\GTA6.Xbox.v1.0.2.1` are never written, renamed or
    deleted. Every handle to it is opened read-only, and a guard in our file layer refuses any
    write or delete there. Code patches (section 5.1) are made in memory only.
 2. **No game data in the repository.** That means no assets, code bytes, shader dumps, extracted
