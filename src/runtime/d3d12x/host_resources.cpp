@@ -123,6 +123,9 @@ ID3D12Resource* host_texture(const void* console_resource, bool create) {
   if (d.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) d.Flags &= ~D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
   d.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
   d.Alignment = 0;
+  // Multisampled targets are single-sampled here for now: shaders sample them as plain 2D
+  // textures (the console reads sample 0 that way), which D3D12 allows only without samples.
+  d.SampleDesc = {1, 0};
   D3D12_HEAP_PROPERTIES heap{};
   heap.Type = D3D12_HEAP_TYPE_DEFAULT;
   ComPtr<ID3D12Resource> t;
@@ -154,6 +157,16 @@ D3D12_CPU_DESCRIPTOR_HANDLE host_rtv(ID3D12Resource* texture, uint32_t format) {
   gpu->device->CreateRenderTargetView(texture, &v, slot);
   h.rtvs[key] = slot;
   return slot;
+}
+
+DXGI_FORMAT host_dsv_format(ID3D12Resource* texture, uint32_t format) {
+  if (!texture) return DXGI_FORMAT_UNKNOWN;
+  return depth_format(format ? static_cast<DXGI_FORMAT>(format) : texture->GetDesc().Format);
+}
+
+DXGI_FORMAT host_rtv_format(ID3D12Resource* texture, uint32_t format) {
+  if (!texture) return DXGI_FORMAT_UNKNOWN;
+  return typed_format(format ? static_cast<DXGI_FORMAT>(format) : texture->GetDesc().Format);
 }
 
 D3D12_CPU_DESCRIPTOR_HANDLE host_dsv(ID3D12Resource* texture, uint32_t format) {

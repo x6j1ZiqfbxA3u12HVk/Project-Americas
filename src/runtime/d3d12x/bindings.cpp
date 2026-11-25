@@ -40,7 +40,22 @@ struct Texture {
   TextureLayout layout;
   ComPtr<ID3D12Resource> resource;
   bool dirty = true;
+  uint64_t checksum = 0;  // of its bytes in title memory when last uploaded
 };
+
+// A quick checksum of title memory (0 when it cannot be read). Not every write to a texture's
+// memory passes through a path we see (the CPU, DirectStorage into physical pages), so the
+// textures are checked against their memory from time to time.
+uint64_t checksum_of(uint64_t address, uint64_t size) {
+  uint64_t h = 0x9E3779B97F4A7C15ull;
+  __try {
+    const auto* p = reinterpret_cast<const uint64_t*>(address);
+    for (uint64_t k = 0; k < size / 8; ++k) h = (h ^ p[k]) * 0x100000001B3ull + (h >> 29);
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    return 0;
+  }
+  return h;
+}
 
 // RDNA 2's sampler descriptor to D3D12's.
 D3D12_SAMPLER_DESC sampler_from(const uint32_t w[4], bool& compare) {
@@ -160,6 +175,7 @@ struct Bindings {
 
   void upload_texture(ID3D12GraphicsCommandList* list, Texture& t) {
     t.dirty = false;
+    t.checksum = checksum_of(t.address, t.size);
     const UINT subs = static_cast<UINT>(t.layout.subresources.size());
     std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> fp(subs);
     std::vector<UINT> rows(subs);
@@ -198,11 +214,26 @@ struct Bindings {
     retired.push_back(std::move(up));
   }
 
+  // Every 15th flush, textures whose memory changed since their upload are marked for another:
+  // in turn, up to 16 MiB of them a time.
+  size_t flushes = 0, next_check = 0;
+  void check_textures() {
+    if (++flushes % 15 || textures.empty()) return;
+    uint64_t budget = 16ull << 20;
+    for (size_t n = 0; n < textures.size() && budget; ++n) {
+      Texture& t = textures[next_check++ % textures.size()];
+      if (t.dirty || !t.resource || t.size > budget) continue;
+      budget -= t.size;
+      if (checksum_of(t.address, t.size) != t.checksum) t.dirty = true;
+    }
+  }
+
   void flush(ID3D12GraphicsCommandList* list) {
     if (!usable) return;
     // Uploads of two submissions ago have run (one queue, in order, a frame or more apart).
     if (retired.size() > 256) retired.erase(retired.begin(), retired.begin() + static_cast<ptrdiff_t>(retired.size() / 2));
     take_misses();
+    check_textures();
     for (Texture& t : textures) {
       if (t.dirty && t.resource) upload_texture(list, t);
     }
@@ -311,7 +342,7 @@ uint32_t image_format(uint32_t dxgi) {
 }
 
 void bind_texture_view(const D3D12_RESOURCE_DESC& resource, const D3D12_SHADER_RESOURCE_VIEW_DESC& view, uint64_t address,
-                       uint32_t words[8]) {
+                       uint32_t words[8], ID3D12Resource* host) {
   std::memset(words, 0, 32);
   const uint32_t format = view.Format ? view.Format : resource.Format;
   const uint32_t mips = std::max<uint32_t>(resource.MipLevels, 1);
@@ -338,6 +369,31 @@ void bind_texture_view(const D3D12_RESOURCE_DESC& resource, const D3D12_SHADER_R
   if (!b) return;
   for (const auto& i : b->images) {
     if (std::equal(i.words, i.words + 8, words)) return;  // the same view again
+  }
+  if (host) {
+    // A texture the GPU renders into: its own view, no copy from title memory.
+    if (host->GetDesc().SampleDesc.Count > 1) return;  // multisampled: a view of its own kind, not yet
+    D3D12_CPU_DESCRIPTOR_HANDLE slot{};
+    const uint32_t index = allocate_view_slot(&slot);
+    if (!index) return;
+    D3D12_SHADER_RESOURCE_VIEW_DESC v = view;
+    if (!v.Format) v.Format = resource.Format;
+    v.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    v.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    v.Texture2D = {0, mips, 0, 0.0f};
+    b->device->CreateShaderResourceView(host, &v, slot);
+    shader::ImageBinding ib;
+    std::copy(words, words + 8, ib.words);
+    ib.srv = ib.alt = index;
+    ib.flags = shader::kImageFloat;
+    b->images.push_back(ib);
+    b->table_dirty = true;
+    static std::atomic<int> told{0};
+    if (told.fetch_add(1) < 16) {
+      logf("gpu: texture %ux%u, format %u, at 0x%s: the GPU's own (a render target): view %u", width, height, format,
+           hex(address).c_str(), index);
+    }
+    return;
   }
   Texture t;
   t.address = address;

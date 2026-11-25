@@ -318,7 +318,7 @@ std::string marker_of(std::span<const uint8_t> code) {
   return h;
 }
 
-int precompile(const fs::path& pack_dir, const fs::path& runtime_dir, const fs::path& out_dir, bool all) {
+int precompile(const fs::path& pack_dir, const fs::path& runtime_dir, const fs::path& out_dir, bool all, const fs::path& hlsl_dir) {
   SetPriorityClass(GetCurrentProcess(), BELOW_NORMAL_PRIORITY_CLASS);
   std::error_code ec;
   fs::create_directories(out_dir, ec);
@@ -363,11 +363,22 @@ int precompile(const fs::path& pack_dir, const fs::path& runtime_dir, const fs::
             const std::string marker = marker_of(b.code(p));
             if (!all && !runtime_file && !wanted.count(marker)) continue;
             const fs::path out = out_dir / widen(marker + ".dxil");
-            if (fs::exists(out, ec)) {
+            const bool have = fs::exists(out, ec);
+            if (have && hlsl_dir.empty()) {
               ++skipped;
               continue;
             }
             const shader::Translation t = shader::translate(input_of(shader->bytes, b, p), shader::Binding::Runtime);
+            // With --raw, every wanted program's HLSL too (for reading it), compiled or not.
+            if (!hlsl_dir.empty() && t.ok) {
+              fs::create_directories(hlsl_dir, ec);
+              std::ofstream(hlsl_dir / widen(marker + ".hlsl"), std::ios::binary) << t.hlsl;
+            }
+            if (have) {
+              std::lock_guard<std::mutex> g(lock);
+              ++skipped;
+              continue;
+            }
             std::string why = t.ok ? std::string() : t.failure;
             host::CompileResult c;
             if (t.ok) {

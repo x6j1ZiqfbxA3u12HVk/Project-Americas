@@ -28,7 +28,7 @@ int image_survey(const std::filesystem::path& pack_dir);
 // program with `all`) to <out>\<marker>.dxil, where the runtime looks them up. Resumable: what
 // is there is skipped.
 int precompile(const std::filesystem::path& pack_dir, const std::filesystem::path& runtime_dir,
-               const std::filesystem::path& out_dir, bool all);
+               const std::filesystem::path& out_dir, bool all, const std::filesystem::path& hlsl_dir = {});
 int translation_survey(const std::filesystem::path& pack_dir, const std::filesystem::path& out_json, size_t compile_sample,
                        const std::filesystem::path& hlsl_dir = {});
 

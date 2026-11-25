@@ -20,9 +20,10 @@
 
 namespace am::rt::d3d12x {
 
-// A texture view's T# (written to `words`), its host texture and its table entry.
+// A texture view's T# (written to `words`), its host texture and its table entry. With `host`
+// (a texture the GPU renders into), the entry views that texture: nothing is uploaded.
 void bind_texture_view(const D3D12_RESOURCE_DESC& resource, const D3D12_SHADER_RESOURCE_VIEW_DESC& view, uint64_t address,
-                       uint32_t words[8]);
+                       uint32_t words[8], ID3D12Resource* host = nullptr);
 // The title's memory in [address, address + size) was written: textures over it are uploaded
 // again at the next submission.
 void notify_title_write(uint64_t address, uint64_t size);

@@ -15,10 +15,12 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <string>
 
+#include "core/text.h"
 #include "runtime/d3d12x/bindings.h"
 #include "runtime/d3d12x/commands.h"
 #include "runtime/d3d12x/d3d12x.h"
@@ -78,6 +80,14 @@ struct HostList {
   std::vector<uint32_t> constants[kParams];
   bool bound = false;  // the translated root signature and heap are set in the host list
   bool flushed = false;  // it holds the image bindings' upkeep (and their misses' readback)
+  DXGI_FORMAT targets[8] = {};  // the bound render targets' view formats
+  uint32_t target_count = 0;
+  // What this host list has been given (D3D12 lists inherit nothing from each other).
+  bool has_viewport = false, has_scissor = false, has_topology = false, has_depth = false;
+  uint32_t topology = 0;
+  DXGI_FORMAT depth_format = DXGI_FORMAT_UNKNOWN;  // the bound depth view's format
+  bool rect_list = false;  // the console's rect list topology is set
+  D3D12_VIEWPORT viewport{};
 };
 
 struct CommandList : Object {
@@ -178,6 +188,7 @@ ID3D12GraphicsCommandList* host_begin(CommandList* l) {
   h.states.clear();
   h.bound = false;
   h.flushed = false;
+  h.has_viewport = h.has_scissor = h.has_topology = false;
   return h.list.Get();
 }
 
@@ -215,10 +226,18 @@ void host_close(HostList& h) {
   }
   if (!back.empty()) h.list->ResourceBarrier(static_cast<UINT>(back.size()), back.data());
   h.states.clear();
-  const bool ok = SUCCEEDED(h.list->Close());
+  const HRESULT hr = h.list->Close();
+  const bool ok = SUCCEEDED(hr);
   h.open = false;
   h.ready = ok;
   if (!ok) h.allocators[h.current].fence = 0;
+  // A list the host refuses is dropped whole, its draws with it: say so.
+  static std::atomic<uint64_t> closed{0}, refused{0};
+  ++closed;
+  if (!ok && refused.fetch_add(1, std::memory_order_relaxed) < 8) {
+    logf("gpu: the host refused a command list at Close (0x%08lx); %llu of %llu so far", static_cast<unsigned long>(hr),
+         static_cast<unsigned long long>(refused.load()), static_cast<unsigned long long>(closed.load()));
+  }
 }
 
 // A console render-target (or depth) descriptor as a host view, the texture moved into `state`.
@@ -271,14 +290,20 @@ bool track(HostList& h, const Recording& r, const Command& c) {
 }
 
 std::atomic<uint64_t> g_draws_run{0}, g_draws_skipped{0};
+constexpr uint64_t kRectListTopology = 17;
+
+void note_unreachable_buffer() {
+  static std::atomic<int> logged{0};
+  if (logged.fetch_add(1, std::memory_order_relaxed) < 8) logf("gpu: a vertex or index buffer outside GPU-reachable title memory (bound null)");
+}
 
 // A draw, when its pipeline has a host pipeline: the translated root signature and heaps, the
 // image binding table, each stage's user data, the draw.
 void draw(HostList& h, ID3D12GraphicsCommandList* list, const Command& c) {
   const void* rs_object = nullptr;
-  ID3D12PipelineState* pso = host_pipeline(h.pipeline, &rs_object);
+  ID3D12PipelineState* pso = host_pipeline(h.pipeline, &rs_object, h.targets, h.target_count, h.depth_format, h.rect_list);
   const RootSignatureDesc* rs = root_signature_desc(h.root_signature ? h.root_signature : rs_object);
-  if (!pso || !rs || c.op != kDrawInstanced) {
+  if (!pso || !rs) {
     ++g_draws_skipped;
     return;
   }
@@ -303,7 +328,12 @@ void draw(HostList& h, ID3D12GraphicsCommandList* list, const Command& c) {
   list->SetPipelineState(pso);
   list->SetGraphicsRoot32BitConstants(0, kUserDataConstants, vs, 0);
   list->SetGraphicsRoot32BitConstants(1, kUserDataConstants, ps, 0);
-  list->DrawInstanced(static_cast<UINT>(c.a[0]), static_cast<UINT>(c.a[1]), static_cast<UINT>(c.a[2]), static_cast<UINT>(c.a[3]));
+  if (c.op == kDrawIndexedInstanced) {
+    list->DrawIndexedInstanced(static_cast<UINT>(c.a[0]), static_cast<UINT>(c.a[1]), static_cast<UINT>(c.a[2]),
+                               static_cast<INT>(c.a[3]), static_cast<UINT>(c.a[4]));
+  } else {
+    list->DrawInstanced(static_cast<UINT>(c.a[0]), static_cast<UINT>(c.a[1]), static_cast<UINT>(c.a[2]), static_cast<UINT>(c.a[3]));
+  }
   ++g_draws_run;
 }
 
@@ -320,8 +350,10 @@ void forward(CommandList* l, const Command& c) {
     case kSetScissorRects:
     case kSetPrimitiveTopology:
     case kSetBlendFactor:
-    case kSetStencilRef: break;
-    default: return;  // draws, dispatches and bindings wait for pipelines and the binding model
+    case kSetStencilRef:
+    case kSetVertexBuffers:
+    case kSetIndexBuffer: break;
+    default: return;  // dispatches and the other bindings wait for pipelines and the binding model
   }
   ID3D12GraphicsCommandList* list = host_begin(l);
   if (!list) return;
@@ -333,7 +365,17 @@ void forward(CommandList* l, const Command& c) {
       const D3D12_CPU_DESCRIPTOR_HANDLE view = host_view(h, c.a[0], false);
       if (!view.ptr || c.data_size < 16) return;
       const UINT rects = static_cast<UINT>(c.a[2]);
-      list->ClearRenderTargetView(view, reinterpret_cast<const float*>(data), rects && c.data_size >= 16 + rects * 16 ? rects : 0,
+      static const bool debug_clear = [] {
+        char* v = nullptr;
+        size_t n = 0;
+        const bool on = _dupenv_s(&v, &n, "AMERICAS_DEBUG_PS") == 0 && v;
+        std::free(v);
+        return on;
+      }();
+      static const float kDebugColor[4] = {0.0f, 0.0f, 0.4f, 1.0f};  // AMERICAS_DEBUG_PS: clears show dark blue
+      if (debug_clear && GetEnvironmentVariableA("AMERICAS_DEBUG_NOCLEAR", nullptr, 0)) return;
+      list->ClearRenderTargetView(view, debug_clear ? kDebugColor : reinterpret_cast<const float*>(data),
+                                  rects && c.data_size >= 16 + rects * 16 ? rects : 0,
                                   rects ? reinterpret_cast<const D3D12_RECT*>(data + 16) : nullptr);
       return;
     }
@@ -352,29 +394,89 @@ void forward(CommandList* l, const Command& c) {
       const size_t given = (range ? (count ? 1 : 0) : count);
       if (given * 8 > c.data_size) return;
       D3D12_CPU_DESCRIPTOR_HANDLE views[D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
+      h.target_count = 0;
       for (UINT i = 0; i < count; ++i) {
         const uint64_t console = range ? handles[0] + uint64_t{i} * descriptor_size(D3D12_DESCRIPTOR_HEAP_TYPE_RTV) : handles[i];
         views[i] = host_view(h, console, false);
         if (!views[i].ptr) return;  // a target we cannot show: the draws after it are skipped anyway
+        ViewInfo v;
+        h.targets[i] = read_view(console, v) ? host_rtv_format(host_texture(reinterpret_cast<const void*>(v.resource)), v.format)
+                                             : DXGI_FORMAT_UNKNOWN;
+        static std::atomic<int> logged{0};
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 12) {
+          D3D12_RESOURCE_DESC d{};
+          uint64_t at = 0;
+          resource_memory(reinterpret_cast<const void*>(v.resource), &d, &at);
+          logf("gpu: render target %u: %llux%u format %u (view %u) at 0x%s", i, static_cast<unsigned long long>(d.Width), d.Height,
+               d.Format, h.targets[i], hex(at).c_str());
+        }
       }
+      h.target_count = count;
       D3D12_CPU_DESCRIPTOR_HANDLE depth{};
+      h.depth_format = DXGI_FORMAT_UNKNOWN;
       if (c.a[3] && c.data_size >= given * 8 + 8) {
         depth = host_view(h, handles[given], true);
+        ViewInfo v;
+        if (depth.ptr && read_view(handles[given], v)) {
+          h.depth_format = host_dsv_format(host_texture(reinterpret_cast<const void*>(v.resource)), v.format);
+        }
       }
       list->OMSetRenderTargets(count, count ? views : nullptr, FALSE, depth.ptr ? &depth : nullptr);
+      h.has_depth = depth.ptr != 0;
       return;
     }
     case kSetViewports:
-      if (data) list->RSSetViewports(static_cast<UINT>(c.data_size / sizeof(D3D12_VIEWPORT)), reinterpret_cast<const D3D12_VIEWPORT*>(data));
+      if (data && c.data_size >= sizeof(D3D12_VIEWPORT)) {
+        list->RSSetViewports(static_cast<UINT>(c.data_size / sizeof(D3D12_VIEWPORT)), reinterpret_cast<const D3D12_VIEWPORT*>(data));
+        h.has_viewport = true;
+        std::memcpy(&h.viewport, data, sizeof h.viewport);
+      }
       return;
     case kSetScissorRects:
-      if (data) list->RSSetScissorRects(static_cast<UINT>(c.data_size / sizeof(D3D12_RECT)), reinterpret_cast<const D3D12_RECT*>(data));
+      if (data) {
+        list->RSSetScissorRects(static_cast<UINT>(c.data_size / sizeof(D3D12_RECT)), reinterpret_cast<const D3D12_RECT*>(data));
+        h.has_scissor = true;
+      }
       return;
-    case kSetPrimitiveTopology: list->IASetPrimitiveTopology(static_cast<D3D12_PRIMITIVE_TOPOLOGY>(c.a[0])); return;
+    case kSetPrimitiveTopology:
+      // The console's rect list (17: three corners of a rectangle) is drawn as triangles, and the
+      // pipeline adds the fourth corner (host_pipeline).
+      h.rect_list = c.a[0] == kRectListTopology;
+      list->IASetPrimitiveTopology(h.rect_list ? D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST : static_cast<D3D12_PRIMITIVE_TOPOLOGY>(c.a[0]));
+      h.has_topology = true;
+      h.topology = static_cast<uint32_t>(c.a[0]);
+      return;
     case kSetBlendFactor: list->OMSetBlendFactor(reinterpret_cast<const float*>(data)); return;
     case kSetStencilRef: list->OMSetStencilRef(static_cast<UINT>(c.a[0])); return;
     case kDrawInstanced:
     case kDrawIndexedInstanced: draw(h, list, c); return;
+    // Vertex and index buffers in place: title memory at its host GPU address (null when the
+    // memory cannot be reached that way yet).
+    case kSetVertexBuffers: {
+      const UINT start = static_cast<UINT>(c.a[0]);
+      const UINT count = std::min<UINT>(static_cast<UINT>(c.a[1]), D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT);
+      if (!data || c.data_size < count * sizeof(D3D12_VERTEX_BUFFER_VIEW) || start + count > D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT) return;
+      D3D12_VERTEX_BUFFER_VIEW views[D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT];
+      std::memcpy(views, data, count * sizeof(D3D12_VERTEX_BUFFER_VIEW));
+      for (UINT i = 0; i < count; ++i) {
+        views[i].BufferLocation = host_gpu_address(views[i].BufferLocation, views[i].SizeInBytes);
+        if (!views[i].BufferLocation) {
+          views[i].SizeInBytes = 0;
+          note_unreachable_buffer();
+        }
+      }
+      list->IASetVertexBuffers(start, count, views);
+      return;
+    }
+    case kSetIndexBuffer: {
+      if (!data || c.data_size < sizeof(D3D12_INDEX_BUFFER_VIEW)) return;
+      D3D12_INDEX_BUFFER_VIEW v;
+      std::memcpy(&v, data, sizeof v);
+      v.BufferLocation = host_gpu_address(v.BufferLocation, v.SizeInBytes);
+      if (!v.BufferLocation) note_unreachable_buffer();
+      list->IASetIndexBuffer(v.BufferLocation ? &v : nullptr);
+      return;
+    }
     default: return;
   }
 }

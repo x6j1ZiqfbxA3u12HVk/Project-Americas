@@ -468,11 +468,50 @@ Translated shaders read textures and samplers through the binding table the runt
   (slot 86) runs every frame. The slot 57 and slot 55 draws still wait: host pipelines exist
   only for stream pipelines so far, so the textured UI draw cannot be checked yet.
 
+## The console's own pipelines (slot 57) on the host (done, 2026-11-25)
+
+The boot screen's last draw (slot 57, the UI composite: a full-screen textured rectangle into
+the back buffer) now runs on the GPU: 2 of the frame's 3 draws, no debug-layer error.
+
+* **Slot 57's blocks** (`pipeline.cpp`, saved as `cache\shaders\runtime\*.cpipe`): block 0 is
+  register state, block 1 the input layout, then each program after its own metadata.
+  * Block 0 at 0xD0: CB_BLEND0..7_CONTROL (checked on 8,000 pipelines: blend off in 56 %, then
+    alpha, multiply, additive, premultiplied). Mapped to D3D12 blend states.
+  * Block 1: at 0x4C the element count, then per element a name length, the name, and the six
+    fields of a D3D12_INPUT_ELEMENT_DESC.
+  * Programs: their DXIL by marker (rt4); the DXIL program header says vertex or pixel.
+  * Host pipelines are made at the first draw, per set of target and depth formats (key in
+    `ConsolePipeline::made`). Not read yet: rasterizer (no culling), depth state (off).
+* **Topology 17 is the console's rect list** (three corners; the UI draws 3 vertices). The host
+  draws triangles and a generated geometry shader adds the fourth corner opposite the
+  right-angle vertex (from the vertex shader's OSG1 signature).
+* **Vertex and index buffers** bind title memory in place (`host_gpu_address`: a window of its
+  own allocation, or pages in a row in the committed pool).
+* **Render targets as textures:** slot 18 `CreateShaderResourceView` now writes a T#; for render
+  and depth targets the table entry views the GPU's own host texture (no copy).
+* **Multisampled targets are single-sampled on the host** for now (shaders sample them as 2D).
+* **Depth format:** the bound depth view's format is the pipeline's (D3D12 requires the match).
+* **Textures from title memory are checked against it** every 15th flush (a checksum, 16 MiB a
+  time) and uploaded again when they changed: CPU writes and DirectStorage page writes too.
+* **Diagnostics** (environment variables):
+  * `AMERICAS_CAPTURE=300,900`: those frames saved as `logs\frame-<n>.bmp`;
+  * `AMERICAS_D3D12_DEBUG=1`: D3D12's debug layer, its warnings and errors in `run.log`;
+  * `AMERICAS_DEBUG_PS=1`: slot 57 pixel shaders replaced by solid magenta, clears dark blue
+    (`AMERICAS_DEBUG_NOCLEAR` skips clears); `AMERICAS_DEBUG_VS=1` (and `_VS_ID`): a simple
+    vertex shader. These split "nothing drawn" into its causes quickly.
+  * `am-shaders precompile --raw <dir>` writes the HLSL of every program it would compile.
+* **Why the picture is still black:** the composite samples the intermediate target at
+  `0xddcfc0000`, which the stream draw (slot 86) and the slot 55 draw render. **Slot 55's
+  descriptions are not decoded** (no shader container is found in them), so its draw is
+  skipped and the intermediate stays black. That is the next step.
+
 After that, from the plan:
 
-* **Next:** slot 57 PSO state from metadata block 0 (0x184 bytes) and its input layout from
-  block 1. Then check the UI draw: sga_dr_vs_pos_color_tex + default_ps_tex, whose S# is
-  built inline (s0=1024, s1=0x00c00000, s2=0x18f00000, s3=0).
+* **Next: slot 55's pipelines.** Decode its descriptions (device.cpp `create_pipeline_55`: (0,
+  count, descriptions, riid, out); the game passes 2 descriptions in some calls), find their
+  programs and state, and make host pipelines as for slot 57. Then capture frames
+  (`AMERICAS_CAPTURE`) to see the boot screen.
+* Slot 57: the rasterizer and depth registers in block 0.
 * VB/IB views from console addresses.
 * Slot 55's shaders.
 * GFX10 detiling for textures.

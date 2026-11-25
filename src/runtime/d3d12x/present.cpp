@@ -14,6 +14,9 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
+#include <fstream>
+#include <vector>
 #include <string>
 
 #include "core/text.h"
@@ -23,6 +26,7 @@
 #include "runtime/d3d12x/layout.h"
 #include "runtime/d3d12x/object.h"
 #include "runtime/log.h"
+#include "runtime/process.h"
 #include "runtime/present/presenter.h"
 #include "runtime/present/window.h"
 
@@ -50,6 +54,60 @@ present::Presenter* presenter() {
 }
 
 // The frame rate in the title bar, once a second.
+// AMERICAS_CAPTURE lists frame numbers (as "300,1500"): those frames are saved, as shown, to
+// <logs>\frame-<n>.bmp. For looking at what the back end draws without watching the window.
+bool capture_wanted(uint64_t frame) {
+  static const std::vector<uint64_t> frames = [] {
+    std::vector<uint64_t> f;
+    char* text = nullptr;
+    size_t size = 0;
+    if (_dupenv_s(&text, &size, "AMERICAS_CAPTURE") == 0 && text) {
+      for (char* p = text; *p;) {
+        char* end = nullptr;
+        const unsigned long long n = std::strtoull(p, &end, 10);
+        if (end == p) break;
+        f.push_back(n);
+        p = *end ? end + 1 : end;
+      }
+      std::free(text);
+    }
+    return f;
+  }();
+  return std::find(frames.begin(), frames.end(), frame) != frames.end();
+}
+
+// Rows of 8-bit RGBA or BGRA (as the swap chain holds them) as a 24-bit BMP, bottom row first.
+void save_bmp(uint64_t frame, const std::vector<uint8_t>& pixels, uint32_t width, uint32_t height, bool rgba) {
+  TitleProcess* p = process();
+  if (!p || p->logs_dir().empty() || pixels.size() < uint64_t{width} * height * 4) return;
+  const uint32_t row = (width * 3 + 3) & ~3u, image = row * height;
+  uint8_t header[54] = {'B', 'M'};
+  const auto put = [&](size_t at, uint32_t v) { std::memcpy(header + at, &v, 4); };
+  put(2, 54 + image);
+  put(10, 54);
+  put(14, 40);
+  put(18, width);
+  put(22, height);
+  header[26] = 1;
+  header[28] = 24;
+  put(34, image);
+  std::vector<uint8_t> out(image, 0);
+  for (uint32_t y = 0; y < height; ++y) {
+    const uint8_t* from = pixels.data() + uint64_t{height - 1 - y} * width * 4;
+    uint8_t* to = out.data() + uint64_t{y} * row;
+    for (uint32_t x = 0; x < width; ++x, from += 4, to += 3) {
+      to[0] = rgba ? from[2] : from[0];
+      to[1] = from[1];
+      to[2] = rgba ? from[0] : from[2];
+    }
+  }
+  const std::filesystem::path file = p->logs_dir() / ("frame-" + std::to_string(frame) + ".bmp");
+  std::ofstream f(file, std::ios::binary);
+  f.write(reinterpret_cast<const char*>(header), sizeof header);
+  f.write(reinterpret_cast<const char*>(out.data()), static_cast<std::streamsize>(out.size()));
+  logf("present: frame %llu saved to %s", static_cast<unsigned long long>(frame), file.string().c_str());
+}
+
 void count_frame(bool shown) {
   static LARGE_INTEGER frequency{}, since{};
   static uint64_t frames = 0, total = 0;
@@ -110,7 +168,13 @@ HRESULT WINAPI queue_present_x(Object* self, UINT plane_count, const void* plane
              width, height, static_cast<unsigned long long>(desc.Width), desc.Height, desc.Format, hex(address).c_str(),
              plane.color_space);
       }
-      if (present::Presenter* p = presenter()) shown = p->present(image);
+      static std::atomic<uint64_t> presented{0};
+      const uint64_t frame = ++presented;
+      const DXGI_FORMAT shown_as = present::swap_chain_format(image.format);
+      const bool capture = capture_wanted(frame) && (shown_as == DXGI_FORMAT_R8G8B8A8_UNORM || shown_as == DXGI_FORMAT_B8G8R8A8_UNORM);
+      std::vector<uint8_t> pixels;
+      if (present::Presenter* p = presenter()) shown = p->present(image, capture ? &pixels : nullptr);
+      if (capture && shown) save_bmp(frame, pixels, width, height, shown_as == DXGI_FORMAT_R8G8B8A8_UNORM);
     }
   }
   count_frame(shown);

@@ -1,5 +1,9 @@
 #include "runtime/present/host_gpu.h"
 
+#include <d3d12sdklayers.h>
+
+#include <atomic>
+
 #include "core/text.h"
 #include "runtime/log.h"
 
@@ -32,7 +36,20 @@ void HostGpu::wait(uint64_t value) {
 
 namespace {
 
+// AMERICAS_D3D12_DEBUG: D3D12's debug layer, its warnings and errors in our log (the first 200).
+void CALLBACK on_debug_message(D3D12_MESSAGE_CATEGORY, D3D12_MESSAGE_SEVERITY severity, D3D12_MESSAGE_ID id, LPCSTR text, void*) {
+  static std::atomic<int> told{0};
+  if (severity > D3D12_MESSAGE_SEVERITY_WARNING || told.fetch_add(1, std::memory_order_relaxed) >= 200) return;
+  logf("d3d12 debug (%s, id %d): %s", severity <= D3D12_MESSAGE_SEVERITY_ERROR ? "error" : "warning", static_cast<int>(id), text);
+}
+
 HostGpu* make() {
+  const bool debug = GetEnvironmentVariableA("AMERICAS_D3D12_DEBUG", nullptr, 0) != 0;
+  if (debug) {
+    ComPtr<ID3D12Debug> d;
+    if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&d)))) d->EnableDebugLayer();
+    else logf("gpu: no D3D12 debug layer (install Windows' Graphics Tools)");
+  }
   auto* g = new HostGpu;
   if (FAILED(CreateDXGIFactory2(0, IID_PPV_ARGS(&g->factory)))) {
     logf("gpu: no DXGI factory");
@@ -46,6 +63,14 @@ HostGpu* make() {
   if (FAILED(D3D12CreateDevice(g->adapter.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&g->device)))) {
     logf("gpu: no D3D12 device; frames are counted but not drawn");
     return nullptr;
+  }
+  if (debug) {
+    ComPtr<ID3D12InfoQueue1> q;
+    DWORD cookie = 0;
+    if (SUCCEEDED(g->device.As(&q)) &&
+        SUCCEEDED(q->RegisterMessageCallback(&on_debug_message, D3D12_MESSAGE_CALLBACK_FLAG_NONE, nullptr, &cookie))) {
+      logf("gpu: D3D12 debug layer on; its messages follow in this log");
+    }
   }
   D3D12_COMMAND_QUEUE_DESC qd{};
   qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;

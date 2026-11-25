@@ -17,8 +17,11 @@
 #include <atomic>
 #include <type_traits>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <map>
+#include <memory>
 #include <fstream>
 #include <mutex>
 #include <set>
@@ -26,7 +29,9 @@
 #include <vector>
 
 #include "runtime/d3d12x/d3d12x.h"
+#include "host/dxc_compile.h"
 #include "runtime/d3d12x/host.h"
+#include "shader/container.h"
 #include "runtime/d3d12x/object.h"
 #include "runtime/log.h"
 #include "runtime/process.h"
@@ -39,6 +44,19 @@ struct Shader {
   std::vector<uint8_t> bytecode;
 };
 
+// Slot 57: what a console pipeline's host pipelines are made from, at their first draw (one for
+// each set of render-target formats it is drawn with).
+struct ConsolePipeline {
+  std::vector<std::string> markers;  // its GPU programs, in order (precompiled DXIL by marker)
+  std::vector<D3D12_INPUT_ELEMENT_DESC> elements;
+  std::vector<std::string> names;  // the elements' semantic names
+  bool layout_ok = false;
+  uint32_t blend[8] = {};  // CB_BLEND0..7_CONTROL, from the first metadata block
+  std::mutex lock;
+  bool failed = false;  // its programs are not all precompiled: not tried again
+  std::map<std::vector<uint32_t>, Microsoft::WRL::ComPtr<ID3D12PipelineState>> made;
+};
+
 struct PipelineState : Object {
   const char* made_by = "";
   Object* root_signature = nullptr;  // referenced
@@ -47,11 +65,15 @@ struct PipelineState : Object {
   Microsoft::WRL::ComPtr<ID3D12PipelineState> host;  // when its shaders are precompiled
   uint32_t console_programs = 0;  // slot 57: GPU programs given by address
   std::string console_name;       // slot 57: the saved blocks' file, and the programs' markers
+  std::unique_ptr<ConsolePipeline> console;
 
   ~PipelineState() {
     if (root_signature) release(root_signature);
   }
 };
+
+ID3D12PipelineState* console_host_pipeline(ConsolePipeline& c, const DXGI_FORMAT* targets, uint32_t count, DXGI_FORMAT depth,
+                                           bool rect_list);
 
 const Kind& pipeline_kind() {
   static const Kind k("pipeline state", 16, {});
@@ -203,12 +225,14 @@ std::string describe_pipeline(const void* object) {
   return text;
 }
 
-ID3D12PipelineState* host_pipeline(const void* object, const void** root_signature) {
+ID3D12PipelineState* host_pipeline(const void* object, const void** root_signature, const DXGI_FORMAT* targets,
+                                   uint32_t target_count, DXGI_FORMAT depth, bool rect_list) {
   Object* o = object_of_kind(object, pipeline_kind());
   if (!o) return nullptr;
   auto* p = static_cast<PipelineState*>(o);
   if (root_signature) *root_signature = p->root_signature;
-  return p->host.Get();
+  if (p->host) return p->host.Get();
+  return p->console ? console_host_pipeline(*p->console, targets, target_count, depth, rect_list) : nullptr;
 }
 
 HRESULT create_compute_pipeline(const D3D12_COMPUTE_PIPELINE_STATE_DESC* desc, uint64_t extra0, uint64_t extra1,
@@ -309,6 +333,7 @@ HRESULT create_pipeline_from_stream(const D3D12_PIPELINE_STATE_STREAM_DESC* desc
       read(host.DSVFormat);
     } else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC) {
       read(host.SampleDesc);
+      host.SampleDesc = {1, 0};  // the host's targets are single-sampled (host_texture)
     }
     at += size;
   }
@@ -429,6 +454,245 @@ uint64_t fnv1a(const uint8_t* b, size_t size, uint64_t h = 0xCBF29CE484222325ull
   return h;
 }
 
+// The second metadata block of a slot 57 pipeline holds its input layout: at 0x4C the count, then
+// for each element its semantic name (a length, then the bytes with their NUL) and the six fields
+// of a D3D12_INPUT_ELEMENT_DESC after it (index, format, slot, offset, class, step rate).
+void read_input_layout(const std::vector<uint8_t>& b, ConsolePipeline& c) {
+  const auto u32 = [&](size_t at) {
+    uint32_t v = 0;
+    std::memcpy(&v, b.data() + at, 4);
+    return v;
+  };
+  if (b.size() < 0x50) return;
+  const uint32_t count = u32(0x4C);
+  size_t at = 0x50;
+  if (count > 32) return;
+  for (uint32_t k = 0; k < count; ++k) {
+    if (at + 4 > b.size()) return;
+    const uint32_t len = u32(at);
+    at += 4;
+    if (!len || len > 64 || at + len + 24 > b.size()) return;
+    c.names.emplace_back(reinterpret_cast<const char*>(b.data() + at), strnlen(reinterpret_cast<const char*>(b.data() + at), len));
+    at += len;
+    D3D12_INPUT_ELEMENT_DESC e{};
+    e.SemanticIndex = u32(at);
+    e.Format = static_cast<DXGI_FORMAT>(u32(at + 4));
+    e.InputSlot = u32(at + 8);
+    e.AlignedByteOffset = u32(at + 12);
+    e.InputSlotClass = static_cast<D3D12_INPUT_CLASSIFICATION>(u32(at + 16));
+    e.InstanceDataStepRate = u32(at + 20);
+    at += 24;
+    c.elements.push_back(e);
+  }
+  c.layout_ok = true;
+}
+
+// An AMD blend control (CB_BLENDn_CONTROL) as D3D12's: factors, functions, separate alpha, enable.
+D3D12_BLEND blend_factor(uint32_t f, bool alpha) {
+  switch (f) {
+    case 0: return D3D12_BLEND_ZERO;
+    case 1: return D3D12_BLEND_ONE;
+    case 2: return alpha ? D3D12_BLEND_SRC_ALPHA : D3D12_BLEND_SRC_COLOR;
+    case 3: return alpha ? D3D12_BLEND_INV_SRC_ALPHA : D3D12_BLEND_INV_SRC_COLOR;
+    case 4: return D3D12_BLEND_SRC_ALPHA;
+    case 5: return D3D12_BLEND_INV_SRC_ALPHA;
+    case 6: return D3D12_BLEND_DEST_ALPHA;
+    case 7: return D3D12_BLEND_INV_DEST_ALPHA;
+    case 8: return alpha ? D3D12_BLEND_DEST_ALPHA : D3D12_BLEND_DEST_COLOR;
+    case 9: return alpha ? D3D12_BLEND_INV_DEST_ALPHA : D3D12_BLEND_INV_DEST_COLOR;
+    case 10: return D3D12_BLEND_SRC_ALPHA_SAT;
+    case 13: case 19: return D3D12_BLEND_BLEND_FACTOR;
+    case 14: case 20: return D3D12_BLEND_INV_BLEND_FACTOR;
+    case 15: return alpha ? D3D12_BLEND_SRC1_ALPHA : D3D12_BLEND_SRC1_COLOR;
+    case 16: return alpha ? D3D12_BLEND_INV_SRC1_ALPHA : D3D12_BLEND_INV_SRC1_COLOR;
+    case 17: return D3D12_BLEND_SRC1_ALPHA;
+    case 18: return D3D12_BLEND_INV_SRC1_ALPHA;
+    default: return D3D12_BLEND_ONE;
+  }
+}
+D3D12_BLEND_OP blend_op(uint32_t f) {
+  switch (f) {
+    case 1: return D3D12_BLEND_OP_SUBTRACT;
+    case 2: return D3D12_BLEND_OP_MIN;
+    case 3: return D3D12_BLEND_OP_MAX;
+    case 4: return D3D12_BLEND_OP_REV_SUBTRACT;
+    default: return D3D12_BLEND_OP_ADD;
+  }
+}
+D3D12_RENDER_TARGET_BLEND_DESC blend_of(uint32_t v) {
+  D3D12_RENDER_TARGET_BLEND_DESC d{FALSE, FALSE, D3D12_BLEND_ONE, D3D12_BLEND_ZERO, D3D12_BLEND_OP_ADD, D3D12_BLEND_ONE,
+                                   D3D12_BLEND_ZERO, D3D12_BLEND_OP_ADD, D3D12_LOGIC_OP_NOOP, D3D12_COLOR_WRITE_ENABLE_ALL};
+  if (!((v >> 30) & 1)) return d;
+  const bool separate = (v >> 29) & 1;
+  d.BlendEnable = TRUE;
+  d.SrcBlend = blend_factor(v & 31, false);
+  d.BlendOp = blend_op((v >> 5) & 7);
+  d.DestBlend = blend_factor((v >> 8) & 31, false);
+  d.SrcBlendAlpha = blend_factor(separate ? (v >> 16) & 31 : v & 31, true);
+  d.BlendOpAlpha = blend_op(separate ? (v >> 21) & 7 : (v >> 5) & 7);
+  d.DestBlendAlpha = blend_factor(separate ? (v >> 24) & 31 : (v >> 8) & 31, true);
+  return d;
+}
+
+// The shader kind in a DXIL container's program header (0 pixel, 1 vertex, ...); -1 without one.
+int dxil_kind(const std::vector<uint8_t>& dxil) {
+  std::string error;
+  const auto c = shader::parse_container(dxil, error);
+  const shader::Part* part = c ? c->find("DXIL") : nullptr;
+  if (!part || part->data.size() < 4) return -1;
+  uint32_t version = 0;
+  std::memcpy(&version, part->data.data(), 4);
+  return static_cast<int>(version >> 16);
+}
+
+// The vertex stage's outputs, from its DXIL's output signature (OSG1): semantic names and indices,
+// in order; empty when it cannot be read. Translated programs declare every output as a float4.
+struct SignatureElement {
+  std::string name;
+  uint32_t index = 0, system_value = 0;
+};
+std::vector<SignatureElement> output_signature(const std::vector<uint8_t>& dxil) {
+  std::vector<SignatureElement> out;
+  std::string error;
+  const auto c = shader::parse_container(dxil, error);
+  const shader::Part* part = c ? c->find("OSG1") : nullptr;
+  if (!part || part->data.size() < 8) return out;
+  const auto& d = part->data;
+  const auto u32 = [&](size_t at) {
+    uint32_t v = 0;
+    if (at + 4 <= d.size()) std::memcpy(&v, d.data() + at, 4);
+    return v;
+  };
+  const uint32_t count = u32(0), first = u32(4);
+  for (uint32_t k = 0; k < count && k < 32; ++k) {
+    const size_t at = first + size_t{k} * 32;  // stream, name, index, system value, type, register, masks, precision
+    if (at + 32 > d.size()) return {};
+    SignatureElement e;
+    const uint32_t name_at = u32(at + 4);
+    if (name_at >= d.size()) return {};
+    e.name.assign(reinterpret_cast<const char*>(d.data() + name_at), strnlen(reinterpret_cast<const char*>(d.data() + name_at), d.size() - name_at));
+    e.index = u32(at + 8);
+    e.system_value = u32(at + 12);
+    out.push_back(std::move(e));
+  }
+  return out;
+}
+
+// The rect list's fourth corner: a geometry shader that finds each triangle's right-angle corner
+// k (the one facing its longest edge, on screen), and draws k, a, b and a + b - k (every output
+// alike) as a strip of two triangles covering the rectangle.
+std::vector<uint8_t> rect_list_geometry_shader(const std::vector<uint8_t>& vs) {
+  const std::vector<SignatureElement> outputs = output_signature(vs);
+  if (outputs.empty()) return {};
+  std::string decl = "struct V {\n", corner, position;
+  for (size_t k = 0; k < outputs.size(); ++k) {
+    const std::string field = "f" + std::to_string(k);
+    const std::string semantic = outputs[k].system_value == 1 ? "SV_Position" : outputs[k].name + std::to_string(outputs[k].index);
+    decl += "  float4 " + field + " : " + semantic + ";\n";
+    corner += "  d." + field + " = a." + field + " + b." + field + " - k." + field + ";\n";
+    if (outputs[k].system_value == 1) position = field;
+  }
+  if (position.empty()) return {};
+  decl += "};\n";
+  const auto at = [&](int n) { return "v[" + std::to_string(n) + "]." + position + ".xy / v[" + std::to_string(n) + "]." + position + ".w"; };
+  const std::string hlsl =
+      decl + "[maxvertexcount(4)] void main(triangle V v[3], inout TriangleStream<V> s) {\n" +
+      "  float2 p0 = " + at(0) + ", p1 = " + at(1) + ", p2 = " + at(2) + ";\n" +
+      "  float e0 = distance(p1, p2), e1 = distance(p2, p0), e2 = distance(p0, p1);\n" +
+      "  V k = v[2], a = v[0], b = v[1];\n" +
+      "  if (e0 >= e1 && e0 >= e2) { k = v[0]; a = v[1]; b = v[2]; }\n" +
+      "  else if (e1 >= e2) { k = v[1]; a = v[2]; b = v[0]; }\n" +
+      "  V d;\n" + corner + "  s.Append(k); s.Append(a); s.Append(b); s.Append(d);\n}\n";
+  const host::CompileResult r = host::compile_hlsl(hlsl, "main", "gs_6_0");
+  if (!r.ok) logf("gpu: the rect list's geometry shader did not compile: %s", r.messages.substr(0, 300).c_str());
+  return r.ok ? r.dxil : std::vector<uint8_t>{};
+}
+
+// A slot 57 pipeline's host pipeline for these render-target formats: its precompiled vertex and
+// pixel programs, its input layout and blend; no culling and no depth until their registers are
+// read.
+ID3D12PipelineState* console_host_pipeline(ConsolePipeline& c, const DXGI_FORMAT* targets, uint32_t count, DXGI_FORMAT depth,
+                                           bool rect_list) {
+  std::lock_guard g(c.lock);
+  if (c.failed) return nullptr;
+  std::vector<uint32_t> key(targets, targets + std::min<uint32_t>(count, 8));
+  key.push_back(rect_list);
+  key.push_back(depth);  // last: the depth view's format (the pipeline must match the bound views)
+  if (auto it = c.made.find(key); it != c.made.end()) return it->second.Get();
+  std::vector<uint8_t> vs, ps;
+  for (const std::string& m : c.markers) {
+    std::vector<uint8_t> code;
+    if (!load_precompiled(m, code)) {
+      c.failed = true;
+      return nullptr;
+    }
+    const int kind = dxil_kind(code);
+    if (kind == 1 && vs.empty()) vs = std::move(code);
+    else if (kind == 0 && ps.empty()) ps = std::move(code);
+    else {
+      c.failed = true;  // a stage we do not make yet (mesh, geometry, ...)
+      return nullptr;
+    }
+  }
+  if (vs.empty() || !c.layout_ok) {
+    c.failed = true;
+    return nullptr;
+  }
+  // AMERICAS_DEBUG_PS: a solid magenta pixel shader in place of the program's, to tell the
+  // vertex side's faults from the pixel side's.
+  static const std::vector<uint8_t> debug_ps = [] {
+    char* v = nullptr;
+    size_t n = 0;
+    const bool on = _dupenv_s(&v, &n, "AMERICAS_DEBUG_PS") == 0 && v;
+    std::free(v);
+    if (!on) return std::vector<uint8_t>{};
+    const host::CompileResult r = host::compile_hlsl("float4 main() : SV_Target { return float4(1, 0, 1, 1); }", "main", "ps_6_6");
+    logf("gpu: debug pixel shader %s", r.ok ? "on" : r.messages.c_str());
+    return r.ok ? r.dxil : std::vector<uint8_t>{};
+  }();
+  if (!debug_ps.empty()) ps = debug_ps;
+  // AMERICAS_DEBUG_VS: a vertex shader that places the vertex buffer's pixel positions on a
+  // 3840x2160 screen itself (no memory reads), to tell the input path's faults from the program's.
+  static const std::vector<uint8_t> debug_vs = [] {
+    if (!GetEnvironmentVariableA("AMERICAS_DEBUG_VS", nullptr, 0)) return std::vector<uint8_t>{};
+    const host::CompileResult r = host::compile_hlsl(
+        (GetEnvironmentVariableA("AMERICAS_DEBUG_VS_ID", nullptr, 0) ? "struct I { float3 p : POSITION0; float4 c : COLOR0; float2 t : TEXCOORD0; };\n float4 main(I i, uint id : SV_VertexID) : SV_Position { return float4(id == 1 ? 3.0 : -1.0, id == 2 ? -3.0 : 1.0, 0.5, 1.0); }" : "struct I { float3 p : POSITION0; float4 c : COLOR0; float2 t : TEXCOORD0; };\n float4 main(I i) : SV_Position { return float4(i.p.x / 1920.0 - 1.0, 1.0 - i.p.y / 1080.0, 0.5, 1.0); }"),
+        "main", "vs_6_6");
+    logf("gpu: debug vertex shader %s", r.ok ? "on" : r.messages.c_str());
+    return r.ok ? r.dxil : std::vector<uint8_t>{};
+  }();
+  if (!debug_vs.empty()) vs = debug_vs;
+  D3D12_GRAPHICS_PIPELINE_STATE_DESC d{};
+  d.VS = {vs.data(), vs.size()};
+  if (!ps.empty()) d.PS = {ps.data(), ps.size()};
+  d.SampleMask = UINT_MAX;
+  d.SampleDesc.Count = 1;
+  d.RasterizerState = {D3D12_FILL_MODE_SOLID, D3D12_CULL_MODE_NONE, FALSE, 0, 0.0f, 0.0f, TRUE, FALSE, FALSE, 0,
+                       D3D12_CONSERVATIVE_RASTERIZATION_MODE_OFF};
+  d.BlendState.IndependentBlendEnable = TRUE;
+  for (int k = 0; k < 8; ++k) d.BlendState.RenderTarget[k] = blend_of(c.blend[k]);
+  d.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+  d.NumRenderTargets = static_cast<UINT>(key.size() - 2);
+  for (size_t k = 0; k + 2 < key.size(); ++k) d.RTVFormats[k] = static_cast<DXGI_FORMAT>(key[k]);
+  std::vector<uint8_t> gs;
+  if (rect_list) {
+    gs = rect_list_geometry_shader(vs);
+    if (gs.empty()) {
+      c.made[key] = nullptr;
+      return nullptr;
+    }
+    d.GS = {gs.data(), gs.size()};
+  }
+  d.DSVFormat = depth;  // depth testing stays off until the depth registers are read
+  std::vector<D3D12_INPUT_ELEMENT_DESC> elements = c.elements;
+  for (size_t k = 0; k < elements.size(); ++k) elements[k].SemanticName = c.names[k].c_str();
+  d.InputLayout = {elements.empty() ? nullptr : elements.data(), static_cast<UINT>(elements.size())};
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> pso;
+  pso.Attach(make_host_graphics_pipeline(d, "a console pipeline (slot 57)"));
+  c.made[key] = pso;
+  return pso.Get();
+}
+
 // Slot 57's description: the root signature, then (address, size) pairs: blocks of metadata in
 // title memory and GPU programs already in GPU memory, each program after its metadata. The
 // pairs end at the first one that is neither. Saved as one file: for each block its address
@@ -443,6 +707,8 @@ void capture_console_blocks(PipelineState* p, const void* desc) {
   std::vector<uint8_t> bundle, block;
   uint32_t programs = 0;
   std::string markers;
+  auto console = std::make_unique<ConsolePipeline>();
+  int metadata = 0;
   for (int i = 1; i + 1 < 33; i += 2) {
     const uint64_t address = words[i], size = words[i + 1];
     if (!address && !size) continue;
@@ -455,6 +721,21 @@ void capture_console_blocks(PipelineState* p, const void* desc) {
     bundle.insert(bundle.end(), reinterpret_cast<const uint8_t*>(&size32), reinterpret_cast<const uint8_t*>(&size32) + 4);
     bundle.insert(bundle.end(), reinterpret_cast<const uint8_t*>(&kind), reinterpret_cast<const uint8_t*>(&kind) + 4);
     bundle.insert(bundle.end(), block.begin(), block.end());
+    if (!kind && metadata == 0 && block.size() >= 0xF0) {
+      std::memcpy(console->blend, block.data() + 0xD0, sizeof console->blend);
+    } else if (!kind && metadata == 1) {
+      read_input_layout(block, *console);
+    }
+    if (!kind) ++metadata;
+    if (kind && block.size() >= 24) {
+      static const char* const kHex = "0123456789abcdef";
+      std::string m;
+      for (size_t k = 0; k < 24; ++k) {
+        m += kHex[block[k] >> 4];
+        m += kHex[block[k] & 15];
+      }
+      console->markers.push_back(std::move(m));
+    }
     if (kind) {
       ++programs;
       char m[32];
@@ -470,6 +751,7 @@ void capture_console_blocks(PipelineState* p, const void* desc) {
   save_once(name, bundle.data(), bundle.size());
   p->console_programs = programs;
   p->console_name = std::string(name, 16) + (markers.empty() ? "" : ":" + markers);
+  p->console = std::move(console);
 }
 
 }  // namespace

@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstring>
+#include <map>
 #include <mutex>
 #include <vector>
 
@@ -42,6 +43,8 @@ struct GpuMemory {
   // memory's view listener adds to it while holding the title memory's lock.
   std::mutex pending_lock;
   std::vector<std::pair<uint64_t, std::vector<uint32_t>>> pending;
+  // The pool's views on the CPU side (first page -> pages, first pool page), for host addresses.
+  std::map<uint64_t, std::pair<uint64_t, uint64_t>> pool_views;
   UINT step = 0;
   uint32_t next_view = kHeapSize;  // the lowest index handed out to a texture view so far
   uint32_t pool_window = 0;  // the committed physical page pool's window, once opened
@@ -254,7 +257,10 @@ void on_view(uint64_t address, uint64_t pages, int64_t pool_page) {
     for (uint64_t k = 0; k < pages; ++k) entries[k] = (m.pool_window << 16) | static_cast<uint32_t>(pool_page + k);
   }
   std::lock_guard p(m.pending_lock);
-  m.pending.emplace_back(address / kPage, std::move(entries));
+  const uint64_t first = address / kPage;
+  m.pool_views.erase(m.pool_views.lower_bound(first), m.pool_views.lower_bound(first + pages));
+  if (pool_page >= 0) m.pool_views[first] = {pages, static_cast<uint64_t>(pool_page)};
+  m.pending.emplace_back(first, std::move(entries));
 }
 
 // Opens the pool once it exists (the title makes it when it first asks for pages). The section
@@ -300,6 +306,31 @@ ID3D12RootSignature* translated_graphics_root_signature() {
   std::lock_guard g(memory().lock);
   GpuMemory* m = ready();
   return m ? m->graphics_root.Get() : nullptr;
+}
+
+D3D12_GPU_VIRTUAL_ADDRESS host_gpu_address(uint64_t address, uint64_t size) {
+  if (!size || (address >> kAddressBits)) return 0;
+  open_pool_if_ready();
+  std::lock_guard g(memory().lock);
+  GpuMemory* m = ready();
+  if (!m) return 0;
+  if (m->open(address)) {
+    for (size_t n = 1; n < m->windows.size(); ++n) {
+      const Window& w = m->windows[n];
+      if (n != m->pool_window && address - w.base < w.size && address + size - w.base <= w.size) {
+        return w.buffer->GetGPUVirtualAddress() + (address - w.base);
+      }
+    }
+  }
+  if (!m->pool_window || m->pool_window == UINT32_MAX) return 0;
+  std::lock_guard p(m->pending_lock);
+  const uint64_t page = address / kPage, last = (address + size - 1) / kPage;
+  auto it = m->pool_views.upper_bound(page);
+  if (it == m->pool_views.begin()) return 0;
+  --it;
+  const auto& [first, view] = *it;
+  if (page - first >= view.first || last - first >= view.first) return 0;  // not all in one view
+  return m->windows[m->pool_window].buffer->GetGPUVirtualAddress() + (view.second + (page - first)) * kPage + address % kPage;
 }
 
 uint32_t allocate_view_slot(D3D12_CPU_DESCRIPTOR_HANDLE* handle) {

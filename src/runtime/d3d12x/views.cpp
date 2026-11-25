@@ -15,6 +15,7 @@
 #include "runtime/d3d12x/bindings.h"
 #include "runtime/d3d12x/d3d12x.h"
 #include "runtime/d3d12x/formats.h"
+#include "runtime/d3d12x/host.h"
 #include "runtime/d3d12x/layout.h"
 #include "runtime/d3d12x/object.h"
 #include "runtime/log.h"
@@ -55,6 +56,30 @@ void WINAPI create_cbv(Object* self, const D3D12_CONSTANT_BUFFER_VIEW_DESC* desc
 
 void WINAPI create_srv(Object* self, Object* resource, const D3D12_SHADER_RESOURCE_VIEW_DESC* desc, uint64_t dest) {
   trace(self, 18, "CreateShaderResourceView", reinterpret_cast<uint64_t>(resource), reinterpret_cast<uint64_t>(desc), dest);
+  // What translated shaders read: a V# for buffers, a T# for textures (the GPU's own texture for
+  // render and depth targets, which the GPU draws into).
+  D3D12_RESOURCE_DESC d{};
+  uint64_t address = 0;
+  if (resource && dest && resource_memory(resource, &d, &address)) {
+    D3D12_SHADER_RESOURCE_VIEW_DESC v{};
+    if (desc) {
+      v = *desc;
+    } else {
+      v.Format = d.Format;
+      v.ViewDimension = d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? D3D12_SRV_DIMENSION_BUFFER : D3D12_SRV_DIMENSION_TEXTURE2D;
+    }
+    const bool target = (d.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)) != 0;
+    if (d.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER && target) {
+      uint32_t words[8] = {};
+      bind_texture_view(d, v, address, words, host_texture(resource));
+      std::memcpy(reinterpret_cast<void*>(dest), words, sizeof words);
+      return;
+    }
+    if (desc || d.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) {
+      write_shader_view(dest, &d, v, address);
+      return;
+    }
+  }
   write_record(dest, resource ? ViewKind::Srv : ViewKind::Null, desc ? desc->Format : 0, reinterpret_cast<uint64_t>(resource));
 }
 

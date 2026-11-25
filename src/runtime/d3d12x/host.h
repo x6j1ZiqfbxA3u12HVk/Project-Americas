@@ -23,6 +23,9 @@ ID3D12Resource* host_texture(const void* console_resource, bool create = true);
 // ptr 0 when none can be made.
 D3D12_CPU_DESCRIPTOR_HANDLE host_rtv(ID3D12Resource* texture, uint32_t format);
 D3D12_CPU_DESCRIPTOR_HANDLE host_dsv(ID3D12Resource* texture, uint32_t format);
+// The formats host_rtv and host_dsv give a texture's views.
+DXGI_FORMAT host_rtv_format(ID3D12Resource* texture, uint32_t format);
+DXGI_FORMAT host_dsv_format(ID3D12Resource* texture, uint32_t format);
 // Drops a console resource's host texture and its views (the console resource is going away).
 void forget_host_texture(const void* console_resource);
 
@@ -34,7 +37,11 @@ bool load_precompiled(const std::string& marker, std::vector<uint8_t>& dxil);
 ID3D12PipelineState* make_host_graphics_pipeline(D3D12_GRAPHICS_PIPELINE_STATE_DESC desc, const char* what);
 
 // pipeline.cpp: a console pipeline's host pipeline (nullptr when there is none) and its console
-// root signature object.
-ID3D12PipelineState* host_pipeline(const void* console_pipeline, const void** root_signature);
+// root signature object. The console's own pipelines (slot 57) are made at their first draw, for
+// the render targets bound then.
+// `rect_list`: drawn with the console's rect list (topology 17), which the host draws as triangles
+// with a geometry shader adding each rectangle's fourth corner.
+ID3D12PipelineState* host_pipeline(const void* console_pipeline, const void** root_signature, const DXGI_FORMAT* targets,
+                                   uint32_t target_count, DXGI_FORMAT depth, bool rect_list);
 
 }  // namespace am::rt::d3d12x
