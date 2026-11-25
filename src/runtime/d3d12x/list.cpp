@@ -20,6 +20,7 @@
 #include <cstring>
 #include <deque>
 #include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 
@@ -384,7 +385,35 @@ void dispatch(HostList& h, ID3D12GraphicsCommandList* list, const Command& c) {
     h.compute_bound = true;
   }
   uint32_t cs[kUserDataConstants] = {};
-  user_data_sgprs(*rs, D3D12_SHADER_VISIBILITY_ALL, h.compute_args, h.compute_constants, cs, kUserDataConstants);
+  if (const std::vector<UserSlot>* layout = compute_user_layout(h.pipeline)) {
+    // The program's own placement: each root parameter at the user-data dword its metadata names.
+    for (const UserSlot& u : *layout) {
+      if (u.slot >= HostList::kParams || u.user >= kUserDataConstants) continue;
+      if (u.root == 3) {
+        cs[u.user] = static_cast<uint32_t>(h.compute_args[u.slot]);
+      } else if (u.root == 1) {
+        cs[u.user] = static_cast<uint32_t>(h.compute_args[u.slot]);
+        if (u.user + 1 < kUserDataConstants) cs[u.user + 1] = static_cast<uint32_t>(h.compute_args[u.slot] >> 32);
+      } else if (u.root == 0) {
+        const std::vector<uint32_t>& values = h.compute_constants[u.slot];
+        for (uint32_t k = 0; k < values.size() && u.user + k < kUserDataConstants; ++k) cs[u.user + k] = values[k];
+      }
+    }
+  } else {
+    user_data_sgprs(*rs, D3D12_SHADER_VISIBILITY_ALL, h.compute_args, h.compute_constants, cs, kUserDataConstants);
+  }
+  {
+    static std::mutex told_lock;
+    static std::set<const void*> told;
+    std::lock_guard g(told_lock);
+    if (told.size() < 6 && told.insert(rs).second) {
+      std::string params;
+      for (const RootParameter& p : rs->parameters) {
+        params += " [type " + std::to_string(p.type) + " vis " + std::to_string(p.visibility) + " n " + std::to_string(p.constants) + "]";
+      }
+      logf("gpu: compute root signature of %s:%s", describe_pipeline(h.pipeline).c_str(), params.c_str());
+    }
+  }
   list->SetPipelineState(pso);
   list->SetComputeRoot32BitConstants(0, kUserDataConstants, cs, 0);
   list->Dispatch(static_cast<UINT>(c.a[0]), static_cast<UINT>(c.a[1]), static_cast<UINT>(c.a[2]));

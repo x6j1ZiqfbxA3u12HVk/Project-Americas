@@ -74,6 +74,7 @@ struct PipelineState : Object {
   bool compute = false;
   std::atomic<ID3D12PipelineState*> host_compute{nullptr};  // made on a worker thread, owned by `host`
   std::string compute_marker;           // its program's
+  std::vector<UserSlot> compute_layout;  // where its root parameters go (user-data dwords)
   std::atomic<bool> compute_tried{false};  // a job has run (made or refused)
   std::atomic<bool> compute_urgent{false};  // a dispatch waited: moved to the front once
   uint32_t console_programs = 0;  // slot 57: GPU programs given by address
@@ -383,6 +384,13 @@ ID3D12PipelineState* host_pipeline(const void* object, const void** root_signatu
   if (p->compute) return nullptr;  // compute pipelines: host_compute_pipeline
   if (p->host) return p->host.Get();
   return p->console ? console_host_pipeline(*p->console, targets, target_count, depth, rect_list) : nullptr;
+}
+
+const std::vector<UserSlot>* compute_user_layout(const void* object) {
+  Object* o = object_of_kind(object, pipeline_kind());
+  if (!o) return nullptr;
+  const auto* p = static_cast<const PipelineState*>(o);
+  return p->compute_layout.empty() ? nullptr : &p->compute_layout;
 }
 
 ID3D12PipelineState* host_compute_pipeline(const void* object, const void** root_signature) {
@@ -888,7 +896,20 @@ void capture_console_blocks(PipelineState* p, const void* desc, bool compute) {
     bundle.insert(bundle.end(), reinterpret_cast<const uint8_t*>(&kind), reinterpret_cast<const uint8_t*>(&kind) + 4);
     bundle.insert(bundle.end(), block.begin(), block.end());
     if (compute) {
-      // Compute pipelines: no blend or input layout in their metadata.
+      // Compute pipelines: no blend or input layout. The block after the program says where
+      // the root parameters arrive: from +0x18, 32-byte records; tag 0x41 is a resource the
+      // code reads: byte 5 its root type, byte 20 descriptor dwords, byte 21 the user-data
+      // dword (sN for compute), byte 22 the root parameter; 0x43 ends the list.
+      if (!kind && programs > 0 && p->compute_layout.empty() && block.size() >= 0x18 && block[0] == 0x03 && block[1] == 0x04) {
+        for (size_t at = 0x18; at + 32 <= block.size(); at += 32) {
+          if (block[at] == 0x43) break;
+          if (block[at] != 0x41) continue;
+          const UserSlot u{block[at + 5], block[at + 21], block[at + 22], block[at + 20]};
+          bool seen = false;
+          for (const UserSlot& e : p->compute_layout) seen = seen || (e.slot == u.slot && e.user == u.user);
+          if (!seen) p->compute_layout.push_back(u);
+        }
+      }
     } else if (!kind && metadata == 0 && block.size() >= 0xF0) {
       std::memcpy(console->blend, block.data() + 0xD0, sizeof console->blend);
     } else if (!kind && metadata == 1) {

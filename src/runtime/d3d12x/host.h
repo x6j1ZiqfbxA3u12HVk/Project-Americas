@@ -50,6 +50,14 @@ ID3D12PipelineState* host_pipeline(const void* console_pipeline, const void** ro
 // A console compute pipeline's host pipeline (nullptr when it is not a compute pipeline or its
 // program is not precompiled) and its console root signature object.
 ID3D12PipelineState* host_compute_pipeline(const void* console_pipeline, const void** root_signature);
+// Where a console compute pipeline's root parameters arrive, from its program's metadata: per
+// root parameter the user-data dword it starts at (s<user> for compute), its root type (0
+// constants, 1 root descriptor, 3 table, 5 / 6 heap addresses) and descriptor dwords. nullptr
+// when the pipeline has no such records (the packed order from s8 applies).
+struct UserSlot {
+  uint8_t root, user, slot, dwords;
+};
+const std::vector<UserSlot>* compute_user_layout(const void* console_pipeline);
 // "N made, M not precompiled, ... of K queued", for the frame log.
 std::string compute_pipeline_counts();
 

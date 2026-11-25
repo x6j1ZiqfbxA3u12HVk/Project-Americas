@@ -750,3 +750,27 @@ Then the larger pieces before the 3D world shows:
   lists the rest. The user drives faster than `AMERICAS_PRESS`.
 * The background precompile was restarted. `wanted-first.txt` holds what the game waited
   for.
+* **Compute user data: found and fixed the layout (commit after ed5ec0b).** Compute programs
+  take user data from **s0** (the "from s8" rule only fits merged stages like the game's
+  vertex shaders, and mesh shaders). Each program's metadata block (after the program in a
+  slot 67 bundle: u32 0x403, size, code dwords, ...; 32-byte records from +0x18) lists per
+  resource a `0x41` record:
+  * byte 4: resource type (0 SRV, 1 sampler, 2 CBV, 3 UAV);
+  * byte 5: root type (0 constants, 1 root descriptor, 3 table, 5/6 heap addresses);
+  * bytes 8/12/16: table offset (dwords), register, view dimension;
+  * byte 20: descriptor dwords;
+  * byte 21: **the user-data dword** (= sN for compute);
+  * byte 22: **the root slot**.
+
+  `compute_user_layout` reads them and `dispatch` fills exactly those registers.
+  Example: pipeline bundle `3099c2719d231d0b` puts root slot 1 (a table) in s5, and its code
+  starts `s_mov_b32 s8, s5`.
+* **With `AMERICAS_COMPUTE=1` the game now crashes about 70 s in, in its own code**
+  (game+0xf6349, reading 0xf). Compute results reach the game now and some are still wrong.
+  Next:
+  * Find which dispatch writes what game+0xf6349 reads, e.g. with a write watch on that
+    memory.
+  * Check root types 5/6 (heap addresses), which `dispatch` does not fill yet.
+  * Check root constants' size against the record's dwords.
+  * Graphics may need the same per-program placement (PS from s0?): today's "from s8" works
+    for the boot screen's shaders only.
