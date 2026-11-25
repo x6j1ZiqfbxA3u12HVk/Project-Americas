@@ -1404,6 +1404,28 @@ const std::unordered_map<std::string, Handler>& table() {
         };
       }
     }
+    // Sub-dword buffer loads: the dword holding the bytes, shifted down, masked or sign-extended.
+    {
+      struct Narrow {
+        const char* name;
+        const char* expr;  // of x, the bytes in the low bits
+      };
+      static const Narrow kNarrow[] = {{"buffer_load_ubyte", "(x & 0xFFu)"},
+                                       {"buffer_load_sbyte", "uint(int(x << 24) >> 24)"},
+                                       {"buffer_load_ushort", "(x & 0xFFFFu)"},
+                                       {"buffer_load_sshort", "uint(int(x << 16) >> 16)"}};
+      for (const Narrow& n : kNarrow) {
+        const std::string expr = n.expr;
+        t[n.name] = [expr](Ctx& c) {
+          if (!buffer_address(c)) return false;
+          const uint32_t vd = c.f(Field::VDATA);
+          c.touch_v(vd);
+          c.line("  { uint x = 0u < lim ? am_load(p) >> (uint(p & 3u) * 8u) : 0u; v[" + num(vd) + "] = " + expr + "; }");
+          c.line("}");
+          return true;
+        };
+      }
+    }
     // -- atomics: 32-bit; GLC returns the value before --
     {
       static const char* const kAtomics[] = {"swap", "cmpswap", "add", "sub", "smin", "umin", "smax", "umax", "and", "or", "xor"};
