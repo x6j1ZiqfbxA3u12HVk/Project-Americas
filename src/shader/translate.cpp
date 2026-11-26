@@ -303,7 +303,7 @@ bool buffer_address(Ctx& c) {
 // instruction runs, outside any EXEC test: they are wave-uniform, and implicit derivatives
 // need every lane. Only the register writes, stores and atomics follow EXEC.
 
-enum class ImgKind : uint8_t { Sample, Gather, Load, Store, Atomic, Info };
+enum class ImgKind : uint8_t { Sample, Gather, Load, Store, Atomic, Info, Lod };
 struct ImgOp {
   ImgKind kind;
   bool offset = false, bias = false, compare = false, grads = false, lod = false, implicit = false;
@@ -319,15 +319,15 @@ bool image(Ctx& c, const ImgOp& op) {
   if (c.f(Field::R128)) return c.fail(name + " (128-bit T#)");
   const uint32_t dim = c.f(Field::DIM), dmask = c.f(Field::DMASK), vd = c.f(Field::VDATA);
   const bool a16 = c.f(Field::A16) != 0, d16 = c.f(Field::D16) != 0, nsa = c.f(Field::NSA) != 0;
-  if (a16 && (op.kind == ImgKind::Sample || op.kind == ImgKind::Gather)) return c.fail(name + " (a16)");
+  const bool sampled = op.kind == ImgKind::Sample || op.kind == ImgKind::Gather || op.kind == ImgKind::Lod;
   if (dim >= 6 && op.kind != ImgKind::Load) return c.fail(name + " (msaa)");
-  // Address components, in the hardware's order: offset, bias, z-compare, gradients,
-  // coordinates, lod / mip. A16 packs two to a register.
-  int next = 0;
+  // Address components, in the hardware's order: offset, bias, z-compare (a dword each), then
+  // gradients, coordinates, lod / mip. A16 packs these last two to a register (as halves:
+  // f16 for sampling, integers for loads and stores); the bias is then an f16 in its dword's
+  // low half, and an odd count of gradients a direction (1D, 3D) pads each direction.
+  int next = 0, extra = 0;
   bool bad = false;
-  const auto addr = [&]() -> std::string {
-    const int k = next++;
-    const int dword = a16 ? k / 2 : k;
+  const auto reg_at = [&](int dword) -> std::string {
     uint32_t reg;
     if (!nsa) reg = c.f(Field::VADDR) + dword;
     else if (dword == 0) reg = c.f(Field::VADDR);
@@ -337,18 +337,33 @@ bool image(Ctx& c, const ImgOp& op) {
       return "0u";
     }
     c.touch_v(reg);
-    const std::string v = "v[" + num(reg) + "]";
-    return a16 ? "((" + v + " >> " + (k % 2 ? "16u" : "0u") + ") & 0xFFFFu)" : v;
+    return "v[" + num(reg) + "]";
+  };
+  const auto whole = [&]() -> std::string { return reg_at(extra++); };
+  const auto addr = [&]() -> std::string {
+    const int k = next++;
+    if (!a16) return reg_at(extra + k);
+    const std::string h = "((" + reg_at(extra + k / 2) + " >> " + (k % 2 ? "16u" : "0u") + ") & 0xFFFFu)";
+    return sampled ? "asuint(f16tof32(" + h + "))" : h;
+  };
+  const auto align = [&]() {
+    if (a16) next += next % 2;
   };
   static const int kCoords[] = {1, 2, 3, 3, 2, 3, 3, 4}, kGrads[] = {1, 2, 3, 2, 1, 2, 0, 0};
   std::string offset, bias, cmp, g[6], co[4], lod;
   if (op.kind == ImgKind::Info) {
     lod = addr();
   } else {
-    if (op.offset) offset = addr();
-    if (op.bias) bias = addr();
-    if (op.compare) cmp = addr();
-    if (op.grads) for (int j = 0; j < 2 * kGrads[dim]; ++j) g[j] = addr();
+    if (op.offset) offset = whole();
+    if (op.bias) bias = a16 ? "asuint(f16tof32(" + whole() + " & 0xFFFFu))" : whole();
+    if (op.compare) cmp = whole();
+    if (op.grads) {
+      for (int j = 0; j < 2 * kGrads[dim]; ++j) {
+        g[j] = addr();
+        if (j == kGrads[dim] - 1) align();
+      }
+      align();
+    }
     for (int j = 0; j < kCoords[dim]; ++j) co[j] = addr();
     if (op.lod) lod = addr();
   }
@@ -384,7 +399,6 @@ bool image(Ctx& c, const ImgOp& op) {
     c.live_images.insert(t);
     c.image_vars.insert(t);
   }
-  const bool sampled = op.kind == ImgKind::Sample || op.kind == ImgKind::Gather;
   if (sampled && !c.live_samplers.count(sa)) {
     c.line("am_sm_" + num(sa) + " = am_sampler(" + sq(sa) + ");");
     c.live_samplers.insert(sa);
@@ -457,6 +471,18 @@ bool image(Ctx& c, const ImgOp& op) {
         c.line("  float4 rf = am_sample_" + suffix + "(im, sm, " + pos + ", " + (op.lod ? fl(lod) : std::string("0.0f")) + ");");
       }
       c.line("  uint4 r = asuint(rf);");
+      write_results(channels, true);
+      break;
+    }
+    case ImgKind::Lod: {
+      // The level implicit derivatives select: x clamped to the image's levels, y unclamped.
+      if (channels.empty()) channels.push_back(0);
+      if (dim == 3) c.line("  float4 cc = am_cube_dir(" + fco + ");");
+      else c.line("  " + std::string(dim == 0 || dim == 4 ? "float2" : "float3") + " cc = " + fco + ";");
+      const std::string gsel = dim == 3 ? "cc.xyz" : dim == 0 || dim == 4 ? "cc.x" : dim == 2 ? "cc" : "cc.xy";
+      const std::string gtype = dim == 3 || dim == 2 ? "float3" : dim == 0 || dim == 4 ? "float" : "float2";
+      c.line("  " + gtype + " dx = AM_DX(" + gsel + "), dy = AM_DY(" + gsel + ");");
+      c.line("  uint4 r = asuint(float4(am_lod_" + suffix + "(im, sm, dx, dy), 0.0f, 0.0f));");
       write_results(channels, true);
       break;
     }
@@ -1570,6 +1596,7 @@ const std::unordered_map<std::string, Handler>& table() {
       add("image_load_mip", o);
       add("image_store", ImgOp{ImgKind::Store});
       add("image_get_resinfo", ImgOp{ImgKind::Info});
+      add("image_get_lod", ImgOp{ImgKind::Lod});
       static const char* const kAtomics[] = {"swap", "cmpswap", "add", "sub", "smin", "umin", "smax", "umax", "and", "or", "xor"};
       for (uint32_t k = 0; k < 11; ++k) {
         o = ImgOp{ImgKind::Atomic};
@@ -2043,6 +2070,45 @@ float4 am_sample_cube(AmImage im, AmSampler sm, float4 c, float lod) {
   SamplerState s = SamplerDescriptorHeap[sm.index];
   if (AM_ARR(im)) { TextureCubeArray<float4> t = ResourceDescriptorHeap[im.srv]; return t.SampleLevel(s, c, lod); }
   TextureCube<float4> t1 = ResourceDescriptorHeap[im.srv]; return t1.SampleLevel(s, c.xyz, lod);
+}
+)" R"(
+// The level of detail for these gradients: (clamped to the image's levels, unclamped). The
+// sampler's own lod clamps are not applied.
+float2 am_lod_of(float r, uint mips) {
+  float l = 0.5f * log2(max(r, 1e-30f));
+  return float2(clamp(l, 0.0f, float(max(mips, 1u) - 1u)), l);
+}
+float2 am_lod_1d(AmImage im, AmSampler sm, float dx, float dy) {
+  if (!AM_SAMPLED(im, sm)) return 0.0f;
+  uint w, e, m;
+  if (AM_ARR(im)) { Texture1DArray<float4> t = ResourceDescriptorHeap[im.srv]; t.GetDimensions(0, w, e, m); }
+  else { Texture1D<float4> t1 = ResourceDescriptorHeap[im.srv]; t1.GetDimensions(0, w, m); }
+  float a = dx * w, b = dy * w;
+  return am_lod_of(max(a * a, b * b), m);
+}
+float2 am_lod_2d(AmImage im, AmSampler sm, float2 dx, float2 dy) {
+  if (!AM_SAMPLED(im, sm)) return 0.0f;
+  uint w, h, e, m;
+  if (AM_ARR(im)) { Texture2DArray<float4> t = ResourceDescriptorHeap[im.srv]; t.GetDimensions(0, w, h, e, m); }
+  else { Texture2D<float4> t1 = ResourceDescriptorHeap[im.srv]; t1.GetDimensions(0, w, h, m); }
+  float2 a = dx * float2(w, h), b = dy * float2(w, h);
+  return am_lod_of(max(dot(a, a), dot(b, b)), m);
+}
+float2 am_lod_3d(AmImage im, AmSampler sm, float3 dx, float3 dy) {
+  if (!AM_SAMPLED(im, sm)) return 0.0f;
+  uint w, h, d, m;
+  Texture3D<float4> t = ResourceDescriptorHeap[im.srv]; t.GetDimensions(0, w, h, d, m);
+  float3 a = dx * float3(w, h, d), b = dy * float3(w, h, d);
+  return am_lod_of(max(dot(a, a), dot(b, b)), m);
+}
+// Cubes: direction gradients on the unit cube, whose face spans 2 units of `w` texels.
+float2 am_lod_cube(AmImage im, AmSampler sm, float3 dx, float3 dy) {
+  if (!AM_SAMPLED(im, sm)) return 0.0f;
+  uint w, h, e, m;
+  if (AM_ARR(im)) { TextureCubeArray<float4> t = ResourceDescriptorHeap[im.srv]; t.GetDimensions(0, w, h, e, m); }
+  else { TextureCube<float4> t1 = ResourceDescriptorHeap[im.srv]; t1.GetDimensions(0, w, h, m); }
+  float3 a = dx * (0.5f * w), b = dy * (0.5f * w);
+  return am_lod_of(max(dot(a, a), dot(b, b)), m);
 }
 // Sampling with gradients (given, or taken across the console's quads of lanes).
 float4 am_grad_1d(AmImage im, AmSampler sm, float2 c, float dx, float dy) {

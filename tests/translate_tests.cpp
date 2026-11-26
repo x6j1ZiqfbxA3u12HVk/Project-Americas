@@ -544,6 +544,10 @@ TEST_CASE(translate_images) {
           0x7E1A02F2,                          // v_mov_b32 v13, 1.0
           0xF0900108, 0x01860E0B,              // image_sample_l v14, v[11:13], s[24:31], s[48:51] dmask:0x1 dim:2D
           0xF09C0108, 0x01860F0B,              // image_sample_lz v15, v[11:12], s[24:31], s[48:51] dmask:0x1 dim:2D
+          0x7E6402FF, 0x38003800,              // v_mov_b32 v50, 0x38003800            (0.5h, 0.5h)
+          0x7E6602FF, 0x00003C00,              // v_mov_b32 v51, 0x3c00                 1.0h
+          0xF0900108, 0x41863432,              // image_sample_l v52, v[50:51], s[24:31], s[48:51] dmask:0x1 dim:2D a16
+          0xF1800308, 0x0186350B,              // image_get_lod v[53:54], v[11:12], s[24:31], s[48:51] dmask:0x3 dim:2D
           0x7E2202F0,                          // v_mov_b32 v17, 0.5
           0xF0BC010A, 0x01A61011, 0x00000C0B,  // image_sample_c_lz v16, [v17, v11, v12], s[24:31], s[52:55] dmask:0x1 dim:2D
           0x162E008C,                          // v_mul_u32_u24 v23, 12, v0
@@ -584,6 +588,9 @@ TEST_CASE(translate_images) {
     if (!ok) std::printf("    lane %u: load %08x %08x %08x %08x\n", l, r.v(l, 5), r.v(l, 6), r.v(l, 7), r.v(l, 8));
     ok = ok && r.v(l, 10) == 3 * l;
     ok = ok && f(r.v(l, 14)) == 5.0f && f(r.v(l, 15)) == 1.0f && f(r.v(l, 16)) == 1.0f;
+    // The same sample_l with 16-bit addresses; the level of uniform coordinates: 0, clamped.
+    ok = ok && f(r.v(l, 52)) == 5.0f && f(r.v(l, 53)) == 0.0f && f(r.v(l, 54)) < -10.0f;
+    if (!ok) std::printf("    lane %u: a16 sample_l %08x, get_lod %08x %08x\n", l, r.v(l, 52), r.v(l, 53), r.v(l, 54));
     if (!ok) {
       std::printf("    lane %u: uav load %u, sample_l %08x, lz %08x, compare %08x\n", l, r.v(l, 10), r.v(l, 14), r.v(l, 15),
                   r.v(l, 16));

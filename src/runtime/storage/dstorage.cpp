@@ -387,7 +387,21 @@ void worker() {
     ++q->running;
     const Request request = c->request;
     lock.unlock();
-    const HRESULT hr = execute(request);
+    HRESULT hr;
+    try {
+      hr = execute(request);
+    } catch (const std::bad_alloc&) {
+      // A request larger than the memory there is: refused, not the end of the run.
+      log_refused(request, "out of memory");
+      logf("dstorage: request refused for want of memory: options 0x%s, offset 0x%llx, %u -> %u bytes (intermediate %u)",
+           hex(request.options).c_str(), static_cast<unsigned long long>(request.offset), request.source_size,
+           request.destination_size, request.intermediate_size);
+      hr = E_OUTOFMEMORY;
+    }
+    // A large request's buffers are let go rather than kept for the next.
+    for (std::vector<uint8_t>* v : {&t_source, &t_out, &t_blocks}) {
+      if (v->capacity() > (64u << 20)) std::vector<uint8_t>().swap(*v);
+    }
     g_requests.fetch_add(1, std::memory_order_relaxed);
     g_bytes.fetch_add(request.destination_size, std::memory_order_relaxed);
     if (FAILED(hr)) g_failures.fetch_add(1, std::memory_order_relaxed);
