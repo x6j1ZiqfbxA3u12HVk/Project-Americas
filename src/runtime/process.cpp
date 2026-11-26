@@ -7,7 +7,11 @@
 #include <csignal>
 #include <exception>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <fstream>
+#include <thread>
+#include <vector>
 
 #include "core/json.h"
 #include "core/text.h"
@@ -55,6 +59,105 @@ std::wstring quote_arg(const std::wstring& a) {
 }
 
 LONG WINAPI top_level_filter(EXCEPTION_POINTERS* info) { return g_process ? g_process->crash_filter(info) : 0; }
+
+// ---- AMERICAS_HW_WATCH (diagnosis) ----
+// "addr[:len],..." (hex, up to four; len 1, 2, 4 or 8, default 8): a data breakpoint on each, in
+// every thread of the process (a watcher arms new threads every 20 ms). Each write is logged
+// with the value now there, the writing thread and its stack.
+
+struct HwWatch {
+  uint64_t address = 0;
+  uint32_t length = 8;
+};
+HwWatch g_hw_watches[4];
+int g_hw_watch_count = 0;
+volatile LONG g_hw_hits = 0;
+
+LONG CALLBACK on_hw_watch(EXCEPTION_POINTERS* info) {
+  if (info->ExceptionRecord->ExceptionCode != EXCEPTION_SINGLE_STEP) return EXCEPTION_CONTINUE_SEARCH;
+  CONTEXT* ctx = info->ContextRecord;
+  const DWORD64 which = ctx->Dr6 & 0xF;
+  if (!which) return EXCEPTION_CONTINUE_SEARCH;
+  ctx->Dr6 = 0;
+  if (InterlockedIncrement(&g_hw_hits) > 400 || !g_process) return EXCEPTION_CONTINUE_EXECUTION;
+  for (int k = 0; k < g_hw_watch_count; ++k) {
+    if (!(which & (1ull << k))) continue;
+    const HwWatch& w = g_hw_watches[k];
+    uint64_t now = 0;
+    std::memcpy(&now, reinterpret_cast<const void*>(w.address), w.length);
+    std::string text = "hw watch: 0x" + hex(w.address) + " = 0x" + hex(now) + ", written by thread " +
+                       std::to_string(GetCurrentThreadId()) + " before " + g_process->describe_address(ctx->Rip);
+    char regs[256];
+    std::snprintf(regs, sizeof regs, "\n  rax %016llx rbx %016llx rcx %016llx rdx %016llx rsi %016llx rdi %016llx", ctx->Rax,
+                  ctx->Rbx, ctx->Rcx, ctx->Rdx, ctx->Rsi, ctx->Rdi);
+    text += regs;
+    text += g_process->describe_stack(*ctx);
+    log_line(text);
+  }
+  return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+void hw_watch_thread() {
+  SetThreadDescription(GetCurrentThread(), L"americas hw watch");
+  DWORD64 dr7 = 0;
+  for (int k = 0; k < g_hw_watch_count; ++k) {
+    const uint32_t len = g_hw_watches[k].length;
+    const DWORD64 len_bits = len == 1 ? 0 : len == 2 ? 1 : len == 8 ? 2 : 3;
+    dr7 |= 1ull << (2 * k);                    // local enable
+    dr7 |= (1ull | (len_bits << 2)) << (16 + 4 * k);  // RW = write, LEN
+  }
+  std::vector<DWORD> armed;
+  const DWORD self = GetCurrentThreadId();
+  for (;;) {
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snapshot != INVALID_HANDLE_VALUE) {
+      THREADENTRY32 te{};
+      te.dwSize = sizeof te;
+      for (BOOL ok = Thread32First(snapshot, &te); ok; ok = Thread32Next(snapshot, &te)) {
+        if (te.th32OwnerProcessID != GetCurrentProcessId() || te.th32ThreadID == self) continue;
+        if (std::find(armed.begin(), armed.end(), te.th32ThreadID) != armed.end()) continue;
+        armed.push_back(te.th32ThreadID);
+        HANDLE t = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, te.th32ThreadID);
+        if (!t) continue;
+        if (SuspendThread(t) != static_cast<DWORD>(-1)) {
+          CONTEXT c{};
+          c.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+          if (GetThreadContext(t, &c)) {
+            DWORD64* dr[4] = {&c.Dr0, &c.Dr1, &c.Dr2, &c.Dr3};
+            for (int k = 0; k < g_hw_watch_count; ++k) *dr[k] = g_hw_watches[k].address;
+            c.Dr7 = dr7;
+            SetThreadContext(t, &c);
+          }
+          ResumeThread(t);
+        }
+        CloseHandle(t);
+      }
+      CloseHandle(snapshot);
+    }
+    Sleep(20);
+  }
+}
+
+void start_hw_watch() {
+  char spec[256] = {};
+  if (!GetEnvironmentVariableA("AMERICAS_HW_WATCH", spec, sizeof spec)) return;
+  for (const char* p = spec; *p && g_hw_watch_count < 4;) {
+    char* end = nullptr;
+    HwWatch w;
+    w.address = std::strtoull(p, &end, 16);
+    if (end == p) break;
+    if (*end == ':') w.length = static_cast<uint32_t>(std::strtoul(end + 1, &end, 16));
+    if (w.length != 1 && w.length != 2 && w.length != 4) w.length = 8;
+    w.address &= ~static_cast<uint64_t>(w.length - 1);  // breakpoints are aligned to their length
+    g_hw_watches[g_hw_watch_count++] = w;
+    logf("hw watch: watching writes to 0x%llx (%u bytes)", static_cast<unsigned long long>(w.address), w.length);
+    p = *end == ',' ? end + 1 : end;
+    if (!*end) break;
+  }
+  if (!g_hw_watch_count) return;
+  AddVectoredExceptionHandler(1, &on_hw_watch);
+  std::thread(hw_watch_thread).detach();
+}
 
 }  // namespace
 
@@ -108,6 +211,7 @@ bool TitleProcess::load(std::string& error) {
   policy_ = loader::ImportPolicy(title_dlls);
   build_command_line();
   SetUnhandledExceptionFilter(&top_level_filter);
+  start_hw_watch();
   std::signal(SIGABRT, &on_abort);
   install_cpu_emulation();
   set_title_code_test([](const void* address) { return g_process && g_process->module_containing(address) != nullptr; });

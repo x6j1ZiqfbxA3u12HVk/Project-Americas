@@ -76,6 +76,7 @@ class TitleProcess {
   long crash_filter(EXCEPTION_POINTERS* info);
   friend void on_abort(int);
   std::string describe_stack(CONTEXT ctx);
+  std::string describe_address(uint64_t address);
 
   // report.json: what the title called that we do not provide yet.
   void write_report() const;
@@ -91,7 +92,6 @@ class TitleProcess {
   HMODULE host_module(const std::string& dll);
   std::string host_ordinal_name(const std::string& dll, uint16_t ordinal);
   void build_command_line();
-  std::string describe_address(uint64_t address);
 
   RunOptions options_;
   loader::ImportPolicy policy_;
