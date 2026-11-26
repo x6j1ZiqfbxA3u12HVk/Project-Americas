@@ -17,6 +17,7 @@
 
 #include "core/file_view.h"
 #include "core/json.h"
+#include "core/sha256.h"
 #include "core/text.h"
 #include "host/dxc_compile.h"
 #include "shader/console_program.h"
@@ -318,10 +319,28 @@ std::string marker_of(std::span<const uint8_t> code) {
   return h;
 }
 
-int precompile(const fs::path& pack_dir, const fs::path& runtime_dir, const fs::path& out_dir, bool all, const fs::path& hlsl_dir) {
+// A translation's content key: hex SHA-256 of profile, entry and source.
+std::string source_key(const shader::Translation& t) {
+  const std::string text = t.profile + "\n" + t.entry + "\n" + t.hlsl;
+  const auto h = sha256(std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(text.data()), text.size()));
+  if (!h) return {};
+  static const char* const kHex = "0123456789abcdef";
+  std::string out;
+  for (uint8_t v : *h) {
+    out += kHex[v >> 4];
+    out += kHex[v & 15];
+  }
+  return out;
+}
+
+int precompile(const fs::path& pack_dir, const fs::path& runtime_dir, const fs::path& out_dir, bool all, const fs::path& hlsl_dir,
+               bool refresh) {
   SetPriorityClass(GetCurrentProcess(), BELOW_NORMAL_PRIORITY_CLASS);
   std::error_code ec;
   fs::create_directories(out_dir, ec);
+  // Compiled DXIL by content key, shared by every translator version.
+  const fs::path by_source = out_dir.parent_path() / L"by-source";
+  fs::create_directories(by_source, ec);
   // The programs the game has used: the GPU programs of its console pipelines (slots 57 and 67,
   // saved as .cpipe bundles), by marker. Bundles read before are listed in cpipe-index.tsv (the
   // bundle's name, a tab, its markers), so a pass reads only the new ones.
@@ -385,7 +404,7 @@ int precompile(const fs::path& pack_dir, const fs::path& runtime_dir, const fs::
               "first, %zu containers to look through%s\n",
               wanted.size(), new_bundles, first.size(), files.size(), all ? " (all of their programs)" : "");
   std::fflush(stdout);
-  std::atomic<size_t> next{0}, done{0}, skipped{0}, failed{0};
+  std::atomic<size_t> next{0}, done{0}, skipped{0}, failed{0}, reused{0};
   std::mutex lock;
   std::ofstream failures(out_dir / L"failures.tsv", std::ios::app);
   // Round 0, when the game waited for some programs: those alone. Round 1: everything else.
@@ -406,8 +425,9 @@ int precompile(const fs::path& pack_dir, const fs::path& runtime_dir, const fs::
             if (round == 0 && !first.count(marker)) continue;
             if (!all && !runtime_file && !wanted.count(marker)) continue;
             const fs::path out = out_dir / widen(marker + ".dxil");
+            const fs::path sidecar = out_dir / widen(marker + ".src");
             const bool have = fs::exists(out, ec);
-            if (have && hlsl_dir.empty()) {
+            if (have && hlsl_dir.empty() && !refresh) {
               ++skipped;
               continue;
             }
@@ -417,9 +437,33 @@ int precompile(const fs::path& pack_dir, const fs::path& runtime_dir, const fs::
               fs::create_directories(hlsl_dir, ec);
               std::ofstream(hlsl_dir / widen(marker + ".hlsl"), std::ios::binary) << t.hlsl;
             }
+            // The translation's content key: its source, entry and profile. DXIL is kept under
+            // it too (by-source), so a source compiled once is never compiled again, under any
+            // marker or translator version.
+            const std::string key = t.ok ? source_key(t) : std::string();
+            const fs::path stored = by_source / widen(key + ".dxil");
             if (have) {
+              std::string was;
+              std::ifstream in(sidecar);
+              std::getline(in, was);
+              in.close();
+              // Unchanged, or files from before content keys (adopted as they are on a
+              // refresh), or a program that no longer translates: kept.
+              if (!t.ok || was == key || was.empty()) {
+                if (t.ok && was.empty()) {
+                  std::ofstream(sidecar) << key;
+                  if (!fs::exists(stored, ec)) fs::copy_file(out, stored, ec);
+                }
+                std::lock_guard<std::mutex> g(lock);
+                ++skipped;
+                continue;
+              }
+            }
+            if (t.ok && fs::exists(stored, ec)) {  // the same source compiled before
+              fs::copy_file(stored, out, fs::copy_options::overwrite_existing, ec);
+              std::ofstream(sidecar) << key;
               std::lock_guard<std::mutex> g(lock);
-              ++skipped;
+              ++reused;
               continue;
             }
             std::string why = t.ok ? std::string() : t.failure;
@@ -438,6 +482,8 @@ int precompile(const fs::path& pack_dir, const fs::path& runtime_dir, const fs::
               continue;
             }
             std::ofstream(out, std::ios::binary).write(reinterpret_cast<const char*>(c.dxil.data()), static_cast<std::streamsize>(c.dxil.size()));
+            std::ofstream(stored, std::ios::binary).write(reinterpret_cast<const char*>(c.dxil.data()), static_cast<std::streamsize>(c.dxil.size()));
+            std::ofstream(sidecar) << key;
             ++done;
             std::printf("  %s %s\n", shader::hw_stage_name(p.stage), marker.c_str());
             std::fflush(stdout);
@@ -453,8 +499,8 @@ int precompile(const fs::path& pack_dir, const fs::path& runtime_dir, const fs::
     std::fflush(stdout);
   }
   }
-  std::printf("precompile: %zu compiled, %zu there already, %zu failed (%s)\n", done.load(), skipped.load(), failed.load(),
-              narrow((out_dir / L"failures.tsv").wstring()).c_str());
+  std::printf("precompile: %zu compiled, %zu reused from earlier compiles of the same source, %zu there already, %zu failed (%s)\n",
+              done.load(), reused.load(), skipped.load(), failed.load(), narrow((out_dir / L"failures.tsv").wstring()).c_str());
   return 0;
 }
 

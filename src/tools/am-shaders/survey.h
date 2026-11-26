@@ -26,9 +26,13 @@ int translate(const std::string& wanted, const std::filesystem::path& pack_dir, 
 int image_survey(const std::filesystem::path& pack_dir);
 // Compiles, with the runtime's binding, the programs the game's saved pipelines use (or every
 // program with `all`) to <out>\<marker>.dxil, where the runtime looks them up. Resumable: what
-// is there is skipped.
+// is there is skipped. With `refresh` programs already compiled are translated again, and only
+// those whose source changed (a translator fix) are compiled again. Compiled DXIL is also kept
+// by its source's content key (dxil\by-source): no source is ever compiled twice, under any
+// marker or translator version. Files from before content keys are adopted as they are.
 int precompile(const std::filesystem::path& pack_dir, const std::filesystem::path& runtime_dir,
-               const std::filesystem::path& out_dir, bool all, const std::filesystem::path& hlsl_dir = {});
+               const std::filesystem::path& out_dir, bool all, const std::filesystem::path& hlsl_dir = {},
+               bool refresh = false);
 int translation_survey(const std::filesystem::path& pack_dir, const std::filesystem::path& out_json, size_t compile_sample,
                        const std::filesystem::path& hlsl_dir = {});
 
