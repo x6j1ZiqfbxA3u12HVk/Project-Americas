@@ -222,6 +222,42 @@ void* TitleMemory::allocate(const ConsoleRequest& request) {
     parameter.Pointer = &requirements;
     parameters = 1;
   }
+  // A GPU-visible allocation over 1 GiB: 1 GiB host allocations side by side, from one
+  // placeholder split up, so the GPU can open each (D3D12 opens none over about 2 GiB, and
+  // shaders reach title memory a 64 KiB page at a time, so the seams do not show).
+  constexpr uint64_t kGpuChunk = uint64_t{1} << 30;
+  if (!request.address && (h.type & MEM_COMMIT) && h.gpu_access && h.size > kGpuChunk && !region.physical) {
+    void* p = placeholders().virtual_alloc2(GetCurrentProcess(), nullptr, h.size, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS,
+                                            &parameter, 1);
+    if (!p) {
+      ++refused_;
+      return nullptr;
+    }
+    const uint64_t base = reinterpret_cast<uint64_t>(p);
+    bool ok = true;
+    for (uint64_t off = 0; ok && h.size - off > kGpuChunk; off += kGpuChunk) {
+      ok = VirtualFree(ptr(base + off), kGpuChunk, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) != 0;
+    }
+    uint64_t made = 0;
+    for (; ok && made < h.size; made += kGpuChunk) {
+      const uint64_t len = std::min(kGpuChunk, h.size - made);
+      ok = placeholders().virtual_alloc2(GetCurrentProcess(), ptr(base + made), len, MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER,
+                                         h.protect, nullptr, 0) != nullptr;
+    }
+    if (!ok) {
+      const DWORD error = GetLastError();
+      for (uint64_t off = 0; off < h.size; off += kGpuChunk) VirtualFree(ptr(base + off), 0, MEM_RELEASE);
+      logf("memory: cannot make a %s GPU allocation of 1 GiB pieces (error %lu)", format_bytes(h.size).c_str(), error);
+      ++refused_;
+      SetLastError(error);
+      return nullptr;
+    }
+    split_[base] = h.size;
+    add_region(base, region);
+    logf("memory: %s GPU allocation at 0x%s made of %llu host allocations of 1 GiB", format_bytes(h.size).c_str(), hex(base).c_str(),
+         static_cast<unsigned long long>((h.size + kGpuChunk - 1) / kGpuChunk));
+    return p;
+  }
   void* p = placeholders().virtual_alloc2(GetCurrentProcess(), ptr(request.address), h.size, h.type, h.protect,
                           parameters ? &parameter : nullptr, parameters);
   if (!p) {
@@ -246,6 +282,18 @@ bool TitleMemory::free(void* address, uint64_t size, uint32_t type) {
     }
     regions_.erase(it);
     return release_physical(a, region_size);
+  }
+  if (auto it = split_.find(a); it != split_.end()) {
+    // One made of 1 GiB pieces: each piece is released.
+    const uint64_t whole = it->second;
+    if (size && size != whole) {
+      SetLastError(ERROR_INVALID_PARAMETER);
+      return false;
+    }
+    for (uint64_t off = 0; off < whole; off += uint64_t{1} << 30) VirtualFree(ptr(a + off), 0, MEM_RELEASE);
+    split_.erase(it);
+    cut_regions(a, whole);
+    return true;
   }
   const uint64_t extent = allocation_extent(a);
   if (size && size == extent) size = 0;  // the console accepts the allocation's own size

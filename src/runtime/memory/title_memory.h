@@ -136,6 +136,9 @@ class TitleMemory {
   MemoryOptions options_;
   mutable std::mutex mutex_;
   std::map<uint64_t, Region> regions_;  // by base; never overlapping
+  // GPU-visible allocations over 1 GiB made of 1 GiB host allocations side by side (the GPU
+  // opens a host allocation of at most about 2 GiB): base -> size.
+  std::map<uint64_t, uint64_t> split_;
   std::map<uint64_t, View> views_;      // by address; never overlapping
 
   HANDLE section_ = nullptr;      // the lazy pool: pages [0, lazy_pages_)
