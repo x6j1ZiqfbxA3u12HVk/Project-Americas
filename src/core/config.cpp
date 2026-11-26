@@ -48,6 +48,18 @@ Config load_config(std::vector<std::string>& warnings) {
       const std::string v = to_lower_ascii(value);
       if (v == "auto" || v == "series_s" || v == "series_x") config.console = v;
       else warnings.push_back(where + ":" + std::to_string(line_no) + ": console must be auto, series_s or series_x");
+    } else if (key == "shader_service") {
+      const std::string v = to_lower_ascii(value);
+      if (v == "on" || v == "auto") config.shader_service = true;
+      else if (v == "off") config.shader_service = false;
+      else warnings.push_back(where + ":" + std::to_string(line_no) + ": shader_service must be on or off");
+    } else if (key == "shader_jobs") {
+      const std::string v(value);
+      if (!v.empty() && v.size() <= 3 && v.find_first_not_of("0123456789") == std::string::npos) {
+        config.shader_jobs = static_cast<unsigned>(std::stoul(v));
+      } else {
+        warnings.push_back(where + ":" + std::to_string(line_no) + ": shader_jobs must be a number (0 = automatic)");
+      }
     } else {
       warnings.push_back(where + ":" + std::to_string(line_no) + ": unknown key '" + key + "'");
     }

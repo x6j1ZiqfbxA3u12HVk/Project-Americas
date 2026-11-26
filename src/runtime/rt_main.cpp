@@ -2,11 +2,13 @@
 //
 //   americas [--title <exe>] [--force-relocation] [--unimplemented zero|trap]
 //            [--allow-missing-cpu-features] [--console auto|series_s|series_x]
-//            [--memory-limit <MiB>] [--timeout <seconds>] [-- <title arguments>]
+//            [--memory-limit <MiB>] [--timeout <seconds>] [--no-shader-service]
+//            [-- <title arguments>]
 //
 // --memory-limit caps the process's committed memory (a job object, which counts private memory;
 // the physical page pool holds itself to the same cap); --timeout ends the run after that many
 // seconds, report written. Both are for unattended test runs. --console overrides americas.ini.
+// --no-shader-service: do not start `am-shaders serve` (americas.ini shader_service = off).
 //
 // Without --title it runs the executable MicrosoftGame.Config names in game_dir (americas.ini).
 
@@ -25,6 +27,7 @@
 #include "runtime/log.h"
 #include "runtime/memory/title_memory.h"
 #include "runtime/process.h"
+#include "runtime/shader_service.h"
 #include "runtime/title_config.h"
 
 // The TLS carriers (runtime/tls.h): imported, so Windows loads them with their slots.
@@ -41,7 +44,8 @@ int usage() {
   std::fprintf(stderr,
                "usage: americas [--title <exe>] [--force-relocation] [--unimplemented zero|trap]\n"
                "                [--allow-missing-cpu-features] [--console auto|series_s|series_x]\n"
-               "                [--memory-limit <MiB>] [--timeout <seconds>] [-- <title arguments>]\n");
+               "                [--memory-limit <MiB>] [--timeout <seconds>] [--no-shader-service]\n"
+               "                [-- <title arguments>]\n");
   return 2;
 }
 
@@ -55,7 +59,8 @@ bool limit_memory(uint64_t mib) {
   HANDLE job = CreateJobObjectW(nullptr, nullptr);
   if (!job) return false;
   JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
-  limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_PROCESS_MEMORY;
+  // Breakaway allowed: the shader service leaves the job (shader_service.h).
+  limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_PROCESS_MEMORY | JOB_OBJECT_LIMIT_BREAKAWAY_OK;
   limits.ProcessMemoryLimit = static_cast<SIZE_T>(mib) << 20;
   return SetInformationJobObject(job, JobObjectExtendedLimitInformation, &limits, sizeof limits) &&
          AssignProcessToJobObject(job, GetCurrentProcess());
@@ -84,6 +89,7 @@ extern "C" __declspec(dllexport) int am_launch(const rt::LauncherInfo* info) {
   rt::RunOptions options;
   uint64_t memory_limit_mib = 0, timeout_s = 0;
   std::string console_setting = config.console;
+  bool shader_service = config.shader_service;
   options.logs_dir = config.logs_dir();
   options.cache_dir = config.cache_dir();
   options.image_window = info->image_window;
@@ -95,6 +101,8 @@ extern "C" __declspec(dllexport) int am_launch(const rt::LauncherInfo* info) {
       console_setting = narrow(info->argv[++i]);
     } else if (a == L"--force-relocation") {
       options.force_relocation = true;
+    } else if (a == L"--no-shader-service") {
+      shader_service = false;
     } else if (a == L"--allow-missing-cpu-features") {
       options.allow_missing_cpu_features = true;
     } else if (a == L"--memory-limit" && i + 1 < info->argc) {
@@ -130,6 +138,7 @@ extern "C" __declspec(dllexport) int am_launch(const rt::LauncherInfo* info) {
   for (const std::string& w : warnings) rt::logf("warning: %s", w.c_str());
   rt::logf("title %s", narrow(options.title.wstring()).c_str());
   rt::set_title_config(rt::read_title_config(options.title.parent_path()));
+  rt::configure_shader_service(shader_service, config.shader_jobs, options.cache_dir, options.logs_dir);
   rt::files::configure({options.title.parent_path(), config.userdata_dir() / L"persistent", config.userdata_dir() / L"temp"});
   if (const rt::TitleConfig& tc = rt::title_config(); tc.title_id) {
     rt::logf("title id %08X, %s %s", tc.title_id, tc.identity_name.c_str(), tc.version.c_str());

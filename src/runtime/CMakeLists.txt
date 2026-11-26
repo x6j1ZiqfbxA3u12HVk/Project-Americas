@@ -5,6 +5,7 @@ add_library(am_runtime STATIC
   image.cpp
   log.cpp
   script.cpp
+  shader_service.cpp
   process.cpp
   stubs.cpp
   title_config.cpp

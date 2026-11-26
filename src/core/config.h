@@ -13,6 +13,8 @@ struct Config {
   bool ini_found = false;
   std::filesystem::path game_dir;  // the unpacked game; read-only; empty when not configured
   std::string console = "auto";    // auto, series_s or series_x
+  bool shader_service = true;      // game runs start `am-shaders serve` (shader_service = on|off)
+  unsigned shader_jobs = 0;        // its compiles at a time; 0 = about half the host's threads
 
   std::filesystem::path logs_dir() const { return root / L"logs"; }
   std::filesystem::path cache_dir() const { return root / L"cache"; }

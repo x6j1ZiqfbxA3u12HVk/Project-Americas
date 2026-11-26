@@ -13,6 +13,7 @@
 #include "runtime/d3d12x/d3d12x.h"
 #include "runtime/d3d12x/root_signature.h"
 #include "runtime/log.h"
+#include "runtime/shader_service.h"
 
 namespace am::rt::d3d12x {
 namespace {
@@ -227,6 +228,7 @@ HRESULT WINAPI create_device(void* adapter, const uint32_t* params, const GUID* 
        d->params[8], d->params[9], d->params[10], d->params[11], d->params[12], d->params[13], d->params[14],
        d->params[15], d->params[16], d->params[17], d->params[18], d->params[19]);
   if (riid && !IsEqualGUID(*riid, kDeviceIid)) logf("  (an interface we have not seen the game ask for)");
+  start_shader_service();  // the title wants its GPU programs from here on
   *out = d;
   return S_OK;
 }

@@ -24,6 +24,7 @@
 #include "shader/console_program.h"
 #include "shader/container.h"
 #include "shader/rdna2.h"
+#include "shader/service.h"
 #include "shader/stage_io.h"
 #include "shader/translate.h"
 #include "survey.h"
@@ -572,11 +573,34 @@ int precompile(const fs::path& pack_dir, const fs::path& runtime_dir, const fs::
 // what draws and dispatches wait for) is read for new markers, and those are compiled first;
 // with none waiting, the rest of the game's pipelines' programs follow, smallest first. The
 // runtime looks for a missing program again every two seconds, so a page fills in while it
-// shows. Runs until stopped.
+// shows. One service at a time (a named mutex); runs until stopped, or until the stop event is
+// set (a game run does that when it finds a newer am-shaders.exe, then starts that one).
 int serve(const fs::path& pack_dir, const fs::path& runtime_dir, const fs::path& out_dir, unsigned jobs) {
   SetPriorityClass(GetCurrentProcess(), BELOW_NORMAL_PRIORITY_CLASS);
+  {
+    SYSTEMTIME now;
+    GetLocalTime(&now);
+    std::printf("serve: started %04u-%02u-%02u %02u:%02u:%02u, process %lu\n", now.wYear, now.wMonth, now.wDay, now.wHour,
+                now.wMinute, now.wSecond, GetCurrentProcessId());
+    std::fflush(stdout);
+  }
+  HANDLE instance = CreateMutexW(nullptr, TRUE, shader::kServiceMutex);
+  if (!instance || GetLastError() == ERROR_ALREADY_EXISTS) {
+    std::printf("serve: another am-shaders serve is running; this one ends\n");
+    return 1;
+  }
+  HANDLE stop = CreateEventW(nullptr, TRUE, FALSE, shader::kServiceStopEvent);
+  if (stop) ResetEvent(stop);
   std::error_code ec;
   fs::create_directories(out_dir, ec);
+  {
+    // Which build runs: the runtime compares it with the am-shaders.exe it would start.
+    const fs::path service_dir = out_dir.parent_path().parent_path() / shader::kServiceFolder;
+    fs::create_directories(service_dir, ec);
+    std::wstring self(32768, L'\0');
+    self.resize(GetModuleFileNameW(nullptr, self.data(), static_cast<DWORD>(self.size())));
+    std::ofstream(service_dir / shader::kServiceRunningFile) << narrow(self) << '\n';
+  }
   const fs::path by_source = out_dir.parent_path() / L"by-source";
   fs::create_directories(by_source, ec);
   struct Location {
@@ -750,8 +774,10 @@ int serve(const fs::path& pack_dir, const fs::path& runtime_dir, const fs::path&
     const auto write = [&](const fs::path& f) {
       std::ofstream(f, std::ios::binary).write(reinterpret_cast<const char*>(c.dxil.data()), static_cast<std::streamsize>(c.dxil.size()));
     };
-    write(by_source / widen(key + ".dxil"));
-    // The DXIL first, under a temporary name: the runtime never reads half a file.
+    // Under temporary names first: nothing reads half a file, even when the service is stopped
+    // mid-write.
+    write(by_source / widen(key + ".tmp"));
+    fs::rename(by_source / widen(key + ".tmp"), by_source / widen(key + ".dxil"), ec);
     write(out_dir / widen(marker + ".tmp"));
     fs::rename(out_dir / widen(marker + ".tmp"), out_dir / widen(marker + ".dxil"), ec);
     std::ofstream(out_dir / widen(marker + ".src")) << key;
@@ -762,9 +788,8 @@ int serve(const fs::path& pack_dir, const fs::path& runtime_dir, const fs::path&
     std::fflush(stdout);
   };
 
-  std::vector<std::thread> workers;
   for (unsigned w = 0; w < jobs; ++w) {
-    workers.emplace_back([&] {
+    std::thread([&] {
       for (;;) {
         std::string marker;
         bool waited = false;
@@ -788,9 +813,18 @@ int serve(const fs::path& pack_dir, const fs::path& runtime_dir, const fs::path&
         if (fs::exists(out_dir / widen(marker + ".dxil"), ec)) continue;
         compile_one(marker, waited);
       }
-    });
+    }).detach();
   }
-  for (std::thread& t : workers) t.join();
+  // Until stopped. Compiles in flight are dropped (their files are written under temporary
+  // names), and the process ends at once rather than wait minutes for DXC.
+  if (stop) WaitForSingleObject(stop, INFINITE);
+  else Sleep(INFINITE);
+  {
+    std::lock_guard<std::mutex> g(lock);
+    std::printf("serve: asked to stop (%zu compiled, %zu reused)\n", compiled.load(), reused.load());
+    std::fflush(stdout);
+  }
+  TerminateProcess(GetCurrentProcess(), 0);
   return 0;
 }
 

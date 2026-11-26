@@ -1326,3 +1326,22 @@ pressure (analysis in `C:\Project Americas\crash`, WinDbg's cdb in the WinDbg pa
   `am-shaders serve` restarted with them (`logs\serve9.txt`). DirectStorage: ~1,600 requests
   fail with E_INVALIDARG, page destinations for `octa_imposters.ttpf` (64 KiB destinations):
   `write_pages` refusing a page number; next to look at.
+
+## The shader service starts itself (2026-11-26, night)
+
+* **Why it was not running:** `am-shaders serve` ran as a background task of the working
+  session, and ended with it (no crash: Windows' event log shows none after 18:00). Nothing
+  started it again.
+* **Now a game run starts it** (`runtime/shader_service.cpp`), when the title creates its D3D12
+  device: from a copy in `cache\shaders\servicem-shaders-<size>-<time>.exe` (so builds can
+  replace `am-shaders.exe` freely; no more renaming aside), below normal priority, outside the
+  run's job (`CREATE_BREAKAWAY_FROM_JOB`; inside it, with a log line saying so, when a job refuses),
+  output appended to `logs\serve.txt`. It keeps running after the game ends.
+* One service at a time (`Local\AmericasShaderService` mutex); `cache\shaders\serviceunning.txt`
+  names the executable it runs from. When a run finds that build differs from
+  `binm-shaders.exe` (a new translator), it sets `Local\AmericasShaderServiceStop`; the old
+  service ends at once (files are written under temporary names, so a stop mid-write leaves
+  nothing half-written) and the new one starts.
+* Jobs: about half the host's threads (3 here); `americas.ini` `shader_jobs = N`,
+  `shader_service = off`, or `--no-shader-service` on the command line.
+* Started by hand it still works as before (`am-shaders serve 3`); a second one exits at once.
