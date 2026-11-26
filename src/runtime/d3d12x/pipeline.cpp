@@ -393,6 +393,11 @@ std::string compute_pipeline_counts() {
          std::to_string(g_compute_refused.load()) + " refused, of " + std::to_string(g_compute_queued.load()) + " queued";
 }
 
+std::string compute_marker_of(const void* object) {
+  Object* o = object_of_kind(object, pipeline_kind());
+  return o && static_cast<const PipelineState*>(o)->compute ? static_cast<const PipelineState*>(o)->compute_marker : std::string();
+}
+
 std::string describe_pipeline(const void* object) {
   Object* o = object_of_kind(object, pipeline_kind());
   if (!o) return object ? "(not a pipeline of ours)" : "(none)";

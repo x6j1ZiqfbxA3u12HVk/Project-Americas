@@ -20,6 +20,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <map>
 #include <mutex>
 #include <set>
 #include <string>
@@ -94,6 +95,7 @@ struct HostList {
   uint64_t compute_args[kParams] = {};
   std::vector<uint32_t> compute_constants[kParams];
   bool flushed = false;  // it holds the image bindings' upkeep (and their misses' readback)
+  std::vector<std::string> dispatched;  // the compute programs it runs (markers), for slow-GPU reports
   DXGI_FORMAT targets[8] = {};  // the bound render targets' view formats
   uint32_t target_count = 0;
   // What this host list has been given (D3D12 lists inherit nothing from each other).
@@ -209,6 +211,7 @@ ID3D12GraphicsCommandList* host_begin(CommandList* l) {
   h.allocators[pick].fence = UINT64_MAX;
   h.current = pick;
   h.open = true;
+  h.dispatched.clear();
   h.ready = false;
   h.states.clear();
   h.bound = false;
@@ -392,6 +395,10 @@ void dispatch(HostList& h, ID3D12GraphicsCommandList* list, const Command& c) {
   if (!table) {
     ++g_dispatches_skipped;
     return;
+  }
+  if (h.dispatched.size() < 64) {
+    std::string m = compute_marker_of(h.pipeline);
+    if (std::find(h.dispatched.begin(), h.dispatched.end(), m) == h.dispatched.end()) h.dispatched.push_back(std::move(m));
   }
   if (!h.compute_bound) {
     list->SetComputeRootSignature(translated_root_signature());
@@ -803,6 +810,30 @@ void write_value(const ValueWrite& w) {
   }
 }
 
+// The compute programs of each recent submission (by its host fence value), to name what the GPU
+// is still running when it is slow.
+std::mutex g_submitted_lock;
+std::map<uint64_t, std::vector<std::string>> g_submitted;
+
+void note_submitted(uint64_t fence, std::vector<std::string> programs) {
+  std::lock_guard g(g_submitted_lock);
+  g_submitted[fence] = std::move(programs);
+  while (g_submitted.size() > 256) g_submitted.erase(g_submitted.begin());
+}
+
+// The programs of the submissions after `completed` up to `fence`.
+std::string programs_between(uint64_t completed, uint64_t fence) {
+  std::lock_guard g(g_submitted_lock);
+  std::string text;
+  size_t n = 0;
+  for (auto it = g_submitted.upper_bound(completed); it != g_submitted.end() && it->first <= fence; ++it) {
+    for (const std::string& m : it->second) {
+      if (n++ < 16) text += " " + m.substr(0, 16);
+    }
+  }
+  return text.empty() ? " (none)" : text;
+}
+
 // Writes wait for the host fence after the lists that hold them, then land in order, from a
 // thread of ours: as on the console, a value is written once the work before it has run.
 class ValueWriter {
@@ -834,7 +865,11 @@ class ValueWriter {
         if (WaitForSingleObject(event, 2000) == WAIT_TIMEOUT) {
           static std::atomic<int> logged{0};
           if (logged.fetch_add(1, std::memory_order_relaxed) < 4) {
-            logf("gpu: lists still running after 2 s; their memory value writes land anyway");
+            const uint64_t completed = gpu->fence->GetCompletedValue();
+            logf("gpu: lists still running after 2 s (host fence at %llu of %llu); their memory value writes land anyway; "
+                 "compute programs in them:%s",
+                 static_cast<unsigned long long>(completed), static_cast<unsigned long long>(next.first),
+                 programs_between(completed, next.first).c_str());
           }
         }
       }
@@ -1050,6 +1085,15 @@ void submit_lists(UINT count, void* const* lists) {
   ID3D12CommandList* uploads = texture_uploads_for_submission();
   if (uploads) host_lists.insert(host_lists.begin(), uploads);
   const uint64_t done = gpu->submit(static_cast<UINT>(host_lists.size()), host_lists.data());
+  {
+    std::vector<std::string> programs;
+    for (HostList* h : owners) {
+      for (const std::string& m : h->dispatched) {
+        if (std::find(programs.begin(), programs.end(), m) == programs.end()) programs.push_back(m);
+      }
+    }
+    note_submitted(done, std::move(programs));
+  }
   if (uploads) bindings_submitted(done, uploads);
   if (!writes.empty()) value_writer().add(done, std::move(writes));
   for (HostList* h : owners) {

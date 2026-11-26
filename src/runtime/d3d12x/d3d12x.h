@@ -77,6 +77,8 @@ HRESULT create_console_pipeline(const char* how, const void* desc, const GUID* r
 HRESULT create_derived_pipeline(const void* base, UINT count, const void* desc, const GUID* riid, void** out);
 // "how it was made, then each shader's stage and hash" (logs).
 std::string describe_pipeline(const void* pipeline);
+// A compute pipeline's program marker ("" for others).
+std::string compute_marker_of(const void* pipeline);
 
 // xg.cpp: xg_xs.dll, the console's texture layout library.
 HRESULT WINAPI xg_suggest_swizzle_mode(const D3D12_RESOURCE_DESC* desc, UINT flags, UINT* layout);
