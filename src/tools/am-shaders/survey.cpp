@@ -258,6 +258,13 @@ int disasm(const std::string& wanted, const fs::path& pack_dir, const fs::path& 
         continue;
       }
       const auto code = as_dwords(bytes);
+      if (by_marker) {
+        // The program's record (its stage interface from +0x78), for reading by eye.
+        const auto record = b.record(p);
+        std::printf("; record, %zu bytes:", record.size());
+        for (size_t k = 0; k < record.size() && k < 0x200; ++k) std::printf("%s%02x", k % 32 ? " " : "\n;   ", record[k]);
+        std::printf("\n");
+      }
       std::printf("; %s program %d: %s, %s, %zu dwords, VGPRs %u, SGPRs %u, LDS %u bytes\n",
                   narrow(file.stem().wstring()).c_str(), index, shader::hw_stage_name(p.stage),
                   p.wave32 ? "wave32" : "wave64", code.size(), p.vgprs, p.sgprs, p.lds_bytes);

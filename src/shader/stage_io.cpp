@@ -46,9 +46,11 @@ std::vector<Element> read_signature(const Part* part) {
   return out;
 }
 
-const Element* by_register(const std::vector<Element>& sig, uint32_t reg) {
+// The element in register `reg` (not a system value); with a component `mask`, the one whose
+// components it shares (a register can hold two: TEXCOORD2 in xy, NORMAL2 in zw).
+const Element* by_register(const std::vector<Element>& sig, uint32_t reg, uint32_t mask = 0) {
   for (const Element& e : sig) {
-    if (e.reg == reg && e.system_value == 0) return &e;
+    if (e.reg == reg && e.system_value == 0 && (!mask || (e.mask & mask))) return &e;
   }
   return nullptr;
 }
@@ -93,10 +95,14 @@ bool read_stage_io(std::span<const uint8_t> container, const NativeBlob& blob, c
   }
   if (program.stage == HwStage::Ps) {
     for (size_t at = 0x78; at + 8 <= record.size() && in.inputs.size() < 32; at += 8) {
-      const uint8_t type = record[at], reg = record[at + 1], attr = record[at + 3];
+      const uint8_t type = record[at], reg = record[at + 1], mask = record[at + 2], attr = record[at + 3];
       if (!type) break;
-      const Element* e = by_register(isg, reg);
+      const Element* e = by_register(isg, reg, mask & 0xF);
       if (!e) {
+        // A system value the PC signature carries in that register (SV_ClipDistance, record
+        // type 7): the host gives it, no attribute to interpolate.
+        const bool system_value = std::any_of(isg.begin(), isg.end(), [&](const Element& x) { return x.reg == reg && x.system_value; });
+        if (system_value) continue;
         error = "pixel attribute register " + std::to_string(reg) + " not in the signature";
         return false;
       }
