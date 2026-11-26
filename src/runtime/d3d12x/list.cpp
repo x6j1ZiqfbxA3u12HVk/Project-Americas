@@ -24,6 +24,7 @@
 #include <set>
 #include <string>
 #include <thread>
+#include <unordered_map>
 
 #include "core/text.h"
 #include "runtime/d3d12x/bindings.h"
@@ -768,8 +769,19 @@ struct ValueWrite {
   uint32_t bytes = 4, flags = 0;  // flags 1: the GPU timestamp, 2: the system timestamp (64 bits)
 };
 
+// The last value our writes put at each address (to tell a wait whose writer never ran from one
+// whose writer is behind).
+std::mutex g_written_lock;
+std::unordered_map<uint64_t, uint64_t> g_written;
+
+void note_written(uint64_t address, uint64_t value) {
+  std::lock_guard g(g_written_lock);
+  g_written[address] = value;
+}
+
 void write_value(const ValueWrite& w) {
   uint64_t v = w.value;
+  note_written(w.address, v);
   if (w.bytes == 8 && (w.flags & 3)) {  // both clocks tick at the queue's timestamp frequency, QPC's
     LARGE_INTEGER t;
     QueryPerformanceCounter(&t);
@@ -872,9 +884,17 @@ void wait_for_values(const Recording& r) {
     if (!met) {
       static std::atomic<int> logged{0};
       if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
-        logf("gpu: a list waits for the value at 0x%s (comparison %u, reference %llu, now %llu): not met in 2 s, let go",
+        std::string last = "never written by a list of ours";
+        {
+          std::lock_guard g(g_written_lock);
+          if (auto it = g_written.find(address); it != g_written.end()) last = "last written " + std::to_string(it->second);
+          size_t close_by = 0;
+          for (const auto& [a, v] : g_written) close_by += a - (address & ~0xFFFull) < 0x2000;
+          last += ", " + std::to_string(close_by) + " written addresses within its 8 KiB";
+        }
+        logf("gpu: a list waits for the value at 0x%s (comparison %u, reference %llu, now %llu; %s): not met in 2 s, let go",
              hex(address).c_str(), comparison, static_cast<unsigned long long>(reference),
-             static_cast<unsigned long long>(read_value(address, bytes)));
+             static_cast<unsigned long long>(read_value(address, bytes)), last.c_str());
       }
     }
   }

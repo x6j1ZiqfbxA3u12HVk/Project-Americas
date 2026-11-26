@@ -1310,3 +1310,11 @@ pressure (analysis in `C:\Project Americas\crash`, WinDbg's cdb in the WinDbg pa
     has it: map the console descriptions to D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC),
     or answer the prebuild query with sizes and make the builds no-ops, so the frame's work runs
     and the waited-for values get written (raytraced effects then show nothing).
+* **The awaited values are never written by any list of ours** (the timeout message now says
+  so: "never written by a list of ours, N written addresses within its 8 KiB"). Addresses
+  0xd8437fe38..0xd84380078, 16 bytes apart, comparison 7, reference = a per-frame counter
+  (2719, 2960, 3435 in three runs). So the writer is a GPU write we drop. Suspects, in order:
+  the slots we take quietly as "pipeline syncs" (131, 132, 142: one may be an end-of-pipe
+  write of a value), a queue-level signal to memory, the raytracing calls (85/86, probes:
+  nothing happens). Next: log the arguments of 131/132/142 and of the queue's slots for an
+  address in that range; the right one writes `reference` there.
