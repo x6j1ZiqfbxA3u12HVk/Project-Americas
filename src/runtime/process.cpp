@@ -905,6 +905,9 @@ long TitleProcess::crash_filter(EXCEPTION_POINTERS* info) {
     log_line(text);
     std::ofstream(options_.logs_dir / L"crash.txt", std::ios::binary) << text << '\n';
     write_report();
+    // Every other thread's stack too (hang.txt): the title's own fatals (its watchdog) are about
+    // what another thread is stuck on.
+    dump_threads();
   }
   if (title_filter_) return title_filter_(info);
   return EXCEPTION_EXECUTE_HANDLER;

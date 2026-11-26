@@ -1,11 +1,13 @@
 // am-shaders translate / tsurvey: the shader translator on the corpus.
 
 #include <windows.h>
+#include <share.h>
 
 #include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdarg>
 #include <cstdio>
 #include <fstream>
 #include <iterator>
@@ -576,12 +578,34 @@ int precompile(const fs::path& pack_dir, const fs::path& runtime_dir, const fs::
 // runtime looks for a missing program again every two seconds, so a page fills in while it
 // shows. One service at a time (a named mutex); runs until stopped, or until the stop event is
 // set (a game run does that when it finds a newer am-shaders.exe, then starts that one).
-int serve(const fs::path& pack_dir, const fs::path& runtime_dir, const fs::path& out_dir, unsigned jobs) {
+namespace {
+
+// The service's output: its console, and (--log) a file it appends to.
+FILE* g_serve_log = nullptr;
+void say(const char* format, ...) {
+  va_list a;
+  va_start(a, format);
+  std::vfprintf(stdout, format, a);
+  va_end(a);
+  std::fflush(stdout);
+  if (g_serve_log) {
+    va_start(a, format);
+    std::vfprintf(g_serve_log, format, a);
+    va_end(a);
+    std::fflush(g_serve_log);
+  }
+}
+
+}  // namespace
+
+int serve(const fs::path& pack_dir, const fs::path& runtime_dir, const fs::path& out_dir, unsigned jobs, const fs::path& log) {
   SetPriorityClass(GetCurrentProcess(), BELOW_NORMAL_PRIORITY_CLASS);
+  if (!log.empty()) g_serve_log = _wfsopen(log.c_str(), L"a", _SH_DENYNO);
+  SetConsoleTitleW(L"Project Americas - shader service");
   {
     SYSTEMTIME now;
     GetLocalTime(&now);
-    std::printf("serve: started %04u-%02u-%02u %02u:%02u:%02u, process %lu\n", now.wYear, now.wMonth, now.wDay, now.wHour,
+    say("serve: started %04u-%02u-%02u %02u:%02u:%02u, process %lu\n", now.wYear, now.wMonth, now.wDay, now.wHour,
                 now.wMinute, now.wSecond, GetCurrentProcessId());
     std::fflush(stdout);
   }
@@ -602,11 +626,11 @@ int serve(const fs::path& pack_dir, const fs::path& runtime_dir, const fs::path&
     // A replacement (the stop event is set: the running one finishes its compiles, then ends)
     // waits its turn; otherwise one is running already.
     if (!stop || WaitForSingleObject(stop, 0) != WAIT_OBJECT_0) {
-      std::printf("serve: another am-shaders serve is running; this one ends\n");
+      say("serve: another am-shaders serve is running; this one ends\n");
       return 1;
     }
     record_self();  // the build that takes over: a run meanwhile starts no third one
-    std::printf("serve: the running service finishes its compiles first\n");
+    say("serve: the running service finishes its compiles first\n");
     std::fflush(stdout);
     const DWORD w = WaitForSingleObject(instance, INFINITE);
     if (w != WAIT_OBJECT_0 && w != WAIT_ABANDONED) return 1;
@@ -693,7 +717,7 @@ int serve(const fs::path& pack_dir, const fs::path& runtime_dir, const fs::path&
     }
     std::sort(bulk.begin(), bulk.end(), [&](const std::string& a, const std::string& b) { return where[a].code_size > where[b].code_size; });
   }
-  std::printf("serve: %zu programs mapped in %zu containers (%.0f s); %zu of the game's pipelines' programs not compiled yet; "
+  say("serve: %zu programs mapped in %zu containers (%.0f s); %zu of the game's pipelines' programs not compiled yet; "
               "%u at a time\n",
               where.size(), files.size(), std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), bulk.size(), jobs);
   std::fflush(stdout);
@@ -744,7 +768,7 @@ int serve(const fs::path& pack_dir, const fs::path& runtime_dir, const fs::path&
             for (const std::string& m : fresh) {
               if (where.count(m) && !taken.count(m) && !fs::exists(out_dir / widen(m + ".dxil"), ec)) urgent.push_back(m);
             }
-            std::printf("serve: %zu new stream containers mapped\n", added);
+            say("serve: %zu new stream containers mapped\n", added);
           }
         }
       }
@@ -759,7 +783,7 @@ int serve(const fs::path& pack_dir, const fs::path& runtime_dir, const fs::path&
       std::lock_guard<std::mutex> g(lock);
       auto it = where.find(marker);
       if (it == where.end()) {
-        std::printf("serve: %s is in no container we have\n", marker.c_str());
+        say("serve: %s is in no container we have\n", marker.c_str());
         std::fflush(stdout);
         return;
       }
@@ -776,7 +800,7 @@ int serve(const fs::path& pack_dir, const fs::path& runtime_dir, const fs::path&
       failures.flush();
       ++refused;
       ++refusals[why.substr(0, 60)];
-      std::printf("  %srefused: %s %s: %s\n", waited ? "waited for, " : "", shader::hw_stage_name(at.stage), marker.c_str(),
+      say("  %srefused: %s %s: %s\n", waited ? "waited for, " : "", shader::hw_stage_name(at.stage), marker.c_str(),
                   why.substr(0, 120).c_str());
       std::fflush(stdout);
     };
@@ -831,7 +855,7 @@ int serve(const fs::path& pack_dir, const fs::path& runtime_dir, const fs::path&
     std::ofstream(out_dir / widen(marker + ".src")) << key;
     ++compiled;
     std::lock_guard<std::mutex> g(lock);
-    std::printf("  %s%s %s, %zu KiB of HLSL, %.1f s (%zu compiled, %zu reused)\n", waited ? "waited for: " : "",
+    say("  %s%s %s, %zu KiB of HLSL, %.1f s (%zu compiled, %zu reused)\n", waited ? "waited for: " : "",
                 shader::hw_stage_name(at.stage), marker.c_str(), t.hlsl.size() >> 10, took, compiled.load(), reused.load());
     std::fflush(stdout);
   };
@@ -866,12 +890,12 @@ int serve(const fs::path& pack_dir, const fs::path& runtime_dir, const fs::path&
           } else if (busy == 0 && deferred_huge.empty() && !idle_told) {
             // Nothing left: say so, and why the rest is not compiled.
             idle_told = true;
-            std::printf("serve: idle, waiting for the game (%zu compiled, %zu reused, %zu refused by the translator)\n",
+            say("serve: idle, waiting for the game (%zu compiled, %zu reused, %zu refused by the translator)\n",
                         compiled.load(), reused.load(), refused.load());
             std::vector<std::pair<size_t, std::string>> top;
             for (const auto& [why, n] : refusals) top.emplace_back(n, why);
             std::sort(top.rbegin(), top.rend());
-            for (size_t k = 0; k < top.size() && k < 20; ++k) std::printf("  %5zu  %s\n", top[k].first, top[k].second.c_str());
+            for (size_t k = 0; k < top.size() && k < 20; ++k) say("  %5zu  %s\n", top[k].first, top[k].second.c_str());
             std::fflush(stdout);
           }
         }
@@ -892,7 +916,7 @@ int serve(const fs::path& pack_dir, const fs::path& runtime_dir, const fs::path&
   {
     std::lock_guard<std::mutex> g(lock);
     stopping = true;
-    std::printf("serve: asked to stop; finishing %d compile(s) (%zu compiled, %zu reused)\n", busy, compiled.load(), reused.load());
+    say("serve: asked to stop; finishing %d compile(s) (%zu compiled, %zu reused)\n", busy, compiled.load(), reused.load());
     std::fflush(stdout);
   }
   for (;;) {
@@ -902,7 +926,7 @@ int serve(const fs::path& pack_dir, const fs::path& runtime_dir, const fs::path&
     }
     Sleep(500);
   }
-  std::printf("serve: stopped\n");
+  say("serve: stopped\n");
   std::fflush(stdout);
   TerminateProcess(GetCurrentProcess(), 0);
   return 0;

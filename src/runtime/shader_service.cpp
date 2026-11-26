@@ -69,52 +69,33 @@ bool ask_to_stop() {
 }
 
 bool launch(const fs::path& exe, const fs::path& work_dir, unsigned jobs, std::string& how) {
-  SECURITY_ATTRIBUTES sa{sizeof sa, nullptr, TRUE};
   std::error_code ec;
   fs::create_directories(g_logs, ec);
-  HANDLE log = CreateFileW((g_logs / L"serve.txt").c_str(), FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa,
-                           OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-  if (log == INVALID_HANDLE_VALUE) {
-    how = "cannot open serve.txt";
-    return false;
-  }
-  SIZE_T size = 0;
-  InitializeProcThreadAttributeList(nullptr, 1, 0, &size);
-  std::vector<char> attr_buf(size);
-  auto* attrs = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attr_buf.data());
-  bool ok = InitializeProcThreadAttributeList(attrs, 1, 0, &size) &&
-            UpdateProcThreadAttribute(attrs, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, &log, sizeof log, nullptr, nullptr);
-  STARTUPINFOEXW si{};
-  si.StartupInfo.cb = sizeof si;
-  si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
-  si.StartupInfo.hStdOutput = log;
-  si.StartupInfo.hStdError = log;
-  si.lpAttributeList = attrs;
-  std::wstring command = L"\"" + exe.wstring() + L"\" serve " + std::to_wstring(jobs);
+  // A console window of its own (the user likes to see it work), shown without taking the
+  // focus from the game; it also appends everything to serve.txt.
+  STARTUPINFOW si{};
+  si.cb = sizeof si;
+  si.dwFlags = STARTF_USESHOWWINDOW;
+  si.wShowWindow = SW_SHOWNOACTIVATE;
+  std::wstring command = L"\"" + exe.wstring() + L"\" serve " + std::to_wstring(jobs) + L" --log \"" + (g_logs / L"serve.txt").wstring() + L"\"";
   PROCESS_INFORMATION pi{};
-  const DWORD flags = EXTENDED_STARTUPINFO_PRESENT | DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | BELOW_NORMAL_PRIORITY_CLASS;
+  const DWORD flags = CREATE_NEW_CONSOLE | CREATE_NEW_PROCESS_GROUP | BELOW_NORMAL_PRIORITY_CLASS;
   // Outside the run's job first, so the service outlives whatever started the game.
   how = "outside the run's job";
-  if (ok) {
-    ok = CreateProcessW(exe.c_str(), command.data(), nullptr, nullptr, TRUE, flags | CREATE_BREAKAWAY_FROM_JOB, nullptr,
-                        work_dir.c_str(), &si.StartupInfo, &pi);
-    if (!ok && GetLastError() == ERROR_ACCESS_DENIED) {
-      how = "inside the run's job (the job refuses breakaway: it ends with it)";
-      ok = CreateProcessW(exe.c_str(), command.data(), nullptr, nullptr, TRUE, flags, nullptr, work_dir.c_str(),
-                          &si.StartupInfo, &pi);
-    }
-    if (!ok) how = "CreateProcess failed, error " + std::to_string(GetLastError());
-  } else {
-    how = "cannot set up the handle list";
+  bool ok = CreateProcessW(exe.c_str(), command.data(), nullptr, nullptr, FALSE, flags | CREATE_BREAKAWAY_FROM_JOB, nullptr,
+                           work_dir.c_str(), &si, &pi);
+  if (!ok && GetLastError() == ERROR_ACCESS_DENIED) {
+    how = "inside the run's job (the job refuses breakaway: it ends with it)";
+    ok = CreateProcessW(exe.c_str(), command.data(), nullptr, nullptr, FALSE, flags, nullptr, work_dir.c_str(), &si, &pi);
   }
-  DeleteProcThreadAttributeList(attrs);
-  CloseHandle(log);
-  if (ok) {
-    how += ", process " + std::to_string(pi.dwProcessId);
-    CloseHandle(pi.hThread);
-    CloseHandle(pi.hProcess);
+  if (!ok) {
+    how = "CreateProcess failed, error " + std::to_string(GetLastError());
+    return false;
   }
-  return ok;
+  how += ", process " + std::to_string(pi.dwProcessId);
+  CloseHandle(pi.hThread);
+  CloseHandle(pi.hProcess);
+  return true;
 }
 
 void start_now() {
