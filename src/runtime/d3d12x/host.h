@@ -32,6 +32,13 @@ void forget_host_texture(const void* console_resource);
 // description in `desc`), or nullptr.
 ID3D12Resource* host_texture_at(uint64_t address, D3D12_RESOURCE_DESC* desc);
 
+// copy.cpp: a submitted list's copies (buffer and texture regions, whole resources), done in
+// title memory in list order; how many were done and skipped so far.
+struct Recording;
+void run_copies(const Recording& r);
+uint64_t copies_done();
+uint64_t copies_skipped();
+
 // host_pipeline.cpp: the 24-byte marker (hex) of a shader container's program of a stage (a
 // stream subobject type: 1 VS, 2 PS, 6 CS); its precompiled DXIL; a host graphics pipeline
 // from a description (the translated root signature is filled in), or nullptr.

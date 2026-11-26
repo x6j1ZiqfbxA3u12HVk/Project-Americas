@@ -26,6 +26,7 @@ add_library(am_runtime STATIC
   hle/audio_streams.cpp
   hle/d3d12x.cpp
   d3d12x/bindings.cpp
+  d3d12x/copy.cpp
   d3d12x/descriptor_heap.cpp
   d3d12x/device.cpp
   d3d12x/dxgi.cpp

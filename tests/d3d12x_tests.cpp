@@ -249,6 +249,101 @@ TEST_CASE(d3d12x_queue_signals_fence_at_once) {
   CHECK(slot<ULONG(WINAPI*)(void*)>(fence, 2)(fence) == 0);  // released and freed
 }
 
+// The lists' copies, done in title memory at submission: a buffer region, a whole buffer, and
+// rows of a buffer footprint into a texture subresource (texels linear in it, layout.h).
+TEST_CASE(d3d12x_copies_in_title_memory) {
+  void* device = make_device();
+  using CreateFn = HRESULT(WINAPI*)(void*, const D3D12_HEAP_PROPERTIES*, UINT, const D3D12_RESOURCE_DESC*, UINT,
+                                    const D3D12_CLEAR_VALUE*, void*, UINT, const DXGI_FORMAT*, const GUID*, void**);
+  D3D12_HEAP_PROPERTIES heap{};
+  heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+  D3D12_RESOURCE_DESC bd{};
+  bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+  bd.Width = 65536;
+  bd.Height = 1;
+  bd.DepthOrArraySize = 1;
+  bd.MipLevels = 1;
+  bd.SampleDesc.Count = 1;
+  bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+  D3D12_RESOURCE_DESC td{};
+  td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+  td.Width = 64;
+  td.Height = 64;
+  td.DepthOrArraySize = 1;
+  td.MipLevels = 1;
+  td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+  td.SampleDesc.Count = 1;
+  void *a = nullptr, *b = nullptr, *t = nullptr;
+  CHECK(slot<CreateFn>(device, 127)(device, &heap, 0, &bd, 0, nullptr, nullptr, 0, nullptr, nullptr, &a) == S_OK);
+  CHECK(slot<CreateFn>(device, 127)(device, &heap, 0, &bd, 0, nullptr, nullptr, 0, nullptr, nullptr, &b) == S_OK);
+  CHECK(slot<CreateFn>(device, 127)(device, &heap, 0, &td, 0, nullptr, nullptr, 0, nullptr, nullptr, &t) == S_OK);
+  if (!a || !b || !t) return;
+  D3D12_RESOURCE_DESC desc{};
+  uint64_t pa = 0, pb = 0, pt = 0;
+  CHECK(resource_memory(a, &desc, &pa) && resource_memory(b, &desc, &pb) && resource_memory(t, &desc, &pt));
+  auto* bytes_a = reinterpret_cast<uint8_t*>(pa);
+  for (uint32_t k = 0; k < 65536; ++k) bytes_a[k] = static_cast<uint8_t>(k * 7 + 1);
+
+  Recording r;
+  Command region;
+  region.op = kCopyBufferRegion;
+  region.a[0] = reinterpret_cast<uint64_t>(b);
+  region.a[1] = 100;
+  region.a[2] = reinterpret_cast<uint64_t>(a);
+  region.a[3] = 1000;
+  region.a[4] = 50;
+  r.commands.push_back(region);
+  // 16 x 8 texels of a footprint (row pitch 256 bytes) to texel (4, 2) of the texture.
+  D3D12_TEXTURE_COPY_LOCATION dst{}, src{};
+  dst.pResource = static_cast<ID3D12Resource*>(t);
+  dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+  dst.SubresourceIndex = 0;
+  src.pResource = static_cast<ID3D12Resource*>(a);
+  src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+  src.PlacedFootprint.Offset = 512;
+  src.PlacedFootprint.Footprint = {DXGI_FORMAT_R8G8B8A8_UNORM, 16, 8, 1, 256};
+  Command tex;
+  tex.op = kCopyTextureRegion;
+  tex.a[0] = reinterpret_cast<uint64_t>(&dst);
+  tex.a[1] = 4;
+  tex.a[2] = 2;
+  tex.a[4] = reinterpret_cast<uint64_t>(&src);
+  tex.data_at = static_cast<uint32_t>(r.data.size());
+  tex.data_size = 2 * sizeof(D3D12_TEXTURE_COPY_LOCATION);
+  r.data.resize(r.data.size() + tex.data_size);
+  std::memcpy(r.data.data() + tex.data_at, &dst, sizeof dst);
+  std::memcpy(r.data.data() + tex.data_at + sizeof dst, &src, sizeof src);
+  r.commands.push_back(tex);
+  run_copies(r);
+
+  const auto* bytes_b = reinterpret_cast<const uint8_t*>(pb);
+  bool ok = true;
+  for (uint32_t k = 0; k < 50; ++k) ok = ok && bytes_b[100 + k] == bytes_a[1000 + k];
+  CHECK(ok && bytes_b[99] == 0 && bytes_b[150] == 0);
+  TextureLayout l;
+  CHECK(texture_layout(td, l));
+  const SubresourceLayout& s0 = l.subresources[0];
+  const auto* texels = reinterpret_cast<const uint8_t*>(pt) + s0.offset;
+  ok = true;
+  for (uint32_t y = 0; y < 8; ++y) {
+    for (uint32_t x = 0; x < 64; ++x) {
+      ok = ok && texels[(2 + y) * s0.row_pitch + (4 * 4) + x] == bytes_a[512 + y * 256 + x];
+    }
+  }
+  CHECK(ok && texels[(2 + 8) * s0.row_pitch + 16] == 0 && texels[2 * s0.row_pitch + 15] == 0);
+
+  // A whole buffer.
+  Recording whole;
+  Command all;
+  all.op = kCopyResource;
+  all.a[0] = reinterpret_cast<uint64_t>(b);
+  all.a[1] = reinterpret_cast<uint64_t>(a);
+  whole.commands.push_back(all);
+  run_copies(whole);
+  CHECK(std::memcmp(bytes_b, bytes_a, 65536) == 0);
+  for (void* x : {a, b, t}) slot<ULONG(WINAPI*)(void*)>(x, 2)(x);
+}
+
 TEST_CASE(d3d12x_committed_resource_memory) {
   void* device = make_device();
   D3D12_HEAP_PROPERTIES heap{};

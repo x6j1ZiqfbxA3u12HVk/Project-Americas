@@ -1229,7 +1229,7 @@ TEST_CASE(translate_narrow_global_memory) {
   CHECK(stored);
 }
 
-// The ray-tracing stand-in: a box node gives no children (zero pointers), a triangle node no hit (t = +inf).
+// The ray-tracing stand-in: the hardware's answer for a miss, all four dwords -1, for box and triangle nodes.
 TEST_CASE(translate_bvh_intersect_stand_in) {
   const Result r = run({
       0x7E020285,              // v_mov_b32_e32 v1, 5                            (a box node)
@@ -1243,8 +1243,8 @@ TEST_CASE(translate_bvh_intersect_stand_in) {
   if (!r.ran) return;
   bool ok = true;
   for (uint32_t l = 0; l < 64 && ok; ++l) {
-    ok = r.v(l, 12) == 0 && r.v(l, 13) == 0 && r.v(l, 14) == 0 && r.v(l, 15) == 0 &&
-         r.v(l, 16) == 0x7F800000u && r.v(l, 17) == 0x3F800000u && r.v(l, 18) == 0 && r.v(l, 19) == 0;
+    ok = r.v(l, 12) == 0xFFFFFFFFu && r.v(l, 13) == 0xFFFFFFFFu && r.v(l, 14) == 0xFFFFFFFFu && r.v(l, 15) == 0xFFFFFFFFu &&
+         r.v(l, 16) == 0xFFFFFFFFu && r.v(l, 17) == 0xFFFFFFFFu && r.v(l, 18) == 0xFFFFFFFFu && r.v(l, 19) == 0xFFFFFFFFu;
     if (!ok) std::printf("    lane %u: %08x %08x %08x %08x / %08x %08x %08x %08x\n", l, r.v(l, 12), r.v(l, 13), r.v(l, 14), r.v(l, 15),
                          r.v(l, 16), r.v(l, 17), r.v(l, 18), r.v(l, 19));
   }

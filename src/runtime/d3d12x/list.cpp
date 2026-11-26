@@ -11,6 +11,8 @@
 
 #include <windows.h>
 #include <d3d12.h>
+#include <dxgi1_4.h>
+#include <psapi.h>
 #include <wrl/client.h>
 
 #include <algorithm>
@@ -814,6 +816,18 @@ uint64_t WINAPI dispatch_with_initiator(CommandList* self, uint64_t x, uint64_t 
   return record<kDispatch>(self, x & 0xFFFFFFFF, y & 0xFFFFFFFF, z & 0xFFFFFFFF, 0, 0, 0, 0);
 }
 
+// Slots 85 and 86: CopyTextureRegionX(dst, x, y, z, src, box, flags) and CopyResourceX(dst,
+// src, flags): D3D12's copies with the console's flags after them (by the game's call shapes:
+// a location, three coordinates, a location and a box; two resources and 0). Recorded as the
+// copies they are; the flags are not used.
+uint64_t WINAPI copy_texture_region_x(CommandList* self, uint64_t dst, uint64_t x, uint64_t y, uint64_t z, uint64_t src, uint64_t box,
+                                      uint64_t /*flags*/) {
+  return record<kCopyTextureRegion>(self, dst, x & 0xFFFFFFFF, y & 0xFFFFFFFF, z & 0xFFFFFFFF, src, box, 0);
+}
+uint64_t WINAPI copy_resource_x(CommandList* self, uint64_t dst, uint64_t src, uint64_t /*flags*/) {
+  return record<kCopyResource>(self, dst, src, 0, 0, 0, 0, 0);
+}
+
 std::vector<Method> list_methods() {
   std::vector<Method> m = {
       {kClose, "Close", reinterpret_cast<void*>(&list_close)},
@@ -821,6 +835,8 @@ std::vector<Method> list_methods() {
       {kClearDepthStencilView, "ClearDepthStencilView", reinterpret_cast<void*>(&clear_depth_stencil)},
       {148, "AllocateSpace", reinterpret_cast<void*>(&list_allocate_space)},
       {80, "DispatchX", reinterpret_cast<void*>(&dispatch_with_initiator)},
+      {85, "CopyTextureRegionX", reinterpret_cast<void*>(&copy_texture_region_x)},
+      {86, "CopyResourceX", reinterpret_cast<void*>(&copy_resource_x)},
       rec_method<12>(), rec_method<13>(), rec_method<14>(), rec_method<15>(), rec_method<16>(), rec_method<17>(),
       rec_method<18>(), rec_method<19>(), rec_method<20>(), rec_method<21>(), rec_method<22>(), rec_method<23>(),
       rec_method<24>(), rec_method<25>(), rec_method<26>(), rec_method<32>(), rec_method<33>(), rec_method<34>(), rec_method<35>(),
@@ -1133,6 +1149,7 @@ void submit_lists(UINT count, void* const* lists) {
     if (!o) continue;
     const Recording& r = static_cast<CommandList*>(o)->rec;
     wait_for_values(r);
+    run_copies(r);  // in title memory, before the uploads below read it
     collect_writes(r, writes);
     if (!gpu) continue;
     HostList& h = static_cast<CommandList*>(o)->host;
@@ -1206,7 +1223,28 @@ void frame_present() {
          static_cast<unsigned long long>(f.frame), f.lists, f.commands, ops.c_str(),
          static_cast<unsigned long long>(g_draws_run.load()), static_cast<unsigned long long>(g_draws_skipped.load()),
          static_cast<unsigned long long>(g_dispatches_run.load()), static_cast<unsigned long long>(g_dispatches_skipped.load()));
-    logf("frame %llu: compute pipelines %s", static_cast<unsigned long long>(f.frame), compute_pipeline_counts().c_str());
+    {
+      // Where memory goes: the process's commit (one run reached 35 GB), the GPU's local and
+      // shared (system) memory in use against their budgets.
+      PROCESS_MEMORY_COUNTERS_EX pm{};
+      pm.cb = sizeof pm;
+      GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pm), sizeof pm);
+      std::string gpu_text = "no GPU";
+      if (present::HostGpu* gpu = present::host_gpu()) {
+        Microsoft::WRL::ComPtr<IDXGIAdapter3> a3;
+        DXGI_QUERY_VIDEO_MEMORY_INFO local{}, shared{};
+        if (SUCCEEDED(gpu->adapter.As(&a3)) && SUCCEEDED(a3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &local)) &&
+            SUCCEEDED(a3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &shared))) {
+          gpu_text = "GPU local " + format_bytes(local.CurrentUsage) + " of " + format_bytes(local.Budget) + ", shared " +
+                     format_bytes(shared.CurrentUsage) + " of " + format_bytes(shared.Budget);
+        }
+      }
+      logf("frame %llu: memory: process commit %s, working set %s; %s", static_cast<unsigned long long>(f.frame),
+           format_bytes(pm.PrivateUsage).c_str(), format_bytes(pm.WorkingSetSize).c_str(), gpu_text.c_str());
+    }
+    logf("frame %llu: compute pipelines %s; copies done %llu, not done %llu", static_cast<unsigned long long>(f.frame),
+         compute_pipeline_counts().c_str(), static_cast<unsigned long long>(copies_done()),
+         static_cast<unsigned long long>(copies_skipped()));
     if (!f.clears.empty()) logf("frame %llu: render-target clears:%s", static_cast<unsigned long long>(f.frame), f.clears.c_str());
     if (!f.pipelines.empty()) logf("frame %llu: pipelines and draws:%s", static_cast<unsigned long long>(f.frame), f.pipelines.c_str());
   }

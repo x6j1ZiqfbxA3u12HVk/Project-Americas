@@ -1910,21 +1910,18 @@ const std::unordered_map<std::string, Handler>& table() {
       add("image_store", ImgOp{ImgKind::Store});
       add("image_get_resinfo", ImgOp{ImgKind::Info});
       add("image_get_lod", ImgOp{ImgKind::Lod});
-      // Ray tracing, a STAND-IN (the user's choice, 2026-11-26): every ray hits nothing. The BVH
-      // node layout the hardware reads is not known yet, so instead of a real intersection:
-      // box and instance nodes (node pointer type 4-7, the low 3 bits) return no children, as
-      // four zero pointers: the game's traversals push a child when its pointer is above 7
-      // (0xFFFFFFFF passed that test, and the traversal never ended: a GPU hang); one that tests
-      // against 0xFFFFFFFF instead visits node 0 once more, a triangle node, which misses.
-      // Triangle nodes return t = +inf over 1 with no hit (hit status / I, J 0). Raytraced
-      // effects show nothing until this is the real instruction (HANDOFF, "Raytracing").
+      // Ray tracing, a STAND-IN (the user's choice, 2026-11-26): every ray hits nothing. Instead
+      // of an intersection the instruction answers what the hardware gives for a miss: all four
+      // dwords -1 (a box node: no child hit; a triangle node: no hit). The game's traversals end
+      // on that. Raytraced effects show nothing until this is the real instruction, which reads
+      // the node at (pointer & ~7) << 3 (kinds in the low 3 bits: 0-3 triangle, 4 box of f16
+      // bounds, 5 box of f32 bounds; see HANDOFF, "Raytracing").
       const auto bvh = [](Ctx& c) {
-        const uint32_t vd = c.f(Field::VDATA), a = c.f(Field::VADDR);
-        c.touch_v(a);
+        const uint32_t vd = c.f(Field::VDATA);
         c.touch_v(vd + 3);
         c.line("// image_bvh_intersect_ray stand-in: no hit");
-        c.line("if (AM_ACT) { bool box = (v[" + num(a) + "] & 4u) != 0u; v[" + num(vd) + "] = box ? 0u : 0x7F800000u; v[" + num(vd + 1) +
-               "] = box ? 0u : 0x3F800000u; v[" + num(vd + 2) + "] = 0u; v[" + num(vd + 3) + "] = 0u; }");
+        c.line("if (AM_ACT) { v[" + num(vd) + "] = 0xFFFFFFFFu; v[" + num(vd + 1) + "] = 0xFFFFFFFFu; v[" + num(vd + 2) +
+               "] = 0xFFFFFFFFu; v[" + num(vd + 3) + "] = 0xFFFFFFFFu; }");
         return true;
       };
       t["image_bvh_intersect_ray"] = bvh;
