@@ -938,7 +938,11 @@ void submit_lists(UINT count, void* const* lists) {
     if (!writes.empty()) value_writer().add(0, std::move(writes));  // nothing runs on the host: in order, now
     return;
   }
+  // Textures whose memory the title wrote before submitting are uploaded ahead of its lists.
+  ID3D12CommandList* uploads = texture_uploads_for_submission();
+  if (uploads) host_lists.insert(host_lists.begin(), uploads);
   const uint64_t done = gpu->submit(static_cast<UINT>(host_lists.size()), host_lists.data());
+  if (uploads) bindings_submitted(done, uploads);
   if (!writes.empty()) value_writer().add(done, std::move(writes));
   for (HostList* h : owners) {
     h->allocators[h->current].fence = done;

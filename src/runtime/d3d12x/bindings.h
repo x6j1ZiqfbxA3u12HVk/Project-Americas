@@ -27,8 +27,12 @@ void bind_texture_view(const D3D12_RESOURCE_DESC& resource, const D3D12_SHADER_R
 // The title's memory in [address, address + size) was written: textures over it are uploaded
 // again at the next submission.
 void notify_title_write(uint64_t address, uint64_t size);
-// Records the uploads and the table's upkeep into `list`, before its draws.
+// Records the table's upkeep into `list`, before its draws.
 void flush_bindings(ID3D12GraphicsCommandList* list);
+// At a submission: the uploads of textures whose memory changed (live ones checked now), as a
+// closed list to run ahead of the title's; nullptr when there are none. bindings_submitted
+// follows with that list.
+ID3D12CommandList* texture_uploads_for_submission();
 // `list` (one that flushed) was submitted; `fence_value` follows it: what it reads is freed and
 // its readback read once that completes.
 void bindings_submitted(uint64_t fence_value, const void* list);

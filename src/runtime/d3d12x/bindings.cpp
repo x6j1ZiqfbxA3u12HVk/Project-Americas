@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstring>
 #include <mutex>
+#include <thread>
 #include <vector>
 
 #include "core/text.h"
@@ -101,6 +102,11 @@ uint64_t offset_4k_s(int log2_bytes, uint32_t x, uint32_t y, uint32_t pitch) {
   return ((uint64_t{y / tile_h} * tiles_per_row + x / tile_w) << 12) + in_tile;
 }
 
+// The texture watcher's rounds (see Bindings::watch): a texture that changed is checked every
+// round for kLiveRounds rounds after; a new one for kNewRounds (the title often fills it after
+// making its view, which is when it was first uploaded).
+constexpr uint32_t kLiveRounds = 600, kNewRounds = 200;
+
 struct Texture {
   uint64_t address = 0, size = 0;
   D3D12_RESOURCE_DESC desc{};
@@ -108,21 +114,33 @@ struct Texture {
   ComPtr<ID3D12Resource> resource;
   bool dirty = true;
   uint64_t checksum = 0;  // of its bytes in title memory when last uploaded
-  // Checks in a row that found it unchanged since it last changed; kLive and under: checked
-  // every flush (video frames, textures the title rewrites).
-  uint32_t quiet = UINT32_MAX;
+  // Rounds in a row that found it unchanged since it last changed; kLiveRounds and under: live,
+  // checked every round.
+  uint32_t quiet = kLiveRounds - kNewRounds;
 };
 
 // A quick checksum of title memory (0 when it cannot be read). Not every write to a texture's
 // memory passes through a path we see (the CPU, DirectStorage into physical pages), so the
 // textures are checked against their memory from time to time.
+// Four lanes, so it runs at memory speed rather than at one multiply's latency a word.
 uint64_t checksum_span(uint64_t h, const uint64_t* p, uint64_t words) {
+  constexpr uint64_t kOdd = 0x9E3779B97F4A7C15ull;
+  uint64_t a = h, b = h ^ 0x6A09E667F3BCC909ull, c = h ^ 0xBB67AE8584CAA73Bull, d = h ^ 0x3C6EF372FE94F82Bull;
   __try {
-    for (uint64_t k = 0; k < words; ++k) h = (h ^ p[k]) * 0x100000001B3ull + (h >> 29);
+    uint64_t k = 0;
+    for (; k + 4 <= words; k += 4) {
+      a = _rotl64((a ^ p[k]) * kOdd, 29);
+      b = _rotl64((b ^ p[k + 1]) * kOdd, 29);
+      c = _rotl64((c ^ p[k + 2]) * kOdd, 29);
+      d = _rotl64((d ^ p[k + 3]) * kOdd, 29);
+    }
+    for (; k < words; ++k) a = _rotl64((a ^ p[k]) * kOdd, 29);
   } __except (EXCEPTION_EXECUTE_HANDLER) {
     return 0;
   }
-  return h;
+  h = (a ^ _rotl64(b, 17) ^ _rotl64(c, 31) ^ _rotl64(d, 47)) * kOdd;
+  h ^= h >> 29;
+  return h ? h : 1;  // 0 means unreadable
 }
 
 uint64_t checksum_of(uint64_t address, uint64_t size) {
@@ -216,6 +234,7 @@ struct Bindings {
     if (FAILED(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&samplers)))) return false;
     sampler_step = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
     usable = true;
+    std::thread([this] { watch(); }).detach();
     return true;
   }
 
@@ -360,37 +379,104 @@ struct Bindings {
     retired.push_back({kPending, recording, std::move(up)});
   }
 
-  // Textures whose memory changed since their upload are marked for another. Those that
-  // changed lately (video frames) are checked every flush; the rest in turn, up to 8 MiB of them
-  // a flush.
-  static constexpr uint32_t kLive = 300;
+  // Textures whose memory changed since their upload are uploaded again. Live ones (new, or
+  // changed lately: video frames, glyph atlases) are checked at every submission, right before
+  // the title's lists run (check_live), so what the title wrote before submitting is what they
+  // read. The others are checked by the watcher, a thread of its own: each round hashes up to
+  // kRoundBytes of them in turn with the lock released, then sleeps a little; the whole set
+  // (420 MiB in the menus) goes by in about 200 ms. A texture it finds changed turns live.
+  static constexpr uint64_t kRoundBytes = 48ull << 20;
   size_t next_check = 0;
-  void check(Texture& t) {
-    if (checksum_of(t.address, t.size) != t.checksum) {
-      t.dirty = true;
-      t.quiet = 0;
-    } else if (t.quiet != UINT32_MAX) {
-      ++t.quiet;
+  struct Watched {
+    size_t index;
+    uint64_t address, size, checksum, now;
+  };
+
+  void watch() {
+    std::vector<Watched> round;
+    for (;;) {
+      round.clear();
+      {
+        std::lock_guard g(lock);
+        const size_t count = textures.size();
+        uint64_t budget = kRoundBytes;
+        for (size_t n = 0; n < count && budget; ++n) {
+          const size_t i = next_check++ % count;
+          const Texture& t = textures[i];
+          if (t.dirty || !t.resource || t.quiet <= kLiveRounds) continue;
+          budget -= std::min(t.size, budget);
+          round.push_back({i, t.address, t.size, t.checksum, 0});
+        }
+      }
+      for (Watched& w : round) w.now = checksum_of(w.address, w.size);
+      {
+        std::lock_guard g(lock);
+        for (const Watched& w : round) {
+          Texture& t = textures[w.index];
+          if (t.dirty || t.checksum != w.checksum) continue;  // uploaded again meanwhile
+          if (w.now != w.checksum) {
+            t.dirty = true;
+            t.quiet = 0;
+          }
+        }
+      }
+      Sleep(round.empty() ? 50 : 12);
     }
   }
-  void check_textures() {
-    if (textures.empty()) return;
+
+  // At a submission, under the lock: live textures whose memory changed are marked.
+  void check_live() {
     for (Texture& t : textures) {
-      if (!t.dirty && t.resource && t.quiet <= kLive) check(t);
-    }
-    constexpr uint64_t kBudget = 8ull << 20;
-    uint64_t budget = kBudget;
-    for (size_t n = 0; n < textures.size() && budget; ++n) {
-      Texture& t = textures[next_check % textures.size()];
-      if (t.dirty || !t.resource || t.quiet <= kLive) {
-        ++next_check;
-        continue;
+      if (t.dirty || !t.resource || t.quiet > kLiveRounds) continue;
+      if (checksum_of(t.address, t.size) != t.checksum) {
+        t.dirty = true;
+        t.quiet = 0;
+      } else {
+        ++t.quiet;
       }
-      if (t.size > budget && budget != kBudget) break;  // a large one gets the next flush's whole budget
-      ++next_check;
-      budget -= std::min(t.size, budget);
-      check(t);
     }
+  }
+
+  // The uploads' own lists, run ahead of the title's in the same submission; each reused once
+  // the GPU is past it.
+  struct UploadList {
+    ComPtr<ID3D12CommandAllocator> allocator;
+    ComPtr<ID3D12GraphicsCommandList> list;
+    uint64_t fence = kPending;
+  };
+  std::vector<UploadList> upload_lists;
+
+  ID3D12CommandList* uploads_for_submission() {
+    if (!usable) return nullptr;
+    check_live();
+    if (std::none_of(textures.begin(), textures.end(), [](const Texture& t) { return t.dirty && t.resource; })) return nullptr;
+    present::HostGpu* gpu = present::host_gpu();
+    UploadList* u = nullptr;
+    for (UploadList& c : upload_lists) {
+      if (c.fence != kPending && gpu->done(c.fence)) {
+        u = &c;
+        break;
+      }
+    }
+    if (u) {
+      if (FAILED(u->allocator->Reset()) || FAILED(u->list->Reset(u->allocator.Get(), nullptr))) return nullptr;
+    } else {
+      UploadList c;
+      if (FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&c.allocator))) ||
+          FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, c.allocator.Get(), nullptr, IID_PPV_ARGS(&c.list)))) {
+        return nullptr;
+      }
+      c.list->SetName(L"texture uploads");
+      upload_lists.push_back(std::move(c));
+      u = &upload_lists.back();
+    }
+    u->fence = kPending;
+    recording = u->list.Get();
+    for (Texture& t : textures) {
+      if (t.dirty && t.resource) upload_texture(u->list.Get(), t);
+    }
+    if (FAILED(u->list->Close())) return nullptr;
+    return u->list.Get();
   }
 
   void flush(ID3D12GraphicsCommandList* list) {
@@ -400,10 +486,6 @@ struct Bindings {
     std::erase_if(retired, [gpu](const Retired& r) { return r.fence != kPending && gpu->done(r.fence); });
     recording = list;
     take_misses();
-    check_textures();
-    for (Texture& t : textures) {
-      if (t.dirty && t.resource) upload_texture(list, t);
-    }
     D3D12_RESOURCE_BARRIER b{};
     b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     if (table_dirty) {
@@ -735,9 +817,18 @@ void flush_bindings(ID3D12GraphicsCommandList* list) {
   if (Bindings* b = ready()) b->flush(list);
 }
 
+ID3D12CommandList* texture_uploads_for_submission() {
+  std::lock_guard g(bindings().lock);
+  Bindings* b = ready();
+  return b ? b->uploads_for_submission() : nullptr;
+}
+
 void bindings_submitted(uint64_t fence_value, const void* list) {
   std::lock_guard g(bindings().lock);
   Bindings& b = bindings();
+  for (auto& u : b.upload_lists) {
+    if (u.fence == Bindings::kPending && u.list.Get() == list) u.fence = fence_value;
+  }
   for (auto& r : b.retired) {
     if (r.fence == Bindings::kPending && r.list == list) r.fence = fence_value;
   }
