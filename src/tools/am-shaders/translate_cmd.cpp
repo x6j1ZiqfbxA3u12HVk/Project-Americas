@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <fstream>
 #include <iterator>
@@ -584,23 +585,34 @@ int serve(const fs::path& pack_dir, const fs::path& runtime_dir, const fs::path&
                 now.wMinute, now.wSecond, GetCurrentProcessId());
     std::fflush(stdout);
   }
-  HANDLE instance = CreateMutexW(nullptr, TRUE, shader::kServiceMutex);
-  if (!instance || GetLastError() == ERROR_ALREADY_EXISTS) {
-    std::printf("serve: another am-shaders serve is running; this one ends\n");
-    return 1;
-  }
-  HANDLE stop = CreateEventW(nullptr, TRUE, FALSE, shader::kServiceStopEvent);
-  if (stop) ResetEvent(stop);
   std::error_code ec;
   fs::create_directories(out_dir, ec);
-  {
-    // Which build runs: the runtime compares it with the am-shaders.exe it would start.
+  // Which build runs: the runtime compares it with the am-shaders.exe it would start.
+  const auto record_self = [&] {
     const fs::path service_dir = out_dir.parent_path().parent_path() / shader::kServiceFolder;
     fs::create_directories(service_dir, ec);
     std::wstring self(32768, L'\0');
     self.resize(GetModuleFileNameW(nullptr, self.data(), static_cast<DWORD>(self.size())));
     std::ofstream(service_dir / shader::kServiceRunningFile) << narrow(self) << '\n';
+  };
+  HANDLE stop = CreateEventW(nullptr, TRUE, FALSE, shader::kServiceStopEvent);
+  HANDLE instance = CreateMutexW(nullptr, TRUE, shader::kServiceMutex);
+  if (!instance) return 1;
+  if (GetLastError() == ERROR_ALREADY_EXISTS) {
+    // A replacement (the stop event is set: the running one finishes its compiles, then ends)
+    // waits its turn; otherwise one is running already.
+    if (!stop || WaitForSingleObject(stop, 0) != WAIT_OBJECT_0) {
+      std::printf("serve: another am-shaders serve is running; this one ends\n");
+      return 1;
+    }
+    record_self();  // the build that takes over: a run meanwhile starts no third one
+    std::printf("serve: the running service finishes its compiles first\n");
+    std::fflush(stdout);
+    const DWORD w = WaitForSingleObject(instance, INFINITE);
+    if (w != WAIT_OBJECT_0 && w != WAIT_ABANDONED) return 1;
   }
+  if (stop) ResetEvent(stop);
+  record_self();
   const fs::path by_source = out_dir.parent_path() / L"by-source";
   fs::create_directories(by_source, ec);
   struct Location {
@@ -692,6 +704,14 @@ int serve(const fs::path& pack_dir, const fs::path& runtime_dir, const fs::path&
   std::atomic<size_t> compiled{0}, reused{0}, refused{0};
   std::map<std::string, size_t> refusals;  // by reason (its first 60 characters)
   int busy = 0;                            // workers compiling (under `lock`)
+  bool stopping = false;                   // asked to stop: workers take nothing new
+  int huge_busy = 0;                       // compiles of over 1 MiB of HLSL running (under `lock`)
+  std::condition_variable huge_free;
+  const int huge_slots = [] {
+    MEMORYSTATUSEX m{sizeof m};
+    GlobalMemoryStatusEx(&m);
+    return std::max(1, static_cast<int>((m.ullTotalPhys >> 30) / 12));
+  }();
   bool idle_told = false;
   // The watcher: new lines of wanted-first.txt.
   std::thread([&] {
@@ -775,7 +795,19 @@ int serve(const fs::path& pack_dir, const fs::path& runtime_dir, const fs::path&
     // The largest programs (over 1 MiB of HLSL take DXC minutes) unoptimized: twice as fast to
     // compile, and the driver optimizes the DXIL again when it makes the pipeline.
     const bool huge = t.hlsl.size() > (1u << 20);
+    // DXC takes about 3 GB for the largest: only `huge_slots` of them at a time (one per 12 GB of
+    // RAM), so the service stays small next to a game run; small programs go on meanwhile.
+    if (huge) {
+      std::unique_lock<std::mutex> g(lock);
+      huge_free.wait(g, [&] { return huge_busy < huge_slots; });
+      ++huge_busy;
+    }
     const host::CompileResult c = host::compile_hlsl(t.hlsl, t.entry, t.profile, huge ? std::vector<std::wstring>{L"-O0"} : std::vector<std::wstring>{});
+    if (huge) {
+      std::lock_guard<std::mutex> g(lock);
+      --huge_busy;
+      huge_free.notify_one();
+    }
     const double took = std::chrono::duration<double>(std::chrono::steady_clock::now() - c0).count();
     if (!c.ok) return fail("DXC: " + c.messages.substr(0, 200));
     const auto write = [&](const fs::path& f) {
@@ -802,6 +834,7 @@ int serve(const fs::path& pack_dir, const fs::path& runtime_dir, const fs::path&
         bool waited = false;
         {
           std::lock_guard<std::mutex> g(lock);
+          if (stopping) return;  // asked to stop: no new work
           while (!urgent.empty() && marker.empty()) {
             std::string m = urgent.front();
             urgent.pop_front();
@@ -837,15 +870,25 @@ int serve(const fs::path& pack_dir, const fs::path& runtime_dir, const fs::path&
       }
     }).detach();
   }
-  // Until stopped. Compiles in flight are dropped (their files are written under temporary
-  // names), and the process ends at once rather than wait minutes for DXC.
+  // Until stopped (a newer build replaces this one): the compiles in flight finish (the largest
+  // take many minutes, and the replacement would start them over), nothing new starts.
   if (stop) WaitForSingleObject(stop, INFINITE);
   else Sleep(INFINITE);
   {
     std::lock_guard<std::mutex> g(lock);
-    std::printf("serve: asked to stop (%zu compiled, %zu reused)\n", compiled.load(), reused.load());
+    stopping = true;
+    std::printf("serve: asked to stop; finishing %d compile(s) (%zu compiled, %zu reused)\n", busy, compiled.load(), reused.load());
     std::fflush(stdout);
   }
+  for (;;) {
+    {
+      std::lock_guard<std::mutex> g(lock);
+      if (busy == 0) break;
+    }
+    Sleep(500);
+  }
+  std::printf("serve: stopped\n");
+  std::fflush(stdout);
   TerminateProcess(GetCurrentProcess(), 0);
   return 0;
 }

@@ -58,23 +58,14 @@ bool running() {
   return true;
 }
 
-// Asks the running service to stop; true when it is gone within `ms`.
-bool stop_running(DWORD ms) {
-  HANDLE mutex = OpenMutexW(SYNCHRONIZE, FALSE, shader::kServiceMutex);
-  if (!mutex) return true;
+// Asks the running service to stop: it finishes the compiles in flight, then ends, and the
+// replacement started next waits for it (the event stays set until the replacement runs).
+bool ask_to_stop() {
   HANDLE stop = OpenEventW(EVENT_MODIFY_STATE, FALSE, shader::kServiceStopEvent);
-  if (!stop) {  // a service from before the stop event existed
-    CloseHandle(mutex);
-    return false;
-  }
+  if (!stop) return false;  // a service from before the stop event existed
   SetEvent(stop);
-  const DWORD w = WaitForSingleObject(mutex, ms);
-  const bool gone = w == WAIT_OBJECT_0 || w == WAIT_ABANDONED;
-  if (gone) ReleaseMutex(mutex);
-  ResetEvent(stop);
   CloseHandle(stop);
-  CloseHandle(mutex);
-  return gone;
+  return true;
 }
 
 bool launch(const fs::path& exe, const fs::path& work_dir, unsigned jobs, std::string& how) {
@@ -147,9 +138,10 @@ void start_now() {
       logf("shader service: running already (%s)", path.c_str());
       return;
     }
-    logf("shader service: the running one (%s) is another build: stopping it", path.empty() ? "unknown" : path.c_str());
-    if (!stop_running(15000)) {
-      logf("shader service: it did not stop; left running");
+    logf("shader service: the running one (%s) is another build: it finishes its compiles, then the new one takes over",
+         path.empty() ? "unknown" : path.c_str());
+    if (!ask_to_stop()) {
+      logf("shader service: it cannot be asked to stop; left running");
       return;
     }
   }

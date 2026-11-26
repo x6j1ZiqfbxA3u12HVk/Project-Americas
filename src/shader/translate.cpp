@@ -1541,6 +1541,9 @@ const std::unordered_map<std::string, Handler>& table() {
         return true;
       }
       else if (tgt == 9 || (stage == HwStage::Vs && ((tgt >= 13 && tgt < 16) || tgt >= 32))) return true;
+      // A render target the signature does not declare (depth-only passes export to MRT 0 as
+      // the shader's last export): nothing reads it.
+      else if (stage == HwStage::Ps && tgt < 8) return true;
       else return c.fail("exp to target " + num(tgt));
       std::string body;
       for (uint32_t k = 0; k < 4; ++k) {
