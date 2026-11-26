@@ -959,3 +959,30 @@ Then the larger pieces before the 3D world shows:
   carefully:** answer slot 10 again only together with decoding the 64 KiB tile requests
   (BCPack/zlib streams with 64 KiB destinations that we refused as corrupt), and keep a
   refused request from leaving a texture's memory half-written.
+
+## Menu scripting; UI tile streaming findings (2026-11-26, morning)
+
+* **AMERICAS_SCRIPT** (eb95cd6, `runtime/script.h`): steps by events, not the clock. To the
+  settings: `A until draw 03fe8796; draw 03fe9527; wait 1; A; wait 3; A; wait 3; A; wait 3;
+  A; wait 3; MENU` (03fe8796 is the intro video's pixel program, 03fe9527 the first setup
+  page's). `trace` logs each pipeline the first time it draws, to find a page's own.
+  The user's notes: after the intro, 4 Enters reach the blue page (Tab: settings); on the
+  legal notices, Down, wait about 6 s, Down, then Enter.
+* **Shaders (rt4 precompile):** 6,030 compiled, about 12,600 refused. The refusals: 9,293
+  pixel shaders on `v_interp_p1ll_f16` (16-bit attributes), 2,522 on `exp` targets (depth
+  export), 385 `image_get_lod`, 215 `image_sample_b`, 111 BVH. `v_interp_p1ll_f16` alone would
+  about double the pixel shaders.
+* **UI tile streaming (AMERICAS_XG_TILING=1, opt-in since this commit):**
+  * The game asks XG slot 10 for its UI textures in `ttdb_ui.ttpf`/`ttdb_graphics.ttpf`:
+    swizzle mode 10 (64KB_D, no XOR), BC1/BC3/BC7, 1 mip. Our answer's tile shapes are D3D12's.
+  * With it, per-tile requests (zlib, ~21 KB -> 64 KiB, page destinations) decode fine, but
+    requests for whole textures (512 KiB) fail: their offsets and sizes are not stream
+    starts. Example: the request said offset 0x1240500, 234,501 bytes -> 524,288; the file
+    has a zlib stream at 0x123a000 (65,025 bytes -> exactly 524,288). The pack's table
+    (`RDS5`, 1550 entries of 8 bytes) holds that entry as `?? ?? ?? ??  a0 23 01 60`
+    (offset >> 8 in the low 24 bits, a flag byte 0x60). The game retries refused requests
+    and finally aborts (ucrtbase abort, its own handler; ours is not called).
+  * **Next:** disassemble the streamer's request builder (the caller of the XG computer,
+    game+0x3441f7, and where it turns tile info and table entries into offsets) and find
+    where our tiling answer differs from the console's. Mode 10 textures also need 64KB_D
+    detiling on upload once their data arrives.
