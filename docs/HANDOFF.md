@@ -1484,3 +1484,34 @@ loading does). Work that way.
 * **Device slot 71** is not the prebuild query: it fills two descriptions (one with 0x20004 at
   +0x30) and passes a descriptor handle ([r12+0x18]); its result is not read. Probably a view
   creation (ray-tracing acceleration structure view?). Not implemented.
+
+## A GPU hang took the display down; runaway guards (2026-11-27, just after midnight)
+
+* **What happened:** a test run hung the GPU at boot (frame 3) and the display driver did not
+  recover: the user had to reset the PC. The only new GPU work in that build was the UAV-clear
+  fill program; most likely a descriptor read wrongly gave it a range of billions of dwords.
+  Earlier runs had GPU hangs (DXGI_ERROR_DEVICE_HUNG / RESET) that Windows did recover from.
+  **Every GPU hang can take the display down: treat them as the most serious bug there is.**
+* **Guards now (b126faa):** every structured loop of a translated program ends the program after
+  4M passes per thread (AM_SPIN_LIMIT), the dispatcher after 16M (AM_DISPATCH_LIMIT); UAV clears
+  only over a range inside the cleared buffer's own memory, at most 256 MiB, with a bounded
+  loop. Programs compiled before the guards that can loop (5,979 of 12,393; `am-shaders
+  guard-loops` counts them) are compiled again by the service, the game's first, the rest when
+  nothing else is left; `dxil\rt5\guarded.txt` lists the guarded ones, and old DXIL serves until
+  the new one is written.
+* **The hang DRED named** in the runs before: `85d880d595abff03` (one workgroup, after
+  `f5cf80d572fdfe03`, 8 groups). Two loops: one over indices in steps of 1,024 up to a loaded
+  count, one following a linked list in a buffer until 0. Both run away on wrong data. The
+  hangs came when video memory was over budget (14 GiB of 13), before textures were dropped.
+  Guarded now; if it hits the guard, its input is wrong (look at what f5cf writes, or what
+  clears or copies it before).
+* **Textures dropped over reused memory** (d42efb7): 3,900 alive instead of 35,000; video memory
+  5.8 GiB at frame 4800 instead of 14.3. Commit still rose to 27 GB after frame 4800 in one run
+  (cause not found: the memory line in the frame summary shows each kind of host resource).
+* **Compile speed:** the largest programs (1-6 MB of HLSL) take DXC 1-15 minutes each, one thread
+  and 3-4 GB each, so memory lets only one or two run at once and the CPU idles behind them.
+  The lasting fix is smaller HLSL from the translator (registers as SSA values, fewer copies).
+* **Running the game for tests:** start it with `cmd /c start "Project Americas" americas.exe
+  --timeout 1200` (a console window the user can watch; the service it starts then gets a window
+  of its own) and watch its commit: end it past ~24 GB on this 16 GB PC (one run reached 36 GB
+  and the system 63 GB of commit).
