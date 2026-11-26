@@ -54,6 +54,8 @@ struct Ctx {
   // Pixel shader attributes read by the 16-bit interpolation instructions: declared
   // nointerpolation and interpolated here, from each vertex's bits and SV_Barycentrics.
   std::set<uint32_t> per_vertex_attrs;
+  // The pixel shader exports depth (MRTZ): AmOut gains SV_Depth.
+  bool depth_export = false;
   // Descriptor lookups still valid in this block, by first SGPR (T#s, S#s), and every one made.
   std::set<uint32_t> live_images, live_samplers, image_vars, sampler_vars;
   // Forgets the lookups whose registers [lo, hi] may have changed.
@@ -1309,6 +1311,16 @@ const std::unordered_map<std::string, Handler>& table() {
       if (stage == HwStage::Vs && tgt == 12) field = "am_o.pos";
       else if (stage == HwStage::Vs && tgt >= 32 && tgt < 64 && tgt - 32 < c.input->outputs.size()) field = "am_o.o" + num(tgt - 32);
       else if (stage == HwStage::Ps && tgt < 8 && tgt < c.input->outputs.size()) field = "am_o.o" + num(tgt);
+      else if (stage == HwStage::Ps && tgt == 8) {
+        // MRTZ: depth in channel x (the 32-bit Z formats). Stencil (y), the sample mask (z) and
+        // alpha-to-coverage (w) are not passed on.
+        if (compr) return c.fail("16-bit depth export");
+        if (!(en & 1u)) return true;
+        c.depth_export = true;
+        c.touch_v(src[0]);
+        c.line("if (AM_ACT != 0u) { am_o.am_depth = asfloat(v[" + num(src[0]) + "]); }");
+        return true;
+      }
       else if (tgt == 9 || (stage == HwStage::Vs && ((tgt >= 13 && tgt < 16) || tgt >= 32))) return true;
       else return c.fail("exp to target " + num(tgt));
       std::string body;
@@ -2688,6 +2700,7 @@ Translation finish_graphics(const TranslateInput& in, const Ctx& c, Translation 
   for (size_t k = 0; k < in.outputs.size(); ++k) {
     h += "  float4 o" + num(static_cast<uint32_t>(k)) + " : " + in.outputs[k].semantic + num(in.outputs[k].semantic_index) + ";\n";
   }
+  if (!vs && c.depth_export) h += "  float am_depth : SV_Depth;\n";
   h += "};\n";
   h += lane_macros(c.wave64);
   h += vs ? "#define AM_END() {}\n" : "#define AM_END() { if (AM_ACT == 0u) discard; }\n";
@@ -2735,6 +2748,8 @@ Translation finish_graphics(const TranslateInput& in, const Ctx& c, Translation 
                  std::to_string(vtx) + "));\n";
       }
     }
+    // A lane that exports no depth keeps the rasterized one.
+    if (c.depth_export) fetch += "  o.am_depth = am_in.am_pos.z;\n";
     h += "AmOut main(AmIn am_in) {\n  AmOut o = (AmOut)0;\n" + fetch + "  am_body(am_in, o);\n  return o;\n}\n";
   }
   tr.hlsl = std::move(h);

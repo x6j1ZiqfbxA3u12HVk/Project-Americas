@@ -940,3 +940,33 @@ TEST_CASE(translate_vertex_and_pixel_shaders_draw) {
   CHECK(std::abs(in[0] - 64) <= 1 && std::abs(in[1] - 128) <= 1 && std::abs(in[2] - 191) <= 1 && in[3] == 255);
   CHECK(out[0] == 0 && out[1] == 0 && out[2] == 0 && out[3] == 0);
 }
+
+// A pixel shader exporting depth (exp mrtz): SV_Depth from channel x, the rasterized depth for
+// lanes that export none; compiled by DXC.
+TEST_CASE(translate_pixel_shader_depth_export) {
+  const std::vector<uint32_t> ps_code = {
+      0xf800000f, 0x03020100,  // exp mrt0, v0, v1, v2, v3
+      0xf8000881, 0x00000004,  // exp mrtz, v4 done
+      0xbf810000,              // s_endpgm
+  };
+  TranslateInput ps;
+  ps.code = ps_code;
+  ps.stage = HwStage::Ps;
+  ps.vgprs = 8;
+  ps.outputs = {{"SV_Target", 0}};
+  const Translation tp = translate(ps, Binding::Test);
+  CHECK(tp.ok);
+  if (!tp.ok) {
+    std::printf("    not translated: %s\n", tp.failure.c_str());
+    return;
+  }
+  CHECK(tp.hlsl.find("SV_Depth") != std::string::npos);
+  std::string why;
+  if (!am::host::dxc_available(&why)) {
+    std::printf("    skipped: %s\n", why.c_str());
+    return;
+  }
+  const am::host::CompileResult cp = am::host::compile_hlsl(tp.hlsl, tp.entry, tp.profile);
+  CHECK(cp.ok);
+  if (!cp.ok) std::printf("    DXC: %s\n", cp.messages.substr(0, 1500).c_str());
+}
