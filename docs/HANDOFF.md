@@ -951,3 +951,11 @@ Then the larger pieces before the 3D world shows:
   the reads; do not view the target in the other format (that removed the device once).
 * Driving the menus by script: Enter at 20 s, then after the intro 4 Enters (with margin,
   e.g. A:36,A:39,A:42,A:45,A:48), then MENU (Tab) for the settings.
+* **The brightness page's symbol (the Rockstar logo) is gone again** since XG slot 10 went
+  back to a probe (1d72dc7). With the tiling answer in, the UI streamer loaded its tiled
+  textures (512x512, 512x256, 1024x512, 512x1024; BC3/BC7, mode 10) and the user saw the
+  logo; without it the streamer asks three times after opening `ttdb_ui.ttpf` and loads
+  nothing (the page's centre is a flat 63,63,63; the write watch is not involved). **Next,
+  carefully:** answer slot 10 again only together with decoding the 64 KiB tile requests
+  (BCPack/zlib streams with 64 KiB destinations that we refused as corrupt), and keep a
+  refused request from leaving a texture's memory half-written.
