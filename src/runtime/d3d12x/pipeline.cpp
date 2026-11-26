@@ -45,6 +45,8 @@
 namespace am::rt::d3d12x {
 namespace {
 
+std::vector<uint8_t> geometry_shader(const std::vector<uint8_t>& vs, const std::vector<uint8_t>& ps, bool rect_list, bool& failed);
+
 struct Shader {
   uint32_t stage = 0;  // the stream's subobject type: 1 VS, 2 PS, 3 DS, 4 HS, 5 GS, 6 CS, 24 AS, 25 MS
   std::vector<uint8_t> bytecode;
@@ -524,6 +526,29 @@ HRESULT create_pipeline_from_stream(const D3D12_PIPELINE_STATE_STREAM_DESC* desc
     D3D12_SHADER_BYTECODE& b = sh.stage == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS ? host.VS : host.PS;
     b = {dxil.back().data(), dxil.back().size()};
   }
+  // The console's rect-list topology type (19; draws use topology 17): triangles, each made a
+  // rectangle by a geometry shader.
+  constexpr uint32_t kRectListType = 19;
+  const bool rect_list = host.PrimitiveTopologyType == static_cast<D3D12_PRIMITIVE_TOPOLOGY_TYPE>(kRectListType);
+  if (rect_list) host.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+  if (host.PrimitiveTopologyType < D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT || host.PrimitiveTopologyType > D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH) {
+    static std::atomic<int> told{0};
+    if (told.fetch_add(1, std::memory_order_relaxed) < 8) {
+      logf("d3d12x: a stream pipeline's topology type %u", static_cast<unsigned>(host.PrimitiveTopologyType));
+    }
+  }
+  std::vector<uint8_t> gs;
+  if (all && host.VS.pShaderBytecode) {
+    // A rect list, or stages that do not link, get a geometry shader (geometry_shader).
+    bool failed = false;
+    const auto bytes = [](const D3D12_SHADER_BYTECODE& b) {
+      const auto* q = static_cast<const uint8_t*>(b.pShaderBytecode);
+      return q ? std::vector<uint8_t>(q, q + b.BytecodeLength) : std::vector<uint8_t>{};
+    };
+    gs = geometry_shader(bytes(host.VS), bytes(host.PS), rect_list, failed);
+    if (!gs.empty()) host.GS = {gs.data(), gs.size()};
+    if (failed) all = false;
+  }
   if (all) {
     for (size_t k = 0; k < elements.size(); ++k) elements[k].SemanticName = names[k].c_str();
     host.InputLayout = {elements.empty() ? nullptr : elements.data(), static_cast<UINT>(elements.size())};
@@ -717,17 +742,18 @@ int dxil_kind(const std::vector<uint8_t>& dxil) {
   return static_cast<int>(version >> 16);
 }
 
-// The vertex stage's outputs, from its DXIL's output signature (OSG1): semantic names and indices,
-// in order; empty when it cannot be read. Translated programs declare every output as a float4.
+// A stage's outputs (OSG1) or inputs (ISG1), from its DXIL's signature: semantic names, indices,
+// system values and registers, in order; empty when it cannot be read. Translated programs
+// declare every one as a float4.
 struct SignatureElement {
   std::string name;
-  uint32_t index = 0, system_value = 0;
+  uint32_t index = 0, system_value = 0, reg = 0;
 };
-std::vector<SignatureElement> output_signature(const std::vector<uint8_t>& dxil) {
+std::vector<SignatureElement> signature(const std::vector<uint8_t>& dxil, const char* tag) {
   std::vector<SignatureElement> out;
   std::string error;
   const auto c = shader::parse_container(dxil, error);
-  const shader::Part* part = c ? c->find("OSG1") : nullptr;
+  const shader::Part* part = c ? c->find(tag) : nullptr;
   if (!part || part->data.size() < 8) return out;
   const auto& d = part->data;
   const auto u32 = [&](size_t at) {
@@ -745,39 +771,107 @@ std::vector<SignatureElement> output_signature(const std::vector<uint8_t>& dxil)
     e.name.assign(reinterpret_cast<const char*>(d.data() + name_at), strnlen(reinterpret_cast<const char*>(d.data() + name_at), d.size() - name_at));
     e.index = u32(at + 8);
     e.system_value = u32(at + 12);
+    e.reg = u32(at + 20);
     out.push_back(std::move(e));
   }
   return out;
 }
+std::vector<SignatureElement> output_signature(const std::vector<uint8_t>& dxil) { return signature(dxil, "OSG1"); }
 
-// The rect list's fourth corner: a geometry shader that finds each triangle's right-angle corner
-// k (the one facing its longest edge, on screen), and draws k, a, b and a + b - k (every output
-// alike) as a strip of two triangles covering the rectangle.
-std::vector<uint8_t> rect_list_geometry_shader(const std::vector<uint8_t>& vs) {
+// Whether the pixel stage's inputs sit in the registers the vertex stage writes them to. The
+// translator packs each stage's own signature in order, so a pixel program that reads fewer
+// of the vertex program's outputs (a gap) has the later ones in other registers, and the host
+// refuses to link the two.
+bool same_element(const SignatureElement& o, const SignatureElement& in) {
+  return o.system_value == in.system_value && (in.system_value == 1 || (o.name == in.name && o.index == in.index));
+}
+bool stages_link(const std::vector<SignatureElement>& outputs, const std::vector<SignatureElement>& inputs) {
+  for (const SignatureElement& in : inputs) {
+    if (in.system_value > 1) continue;  // made by the rasterizer (front face, sample index, ...)
+    const auto it = std::find_if(outputs.begin(), outputs.end(), [&](const SignatureElement& o) { return same_element(o, in); });
+    if (it == outputs.end() || it->reg != in.reg) return false;
+  }
+  return true;
+}
+
+// The geometry shader between a vertex and a pixel program, when one is needed: for a rect list,
+// the fourth corner (it finds each triangle's right-angle corner k, the one facing its longest
+// edge on screen, and draws k, a, b and a + b - k as a strip of two triangles); for stages that
+// do not link (stages_link), the vertex outputs again in the pixel program's order, so each
+// lands in the register it is read from (0 for one the vertex program does not write). Empty
+// when none is needed, or when it cannot be made (then `failed`).
+std::vector<uint8_t> geometry_shader(const std::vector<uint8_t>& vs, const std::vector<uint8_t>& ps, bool rect_list, bool& failed) {
+  failed = false;
   const std::vector<SignatureElement> outputs = output_signature(vs);
-  if (outputs.empty()) return {};
+  const std::vector<SignatureElement> inputs = ps.empty() ? std::vector<SignatureElement>{} : signature(ps, "ISG1");
+  const bool relink = !ps.empty() && !stages_link(outputs, inputs);
+  if (!rect_list && !relink) return {};
+  failed = true;
+  if (outputs.empty() || (relink && inputs.empty())) return {};
+  const auto semantic = [](const SignatureElement& e) {
+    return e.system_value == 1 ? std::string("SV_Position") : e.name + std::to_string(e.index);
+  };
   std::string decl = "struct V {\n", corner, position;
   for (size_t k = 0; k < outputs.size(); ++k) {
     const std::string field = "f" + std::to_string(k);
-    const std::string semantic = outputs[k].system_value == 1 ? "SV_Position" : outputs[k].name + std::to_string(outputs[k].index);
-    decl += "  float4 " + field + " : " + semantic + ";\n";
+    decl += "  float4 " + field + " : " + semantic(outputs[k]) + ";\n";
     corner += "  d." + field + " = a." + field + " + b." + field + " - k." + field + ";\n";
     if (outputs[k].system_value == 1) position = field;
   }
   if (position.empty()) return {};
   decl += "};\n";
-  const auto at = [&](int n) { return "v[" + std::to_string(n) + "]." + position + ".xy / v[" + std::to_string(n) + "]." + position + ".w"; };
-  const std::string hlsl =
-      decl + "[maxvertexcount(4)] void main(triangle V v[3], inout TriangleStream<V> s) {\n" +
-      "  float2 p0 = " + at(0) + ", p1 = " + at(1) + ", p2 = " + at(2) + ";\n" +
-      "  float e0 = distance(p1, p2), e1 = distance(p2, p0), e2 = distance(p0, p1);\n" +
-      "  V k = v[2], a = v[0], b = v[1];\n" +
-      "  if (e0 >= e1 && e0 >= e2) { k = v[0]; a = v[1]; b = v[2]; }\n" +
-      "  else if (e1 >= e2) { k = v[1]; a = v[2]; b = v[0]; }\n" +
-      "  V d;\n" + corner + "  s.Append(k); s.Append(a); s.Append(b); s.Append(d);\n}\n";
+  // What the stream carries: the vertex outputs as they are, or the pixel program's inputs.
+  std::string out_type = "V", convert;
+  if (relink) {
+    out_type = "P";
+    decl += "struct P {\n";
+    convert = "P to_p(V v) {\n  P p;\n";
+    bool has_position = false;
+    for (size_t k = 0; k < inputs.size(); ++k) {
+      const SignatureElement& in = inputs[k];
+      if (in.system_value > 1) continue;
+      const std::string field = "g" + std::to_string(k);
+      decl += "  float4 " + field + " : " + semantic(in) + ";\n";
+      std::string from = "float4(0, 0, 0, 0)";
+      for (size_t j = 0; j < outputs.size(); ++j) {
+        if (same_element(outputs[j], in)) from = "v.f" + std::to_string(j);
+      }
+      if (in.system_value == 1) has_position = true;
+      convert += "  p." + field + " = " + from + ";\n";
+    }
+    if (!has_position) {
+      decl += "  float4 g_position : SV_Position;\n";
+      convert += "  p.g_position = v." + position + ";\n";
+    }
+    decl += "};\n";
+    convert += "  return p;\n}\n";
+  }
+  const auto emit = [&](const std::string& v) { return relink ? "s.Append(to_p(" + v + "));" : "s.Append(" + v + ");"; };
+  std::string body;
+  if (rect_list) {
+    const auto at = [&](int n) {
+      return "v[" + std::to_string(n) + "]." + position + ".xy / v[" + std::to_string(n) + "]." + position + ".w";
+    };
+    body = "  float2 p0 = " + at(0) + ", p1 = " + at(1) + ", p2 = " + at(2) + ";\n" +
+           "  float e0 = distance(p1, p2), e1 = distance(p2, p0), e2 = distance(p0, p1);\n" +
+           "  V k = v[2], a = v[0], b = v[1];\n" +
+           "  if (e0 >= e1 && e0 >= e2) { k = v[0]; a = v[1]; b = v[2]; }\n" +
+           "  else if (e1 >= e2) { k = v[1]; a = v[2]; b = v[0]; }\n" +
+           "  V d;\n" + corner + "  " + emit("k") + " " + emit("a") + " " + emit("b") + " " + emit("d") + "\n";
+  } else {
+    body = "  " + emit("v[0]") + " " + emit("v[1]") + " " + emit("v[2]") + "\n";
+  }
+  const std::string hlsl = decl + convert + "[maxvertexcount(" + (rect_list ? "4" : "3") +
+                           ")] void main(triangle V v[3], inout TriangleStream<" + out_type + "> s) {\n" + body + "}\n";
   const host::CompileResult r = host::compile_hlsl(hlsl, "main", "gs_6_0");
-  if (!r.ok) logf("gpu: the rect list's geometry shader did not compile: %s", r.messages.substr(0, 300).c_str());
-  return r.ok ? r.dxil : std::vector<uint8_t>{};
+  if (!r.ok) {
+    logf("gpu: a geometry shader (%s) did not compile: %s", rect_list ? "rect list" : "linkage", r.messages.substr(0, 300).c_str());
+    return {};
+  }
+  failed = false;
+  static std::atomic<int> told{0};
+  if (relink && told.fetch_add(1, std::memory_order_relaxed) < 8) logf("gpu: a vertex and a pixel program linked through a geometry shader");
+  return r.dxil;
 }
 
 // A slot 57 pipeline's host pipeline for these render-target formats: its precompiled vertex and
@@ -848,15 +942,13 @@ ID3D12PipelineState* console_host_pipeline(ConsolePipeline& c, const DXGI_FORMAT
   d.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
   d.NumRenderTargets = static_cast<UINT>(key.size() - 2);
   for (size_t k = 0; k + 2 < key.size(); ++k) d.RTVFormats[k] = static_cast<DXGI_FORMAT>(key[k]);
-  std::vector<uint8_t> gs;
-  if (rect_list) {
-    gs = rect_list_geometry_shader(vs);
-    if (gs.empty()) {
-      c.made[key] = nullptr;
-      return nullptr;
-    }
-    d.GS = {gs.data(), gs.size()};
+  bool gs_failed = false;
+  const std::vector<uint8_t> gs = geometry_shader(vs, ps, rect_list, gs_failed);
+  if (gs_failed) {
+    c.made[key] = nullptr;
+    return nullptr;
   }
+  if (!gs.empty()) d.GS = {gs.data(), gs.size()};
   d.DSVFormat = depth;  // depth testing stays off until the depth registers are read
   std::vector<D3D12_INPUT_ELEMENT_DESC> elements = c.elements;
   for (size_t k = 0; k < elements.size(); ++k) elements[k].SemanticName = c.names[k].c_str();
