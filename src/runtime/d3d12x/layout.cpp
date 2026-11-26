@@ -100,8 +100,64 @@ bool texture_layout(const D3D12_RESOURCE_DESC& d, TextureLayout& out) {
 
   // One layer's mip chain.
   std::vector<SubresourceLayout> chain(out.mips);
+  out.first_tail_mip = out.mips;
   uint64_t at = 0;
-  for (uint32_t m = 0; m < out.mips; ++m) {
+  if (!linear && !is_3d && out.samples == 1 && out.mips > 1 && out.block_bytes >= k4K) {
+    // With a mip tail (see layout.h).
+    const uint32_t block_log2 = std::countr_zero(out.block_bytes);
+    const uint32_t max_in_tail = block_log2 - 4;  // 8 for 4 KiB blocks, 12 for 64 KiB
+    const uint32_t tail_w = out.block_width / 2, tail_h = out.block_height;
+    const uint64_t w0 = (d.Width + f.block - 1) / f.block, h0 = (uint64_t{d.Height} + f.block - 1) / f.block;
+    // Mip sizes for placement: mip 0's elements halved, rounding up.
+    const auto padded = [](uint64_t elements, uint32_t m) { return static_cast<uint32_t>((elements + (1ull << m) - 1) >> m); };
+    for (uint32_t m = 0; m < out.mips; ++m) {
+      if (padded(w0, m) <= tail_w && padded(h0, m) <= tail_h && out.mips - m <= max_in_tail) {
+        out.first_tail_mip = m;
+        break;
+      }
+    }
+    const int element_log2 = std::countr_zero(f.bytes);
+    static constexpr uint32_t kMicro[5][2] = {{16, 16}, {16, 8}, {8, 8}, {8, 4}, {4, 4}};  // 256-byte tiles, in elements
+    const uint32_t micro_w = kMicro[std::min(element_log2, 4)][0], micro_h = kMicro[std::min(element_log2, 4)][1];
+    // Standard mips from the smallest up, after the tail.
+    at = out.first_tail_mip < out.mips ? out.block_bytes : 0;
+    for (int m = static_cast<int>(out.first_tail_mip) - 1; m >= 0; --m) {
+      SubresourceLayout& s = chain[m];
+      const uint64_t w = std::max<uint64_t>(d.Width >> m, 1), h = std::max<uint64_t>(d.Height >> m, 1);
+      s.width_elements = static_cast<uint32_t>((w + f.block - 1) / f.block);
+      s.rows = static_cast<uint32_t>((h + f.block - 1) / f.block);
+      s.row_pitch = static_cast<uint32_t>(align_up(padded(w0, m), out.block_width) * f.bytes);
+      s.padded_rows = static_cast<uint32_t>(align_up(padded(h0, m), out.block_height));
+      s.offset = at;
+      s.size = uint64_t{s.row_pitch} * s.padded_rows;
+      at += s.size;
+    }
+    uint32_t pitch = tail_w, rows = tail_h;
+    for (uint32_t m = out.first_tail_mip; m < out.mips; ++m) {
+      SubresourceLayout& s = chain[m];
+      const uint64_t w = std::max<uint64_t>(d.Width >> m, 1), h = std::max<uint64_t>(d.Height >> m, 1);
+      s.width_elements = static_cast<uint32_t>((w + f.block - 1) / f.block);
+      s.rows = static_cast<uint32_t>((h + f.block - 1) / f.block);
+      const uint32_t slot = max_in_tail - 1 - (m - out.first_tail_mip);
+      const uint32_t byte = slot > 6 ? 16u << slot : slot << 8;
+      // The byte offset's bits from 8 up: odd ones x, even ones y, in 256-byte tiles.
+      uint32_t x = 0, y = 0;
+      for (uint32_t b = 0; b < 6; ++b) {
+        x |= ((byte >> (9 + 2 * b)) & 1) << b;
+        y |= ((byte >> (8 + 2 * b)) & 1) << b;
+      }
+      s.in_tail = true;
+      s.tail_x = x * micro_w;
+      s.tail_y = y * micro_h;
+      s.offset = 0;  // the tail block, at the chain's start
+      s.row_pitch = pitch * f.bytes;
+      s.padded_rows = rows;
+      s.size = std::min<uint64_t>(uint64_t{pitch} * rows * f.bytes, out.block_bytes);
+      pitch = std::max(pitch >> 1, micro_w);
+      rows = std::max(rows >> 1, micro_h);
+    }
+  }
+  for (uint32_t m = 0; out.first_tail_mip == out.mips && m < out.mips; ++m) {
     const uint64_t w = std::max<uint64_t>(d.Width >> m, 1), h = std::max<uint64_t>(d.Height >> m, 1);
     SubresourceLayout& s = chain[m];
     s.width_elements = static_cast<uint32_t>((w + f.block - 1) / f.block);
@@ -119,6 +175,7 @@ bool texture_layout(const D3D12_RESOURCE_DESC& d, TextureLayout& out) {
     s.size = uint64_t{s.row_pitch} * s.padded_rows * s.depth * out.samples;
     at += s.size;
   }
+  if (out.first_tail_mip < out.mips && at < out.block_bytes) at = out.block_bytes;
   const uint64_t layer_stride = align_up(at, out.block_bytes);
   out.subresources.reserve(uint64_t{out.mips} * out.layers);
   for (uint32_t l = 0; l < out.layers; ++l) {

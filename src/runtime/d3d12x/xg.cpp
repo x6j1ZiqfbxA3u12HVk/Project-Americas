@@ -9,9 +9,9 @@
 // offset, size and pitch). The game calls slot 8 with (texture memory, plane, subresource,
 // linear data, row pitch, slice pitch): the copy of linear data into the texture's layout. Its
 // other slots are probes until the game's calls show them. Slot 10 is GetResourceTiling (D3D12's
-// without the resource); answering it made the UI streamer request 64 KiB tiles we could not
-// decode, and runs then lost the device or aborted, so it stays a probe for now. Every answer comes from layout.h, the
-// model GetResourceAllocationInfo uses.
+// without the resource), which the texture streamer maps 64 KiB tiles by. Every answer comes
+// from layout.h, the model GetResourceAllocationInfo uses: the two must agree (the streamer
+// maps tiles by one and releases pages by the other's size).
 
 #include <windows.h>
 #include <d3d12.h>
@@ -103,7 +103,8 @@ HRESULT WINAPI get_resource_layout(TextureComputer* self, ResourceLayout* out) {
   p.slice_size = l.size / array;
   p.alignment = l.alignment;
   p.element_bytes = l.element_bytes;
-  p.standard_mips = mips;
+  p.standard_mips = std::min(l.first_tail_mip, mips);
+  p.tail_mips = mips - p.standard_mips;
   for (uint32_t i = 0; i < mips && i < l.subresources.size(); ++i) {
     const SubresourceLayout& s = l.subresources[i];
     MipLayout& m = p.mips[i];
@@ -125,6 +126,8 @@ HRESULT WINAPI get_resource_layout(TextureComputer* self, ResourceLayout* out) {
     m.samples = l.samples;
     m.swizzle_mode = l.swizzle_mode;
     m.slice_depth = 1;
+    m.in_tail = s.in_tail ? 1 : 0;
+    m.tail_position = s.in_tail ? i - l.first_tail_mip : 0;
   }
   return S_OK;
 }
@@ -140,6 +143,17 @@ HRESULT WINAPI copy_into_subresource(TextureComputer* self, void* memory, UINT p
   const uint64_t slice_bytes = uint64_t{s.row_pitch} * s.padded_rows;
   auto* to = static_cast<uint8_t*>(memory) + s.offset;
   const auto* from = static_cast<const uint8_t*>(linear);
+  if (s.in_tail) {
+    // In the mip tail: row by row from (tail_x, tail_y) of the tail block, as the upload reads it.
+    const uint32_t eb = self->layout.element_bytes, pitch = self->layout.block_width;
+    for (uint32_t y = 0; y < s.rows; ++y) {
+      const uint64_t at = (uint64_t{s.tail_y + y} * pitch + s.tail_x) * eb;
+      if (at + row_bytes > self->layout.block_bytes) break;
+      std::memcpy(to + at, from + uint64_t{y} * row_pitch, std::min<uint64_t>(row_bytes, row_pitch ? row_pitch : row_bytes));
+    }
+    notify_title_write(reinterpret_cast<uint64_t>(to), self->layout.block_bytes);
+    return S_OK;
+  }
   for (uint32_t z = 0; z < s.depth; ++z) {
     for (uint32_t y = 0; y < s.rows; ++y) {
       std::memcpy(to + z * slice_bytes + uint64_t{y} * s.row_pitch, from + uint64_t{z} * slice_pitch + uint64_t{y} * row_pitch,
@@ -157,9 +171,8 @@ HRESULT WINAPI copy_into_subresource(TextureComputer* self, void* memory, UINT p
 // the tiles from the first of them on. Each tile starts at its mip's offset in 64 KiB steps.
 HRESULT WINAPI get_resource_tiling(TextureComputer* self, UINT* tiles, D3D12_PACKED_MIP_INFO* packed, D3D12_TILE_SHAPE* shape,
                                    UINT* count, UINT first, D3D12_SUBRESOURCE_TILING* tilings) {
-  // Off unless AMERICAS_XG_TILING=1: with it the UI streamer asks for 64 KiB tiles we cannot
-  // decode yet (see the HANDOFF). Off, the call leaves the game's zeros, as the stub did.
-  static const bool enabled = GetEnvironmentVariableA("AMERICAS_XG_TILING", nullptr, 0) != 0;
+  // AMERICAS_NO_XG_TILING=1 (diagnosis) leaves the game's zeros, as the first stub did.
+  static const bool enabled = GetEnvironmentVariableA("AMERICAS_NO_XG_TILING", nullptr, 0) == 0;
   if (!enabled) return S_OK;
   constexpr uint64_t kTile = 64 << 10;
   const TextureLayout& l = self->layout;
@@ -178,18 +191,16 @@ HRESULT WINAPI get_resource_tiling(TextureComputer* self, UINT* tiles, D3D12_PAC
   }
   const uint32_t block = std::max<uint32_t>(l.element_texels, 1);
   w *= block, h *= block;
-  uint32_t standard = 0;
-  while (standard < mips && std::max<uint32_t>(static_cast<uint32_t>(d.Width >> standard), 1) >= w &&
-         std::max<uint32_t>(d.Height >> standard, 1) >= h) {
-    ++standard;
-  }
+  // The standard mips are the layout's (those before its mip tail); the tail is the packed
+  // mips, in the chain's first tile.
+  const uint32_t standard = std::min(l.first_tail_mip, mips);
   const uint64_t slice_bytes = l.size / array;
   const uint64_t packed_at = standard < mips ? l.subresources[standard].offset : slice_bytes;
   if (tiles) *tiles = static_cast<UINT>((l.size + kTile - 1) / kTile);
   if (packed) {
     packed->NumStandardMips = static_cast<UINT8>(standard);
     packed->NumPackedMips = static_cast<UINT8>(mips - standard);
-    packed->NumTilesForPackedMips = standard < mips ? static_cast<UINT>((slice_bytes - packed_at + kTile - 1) / kTile) : 0;
+    packed->NumTilesForPackedMips = standard < mips ? 1 : 0;
     packed->StartTileIndexInOverallResource = standard < mips ? static_cast<UINT>(packed_at / kTile) : 0;
   }
   if (shape) *shape = {w, h, 1};

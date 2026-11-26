@@ -360,6 +360,23 @@ struct Bindings {
     for (UINT k = 0; k < subs; ++k) {
       const SubresourceLayout& s = t.layout.subresources[k];
       const uint64_t bytes = std::min<uint64_t>(row_bytes[k], s.row_pitch);
+      if (s.in_tail && fp[k].Footprint.Depth == 1) {
+        // In the mip tail: the tail block, the mip from (tail_x, tail_y) of it (in the 4 KiB
+        // standard order, or row by row in the block for the modes we keep linear).
+        const uint64_t size = t.layout.block_bytes;
+        tiled.resize(size);
+        read_gpu(t.address + s.offset, tiled.data(), size);
+        const uint32_t eb = t.layout.element_bytes, pitch = t.layout.block_width;
+        for (UINT y = 0; y < rows[k] && y < s.rows; ++y) {
+          uint8_t* row = p + fp[k].Offset + uint64_t{y} * fp[k].Footprint.RowPitch;
+          for (uint32_t x = 0; x < s.width_elements && (x + 1) * eb <= row_bytes[k]; ++x) {
+            const uint32_t ex = s.tail_x + x, ey = s.tail_y + y;
+            const uint64_t at = detile ? offset_4k_s(log2_bytes, ex, ey, pitch) : (uint64_t{ey} * pitch + ex) * eb;
+            if (at + eb <= size) std::memcpy(row + uint64_t{x} * eb, tiled.data() + at, eb);
+          }
+        }
+        continue;
+      }
       if (detile && fp[k].Footprint.Depth == 1) {
         // The subresource's tiles, then each element from its place in its 4 KiB tile.
         const uint64_t size = uint64_t{s.row_pitch} * s.padded_rows;

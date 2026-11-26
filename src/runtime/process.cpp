@@ -10,12 +10,15 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <atomic>
+#include <mutex>
 #include <thread>
 #include <vector>
 
 #include "core/json.h"
 #include "core/text.h"
 #include "runtime/console.h"
+#include "runtime/d3d12x/d3d12x.h"
 #include "runtime/d3d12x/object.h"
 #include "runtime/gdk/runtime.h"
 #include "runtime/host_patch.h"
@@ -70,7 +73,8 @@ struct HwWatch {
   uint32_t length = 8;
 };
 HwWatch g_hw_watches[4];
-int g_hw_watch_count = 0;
+std::atomic<int> g_hw_watch_count{0};
+std::atomic<int> g_hw_generation{0};  // the watches changed: every thread is armed again
 volatile LONG g_hw_hits = 0;
 
 LONG CALLBACK on_hw_watch(EXCEPTION_POINTERS* info) {
@@ -100,15 +104,21 @@ LONG CALLBACK on_hw_watch(EXCEPTION_POINTERS* info) {
 void hw_watch_thread() {
   SetThreadDescription(GetCurrentThread(), L"americas hw watch");
   DWORD64 dr7 = 0;
-  for (int k = 0; k < g_hw_watch_count; ++k) {
-    const uint32_t len = g_hw_watches[k].length;
-    const DWORD64 len_bits = len == 1 ? 0 : len == 2 ? 1 : len == 8 ? 2 : 3;
-    dr7 |= 1ull << (2 * k);                    // local enable
-    dr7 |= (1ull | (len_bits << 2)) << (16 + 4 * k);  // RW = write, LEN
-  }
+  int generation = -1;
   std::vector<DWORD> armed;
   const DWORD self = GetCurrentThreadId();
   for (;;) {
+    if (const int now = g_hw_generation.load(); now != generation) {
+      generation = now;
+      armed.clear();
+      dr7 = 0;
+      for (int k = 0; k < g_hw_watch_count; ++k) {
+        const uint32_t len = g_hw_watches[k].length;
+        const DWORD64 len_bits = len == 1 ? 0 : len == 2 ? 1 : len == 8 ? 2 : 3;
+        dr7 |= 1ull << (2 * k);                           // local enable
+        dr7 |= (1ull | (len_bits << 2)) << (16 + 4 * k);  // RW = write, LEN
+      }
+    }
     HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
     if (snapshot != INVALID_HANDLE_VALUE) {
       THREADENTRY32 te{};
@@ -137,6 +147,8 @@ void hw_watch_thread() {
     Sleep(20);
   }
 }
+
+bool add_hw_watch(uint64_t address, uint32_t length);
 
 // ---- AMERICAS_CLAMP_PAGE_RELEASE (diagnosis) ----
 // The title's 64 KiB page allocator keeps one 8-byte entry a page (the array's address at
@@ -206,6 +218,16 @@ void checked_object_release(uint8_t* object) {
     const uint32_t unit = static_cast<uint32_t>((pool - cpu_view) >> 16), units = size >> 16;
     const uint32_t size_class = static_cast<uint32_t>(table[unit] >> 15) & 0x1F;
     const uint32_t block = size_class >= 0x18 ? 1u : (1u << size_class);
+    static std::atomic<int> all{0};
+    if (all.fetch_add(1) < 60) {  // the first releases, good or not, to compare the objects
+      const uint64_t* q = reinterpret_cast<const uint64_t*>(object);
+      logf("pages: release of %u units from unit 0x%x (block of %u, class %u, count %llu); object words %llx %llx %llx %llx "
+           "%llx %llx %llx %llx",
+           units, unit, block, size_class, static_cast<unsigned long long>(table[unit] & 0x7FFF),
+           static_cast<unsigned long long>(q[0]), static_cast<unsigned long long>(q[1]), static_cast<unsigned long long>(q[2]),
+           static_cast<unsigned long long>(q[3]), static_cast<unsigned long long>(q[4]), static_cast<unsigned long long>(q[5]),
+           static_cast<unsigned long long>(q[6]), static_cast<unsigned long long>(q[7]));
+    }
     if (units > block && (size_class == 0 || size_class >= 0x18)) {
       static std::atomic<int> told{0};
       if (told.fetch_add(1) < 30) {
@@ -220,6 +242,19 @@ void checked_object_release(uint8_t* object) {
              static_cast<unsigned long long>(table[unit]), static_cast<unsigned long long>(q[0]),
              static_cast<unsigned long long>(q[1]), static_cast<unsigned long long>(q[2]), static_cast<unsigned long long>(q[3]),
              static_cast<unsigned long long>(q[4]), static_cast<unsigned long long>(q[5]), text.c_str());
+        // +0x20: one of our resources?
+        D3D12_RESOURCE_DESC rd{};
+        uint64_t ra = 0;
+        const void* r = reinterpret_cast<const void*>(q[4]);
+        if (d3d12x::is_object(r) && d3d12x::resource_memory(r, &rd, &ra)) {
+          const D3D12_RESOURCE_ALLOCATION_INFO ai = d3d12x::allocation_info(rd);
+          logf("pages:   +0x20 is our resource %p: dim %u, %llux%u x%u, %u mips, format %u, layout 0x%x, flags 0x%x, at 0x%llx; "
+               "our size %llu", r, rd.Dimension, static_cast<unsigned long long>(rd.Width), rd.Height, rd.DepthOrArraySize,
+               rd.MipLevels, rd.Format, static_cast<uint32_t>(rd.Layout), rd.Flags, static_cast<unsigned long long>(ra),
+               static_cast<unsigned long long>(ai.SizeInBytes));
+        } else if (d3d12x::is_object(r)) {
+          logf("pages:   +0x20 is one of our objects (%p), not a resource", r);
+        }
       }
     }
   }
@@ -227,8 +262,77 @@ void checked_object_release(uint8_t* object) {
   gpu = 0;
 }
 
+// AMERICAS_WATCH_TEXTURES=<width>x<height> (diagnosis): after the title's texture init
+// (game+0x164db0: texture, description, two flags, then a byte, a u32 and a pointer on the stack)
+// makes a texture of that size, its arguments are logged and its address field (+0x18) gets a
+// hardware watch (up to four). The init's first 14 bytes (pushes and the frame) run in a stub
+// that jumps back.
+constexpr uint64_t kTextureInitRva = 0x164db0;
+uint32_t g_watch_width = 0, g_watch_height = 0;
+using TextureInit = uint64_t (*)(uint8_t*, const uint8_t*, uint64_t, uint64_t, uint64_t, uint64_t, const uint8_t*);
+TextureInit g_texture_init = nullptr;
+
+uint64_t watched_texture_init(uint8_t* texture, const uint8_t* desc, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6,
+                              const uint8_t* a7) {
+  const uint64_t result = g_texture_init(texture, desc, a3, a4, a5, a6, a7);
+  const uint32_t width = *reinterpret_cast<uint32_t*>(texture + 0x8);
+  const uint32_t height = *reinterpret_cast<uint16_t*>(texture + 0xC) & 0xFFFu;
+  static std::atomic<int> seen{0};
+  if (seen.fetch_add(1) < 12) {
+    logf("pages: texture init %p: +0x8 %u, +0xc 0x%x, address 0x%llx", texture, width,
+         *reinterpret_cast<uint16_t*>(texture + 0xC), static_cast<unsigned long long>(*reinterpret_cast<uint64_t*>(texture + 0x18)));
+  }
+  if (width == g_watch_width && height == g_watch_height) {
+    void* frames[6] = {};
+    const USHORT got = RtlCaptureStackBackTrace(0, 6, frames, nullptr);
+    std::string text;
+    for (USHORT k = 0; k < got; ++k) text += " " + g_process->describe_address(reinterpret_cast<uint64_t>(frames[k]));
+    const uint64_t* d = reinterpret_cast<const uint64_t*>(desc);
+    const uint64_t* m = reinterpret_cast<const uint64_t*>(a7);
+    logf("pages: texture %p made %ux%u (flags 0x%llx 0x%llx, 0x%llx, 0x%llx), address 0x%llx; description %llx %llx %llx; "
+         "memory %llx %llx;%s",
+         texture, width, height, static_cast<unsigned long long>(a3), static_cast<unsigned long long>(a4),
+         static_cast<unsigned long long>(a5 & 0xFF), static_cast<unsigned long long>(a6 & 0xFFFFFFFF),
+         static_cast<unsigned long long>(*reinterpret_cast<uint64_t*>(texture + 0x18)), static_cast<unsigned long long>(d[0]),
+         static_cast<unsigned long long>(d[1]), static_cast<unsigned long long>(d[2]),
+         static_cast<unsigned long long>(m ? m[0] : 0), static_cast<unsigned long long>(m ? m[1] : 0), text.c_str());
+    add_hw_watch(reinterpret_cast<uint64_t>(texture + 0x18), 8);
+  }
+  return result;
+}
+
 void install_page_release_clamp(uint8_t* base) {
   g_title_base = base;
+  char size[32] = {};
+  if (GetEnvironmentVariableA("AMERICAS_WATCH_TEXTURES", size, sizeof size) &&
+      sscanf_s(size, "%ux%u", &g_watch_width, &g_watch_height) == 2) {
+    uint8_t* at = base + kTextureInitRva;
+    // push r15; push r14; push r12; push rsi; push rdi; push rbp; push rbx; sub rsp, 0x50
+    const uint8_t expected[] = {0x41, 0x57, 0x41, 0x56, 0x41, 0x54, 0x56, 0x57, 0x55, 0x53, 0x48, 0x83, 0xEC, 0x50};
+    auto* stub = static_cast<uint8_t*>(VirtualAlloc(nullptr, 64, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE));
+    if (stub && std::memcmp(at, expected, sizeof expected) == 0) {
+      // The stub: the 14 bytes, then jmp [rip] to the init's 15th byte.
+      std::memcpy(stub, expected, sizeof expected);
+      const uint8_t far_jump[6] = {0xFF, 0x25, 0, 0, 0, 0};
+      std::memcpy(stub + sizeof expected, far_jump, sizeof far_jump);
+      const uint64_t back = reinterpret_cast<uint64_t>(at + sizeof expected);
+      std::memcpy(stub + sizeof expected + sizeof far_jump, &back, 8);
+      FlushInstructionCache(GetCurrentProcess(), stub, 64);
+      g_texture_init = reinterpret_cast<TextureInit>(stub);
+      uint8_t jump[12] = {0x48, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xE0};
+      const uint64_t target = reinterpret_cast<uint64_t>(&watched_texture_init);
+      std::memcpy(jump + 2, &target, 8);
+      DWORD old = 0;
+      if (VirtualProtect(at, sizeof jump, PAGE_EXECUTE_READWRITE, &old)) {
+        std::memcpy(at, jump, sizeof jump);
+        VirtualProtect(at, sizeof jump, old, &old);
+        FlushInstructionCache(GetCurrentProcess(), at, sizeof jump);
+        logf("pages: AMERICAS_WATCH_TEXTURES: watching %ux%u textures", g_watch_width, g_watch_height);
+      }
+    } else {
+      logf("pages: AMERICAS_WATCH_TEXTURES: the texture init is not where this build expects it");
+    }
+  }
   if (GetEnvironmentVariableA("AMERICAS_CHECK_PAGE_RELEASE", nullptr, 0)) {
     uint8_t* at = base + kObjectReleaseRva;
     const uint8_t expected[] = {0x56, 0x48, 0x83, 0xEC, 0x20, 0x48, 0x89, 0xCE, 0x48, 0x8B, 0x49, 0x18};
@@ -264,6 +368,14 @@ void install_page_release_clamp(uint8_t* base) {
   logf("pages: AMERICAS_CLAMP_PAGE_RELEASE: releases of pages with no reference left are refused");
 }
 
+void ensure_hw_watcher() {
+  static std::once_flag once;
+  std::call_once(once, [] {
+    AddVectoredExceptionHandler(1, &on_hw_watch);
+    std::thread(hw_watch_thread).detach();
+  });
+}
+
 void start_hw_watch() {
   char spec[256] = {};
   if (!GetEnvironmentVariableA("AMERICAS_HW_WATCH", spec, sizeof spec)) return;
@@ -281,8 +393,24 @@ void start_hw_watch() {
     if (!*end) break;
   }
   if (!g_hw_watch_count) return;
-  AddVectoredExceptionHandler(1, &on_hw_watch);
-  std::thread(hw_watch_thread).detach();
+  ensure_hw_watcher();
+}
+
+// A watch added while the title runs (diagnosis code that finds what to watch); false when
+// all four are taken.
+bool add_hw_watch(uint64_t address, uint32_t length) {
+  static std::mutex lock;
+  std::lock_guard g(lock);
+  if (g_hw_watch_count >= 4) return false;
+  HwWatch w;
+  w.length = length;
+  w.address = address & ~static_cast<uint64_t>(length - 1);
+  g_hw_watches[g_hw_watch_count] = w;
+  ++g_hw_watch_count;
+  ++g_hw_generation;
+  logf("hw watch: watching writes to 0x%llx (%u bytes), added", static_cast<unsigned long long>(w.address), w.length);
+  ensure_hw_watcher();
+  return true;
 }
 
 }  // namespace

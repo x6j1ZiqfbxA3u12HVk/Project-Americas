@@ -1229,3 +1229,29 @@ pressure (analysis in `C:\Project Americas\crash`, WinDbg's cdb in the WinDbg pa
   giving such a texture memory of its own. `AMERICAS_CLAMP_PAGE_RELEASE=1` refuses releases
   past zero but does not save the run (the over-release takes references that exist).
 * Also new: `xg: GetResourceLayout asked from ...` logs each place that asks XG (once).
+
+## The loading stall: fixed by the mip tail (2026-11-26, evening)
+
+* **The cause:** the four bad releases were our own placed resources (`+0x20` of the title's
+  texture object): 1024x1024 BC7/BC5, 9 mips, swizzle mode 10. The title released them by the
+  size our layout answered, 1,769,472 bytes (27 tiles: every small mip in a 64 KiB tile of
+  its own, "no mip tail"), while it had mapped tiles by GetResourceTiling (XG slot 10), which
+  we left unanswered. The extra 64 KiB units it released belonged to its neighbours.
+* **The fix:** `layout.cpp` now places the mip tail as the GPU's address library does (2D, 4
+  KiB and 64 KiB blocks, one sample, several mips): the tail block first, the larger mips after
+  it from the smallest up, each tail mip at its slot inside the block (`tail_x`/`tail_y`).
+  The same texture is now 1,408 KiB. XG slot 2 reports standard and tail mips, slot 10 is
+  answered by default (the tail is the packed mips, in tile 0; `AMERICAS_NO_XG_TILING=1` turns
+  it off), the upload and XG's slot 8 place tail mips inside the block. Tests in
+  `d3d12x_tests.cpp`.
+* **Result:** no bad releases, no crash, no spinning thread. A run reached 84,000 DirectStorage
+  requests (5 GB, up from 24,000) and was still loading (dark screen, spinner turning) when
+  its timeout ended it. The old worry about slot 10 (device loss, aborts) did not come back.
+  Failed requests fell from ~91,000 (slot 10 on our old layout) to 4,099: **BCPack requests
+  we refuse** (`dstorage: request refused (BCPack): options 0x20000c`, 1 MiB and 256 KiB
+  destinations). Those are next.
+* The run's command: `AMERICAS_SCRIPT=@C:\Project Americas\scripts-run\to-past-stall.txt`
+  with `--timeout 600` (captures every minute after Confirm).
+* Shader service: `am-shaders serve 6` died twice without a message on the 2 MB compute
+  programs while a game ran (memory, most likely); it runs with 3 jobs now
+  (`logs\serve3.txt`, `serve3-err.txt`).

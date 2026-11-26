@@ -166,7 +166,8 @@ TEST_CASE(d3d12x_texture_layouts) {
   CHECK(texture_layout(d, t) && t.swizzle_mode == 0 && t.subresources[0].row_pitch == 15360);
 
   // Mips and layers: a 256 x 256 BC3 array of 2 with a full chain, 64 KiB blocks of 64 x 64
-  // elements (16 bytes each): each of the 9 mips takes one block.
+  // elements (16 bytes each). Mip 0 fills a block; mips 1-8 (32 elements and less) share the
+  // mip tail, which comes first: each layer is the tail block, then mip 0.
   D3D12_RESOURCE_DESC a{};
   a.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
   a.Width = 256;
@@ -178,9 +179,30 @@ TEST_CASE(d3d12x_texture_layouts) {
   a.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x100 | 25);
   CHECK(texture_layout(a, t));
   CHECK(t.mips == 9 && t.layers == 2 && t.subresources.size() == 18);
-  CHECK(t.subresources[1].offset == 65536 && t.subresources[9].offset == 9 * 65536);
+  CHECK(t.first_tail_mip == 1 && t.subresources[0].offset == 65536 && t.subresources[9].offset == 3 * 65536);
+  CHECK(t.subresources[1].in_tail && t.subresources[1].offset == 0 && t.subresources[10].offset == 2 * 65536);
   CHECK(t.subresources[0].width_elements == 64 && t.subresources[8].width_elements == 1);
-  CHECK(t.size == 18 * 65536);
+  CHECK(t.size == 4 * 65536);
+  // Inside the tail, the largest tail mip (slot 11) starts at byte 16 << 11 = 0x8000: address
+  // bit 15, an x bit (odd bits from 9 are x, even ones from 8 are y, in 256-byte tiles of 4 x 4
+  // elements), so element (32, 0); the smallest (mip 8, slot 4) at byte 0x400, element (0, 8).
+  CHECK(t.subresources[1].tail_x == 32 && t.subresources[1].tail_y == 0);
+  CHECK(t.subresources[8].tail_x == 0 && t.subresources[8].tail_y == 8);
+
+  // The UI streamer's textures: 1024 x 1024 BC7, 9 mips, 64 KiB blocks (mode 10). Mips 3-8 are
+  // in the tail: 64 + 64 + 256 + 1024 KiB, mip 0 last.
+  D3D12_RESOURCE_DESC ui{};
+  ui.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+  ui.Width = 1024;
+  ui.Height = 1024;
+  ui.DepthOrArraySize = 1;
+  ui.MipLevels = 9;
+  ui.Format = DXGI_FORMAT_BC7_UNORM;
+  ui.SampleDesc.Count = 1;
+  ui.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x100 | 10);
+  CHECK(texture_layout(ui, t));
+  CHECK(t.first_tail_mip == 3 && t.size == 1408 * 1024);
+  CHECK(t.subresources[2].offset == 65536 && t.subresources[1].offset == 2 * 65536 && t.subresources[0].offset == 6 * 65536);
 
   // XG: a suggestion fills the Layout field; the computer copies linear rows into the layout.
   D3D12_RESOURCE_DESC small_tex{};
