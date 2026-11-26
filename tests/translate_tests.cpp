@@ -1188,3 +1188,38 @@ TEST_CASE(translate_packed_constants_and_pack) {
   }
   CHECK(ok);
 }
+
+// Narrow global stores and loads: 16 bits into their half of a dword, read back zero- and
+// sign-extended, one byte of them.
+TEST_CASE(translate_narrow_global_memory) {
+  const uint64_t base = 0x500000000ull;
+  std::vector<uint32_t> memory(256, 0);
+  const uint64_t buf = base + 0x100;
+  memory[0] = static_cast<uint32_t>(buf);
+  memory[1] = static_cast<uint32_t>(buf >> 32);
+  const Result r = run(
+      {
+          0xF4040100, 0xFA000000,  // s_load_dwordx2 s[4:5], s[0:1], 0x0
+          0xBF8CC07F,              // s_waitcnt lgkmcnt(0)
+          0x34020081,              // v_lshlrev_b32_e32 v1, 1, v0
+          0x4A0400FF, 0x00008100,  // v_add_nc_u32_e32 v2, 0x8100, v0
+          0xDC688000, 0x00040201,  // global_store_short v1, v2, s[4:5]
+          0xBF8C3F70,              // s_waitcnt vmcnt(0)
+          0xDC288000, 0x03040001,  // global_load_ushort v3, v1, s[4:5]
+          0xDC2C8000, 0x04040001,  // global_load_sshort v4, v1, s[4:5]
+          0xDC208001, 0x05040001,  // global_load_ubyte v5, v1, s[4:5] offset:1
+          0xBF8C3F70,              // s_waitcnt vmcnt(0)
+          0xBF810000,              // s_endpgm
+      },
+      {static_cast<uint32_t>(base), static_cast<uint32_t>(base >> 32)}, memory, base);
+  if (!r.ran) return;
+  bool ok = true;
+  for (uint32_t l = 0; l < 64 && ok; ++l) {
+    ok = r.v(l, 3) == 0x8100u + l && r.v(l, 4) == 0xFFFF8100u + l && r.v(l, 5) == 0x81u;
+    if (!ok) std::printf("    lane %u: v3 %08x v4 %08x v5 %08x\n", l, r.v(l, 3), r.v(l, 4), r.v(l, 5));
+  }
+  CHECK(ok);
+  bool stored = r.memory.size() >= 0x60;
+  for (uint32_t k = 0; k < 32 && stored; ++k) stored = r.memory[0x40 + k] == ((0x8100u + 2 * k) | (0x8101u + 2 * k) << 16);
+  CHECK(stored);
+}

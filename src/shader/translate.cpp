@@ -1761,6 +1761,45 @@ const std::unordered_map<std::string, Handler>& table() {
         };
       }
     }
+    // Narrow global loads and stores (FLAT global): the dword holding the bytes, as the buffer
+    // forms; stores merge their bytes into it atomically.
+    {
+      struct NarrowGlobal {
+        const char* name;
+        const char* expr;  // loads: of x, the bytes in the low bits; stores: the mask
+        bool store;
+      };
+      static const NarrowGlobal kGlobal[] = {{"global_load_ubyte", "(x & 0xFFu)", false},
+                                             {"global_load_sbyte", "uint(int(x << 24) >> 24)", false},
+                                             {"global_load_ushort", "(x & 0xFFFFu)", false},
+                                             {"global_load_sshort", "uint(int(x << 16) >> 16)", false},
+                                             {"global_store_byte", "0xFFu", true},
+                                             {"global_store_short", "0xFFFFu", true}};
+      for (const NarrowGlobal& g : kGlobal) {
+        t[g.name] = [g](Ctx& c) {
+          const uint32_t sa = c.f(Field::SADDR), va = c.f(Field::ADDR);
+          const uint32_t vd = g.store ? c.f(Field::DATA) : c.f(Field::VDST);
+          const int32_t imm = static_cast<int32_t>(c.f(Field::OFFSET) << 20) >> 20;
+          std::string addr;
+          if (sa == 125 || sa == 0x7F) {
+            c.touch_v(va + 1);
+            addr = "am_u64(v[" + num(va) + "], v[" + num(va + 1) + "])";
+          } else {
+            c.touch_v(va);
+            addr = "am_u64(s[" + num(sa) + "], s[" + num(sa + 1) + "]) + uint64_t(v[" + num(va) + "])";
+          }
+          c.touch_v(vd);
+          c.line("if (AM_ACT) { uint64_t p = " + addr + " + uint64_t(int64_t(" + std::to_string(imm) + ")); uint sh = uint(p & 3u) * 8u;");
+          if (g.store) {
+            c.line("  am_store_masked(p & ~uint64_t(3), (v[" + num(vd) + "] & " + g.expr + ") << sh, " + g.expr + " << sh);");
+          } else {
+            c.line("  uint x = am_load(p & ~uint64_t(3)) >> sh; v[" + num(vd) + "] = " + g.expr + ";");
+          }
+          c.line("}");
+          return true;
+        };
+      }
+    }
     // Sub-dword buffer stores: the bytes into their place in the dword (atomically: lanes may
     // write other bytes of the same dword).
     for (const auto& [name, mask] : {std::pair{"buffer_store_byte", "0xFFu"}, {"buffer_store_short", "0xFFFFu"}}) {
@@ -3307,6 +3346,19 @@ Translation translate(const TranslateInput& in, Binding binding) {
   std::string body;
   bool uses_br = false;
   tr.structured = Structurer(blocks).run(body, uses_br);
+  // DXC refuses more than 256 nested brackets: structured code nested deeper (programs with
+  // many far jumps) takes the dispatcher instead.
+  if (tr.structured) {
+    int depth = 0, deepest = 0;
+    for (const char ch : body) {
+      if (ch == '{' || ch == '(') deepest = std::max(deepest, ++depth);
+      else if (ch == '}' || ch == ')') --depth;
+    }
+    if (deepest > 200) {
+      tr.structured = false;
+      uses_br = false;
+    }
+  }
   if (!tr.structured) body = dispatch(blocks);
 
   const uint32_t nv = std::max<uint32_t>({c.max_vgpr, in.vgprs ? in.vgprs : 1u, 4u});

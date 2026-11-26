@@ -1345,3 +1345,60 @@ pressure (analysis in `C:\Project Americas\crash`, WinDbg's cdb in the WinDbg pa
 * Jobs: about half the host's threads (3 here); `americas.ini` `shader_jobs = N`,
   `shader_service = off`, or `--no-shader-service` on the command line.
 * Started by hand it still works as before (`am-shaders serve 3`); a second one exits at once.
+* **"No compiling going on", the second time:** the service was running but idle. Every
+  program left in its queue (211) was refused by the translator within 35 s, and refusals were
+  only printed for programs the game had waited on, so `serve.txt` looked dead. It now prints
+  every refusal and, when its queue empties, `serve: idle ...` with the refusal reasons ranked.
+  When it is idle, the translator is what limits compiling.
+
+## Translator gaps closed; the GPU-wait watchdog is still next (2026-11-26, night)
+
+* **Added** (GPU tests for each in `translate_tests.cpp`):
+  * `v_sub_co_ci_u32`, `v_subrev_co_ci_u32`;
+  * f64: `v_add/mul/fma/min/max_f64`, `v_rcp_f64`, `v_cvt_f32_f64`, `v_cvt_f64_f32/i32/u32`,
+    `v_cvt_i32/u32_f64` (saturating);
+  * f16: `v_trunc/ceil/rndne/exp/log/sin/cos_f16`;
+  * `buffer_store_byte/short`;
+  * LDS: `ds_read_u8/i8/u16/i16` and their d16 / d16_hi forms, `ds_write_b8`,
+    `ds_write_b8/b16_d16_hi`, `ds_min/max(_rtn)_i32`;
+  * `image_sample_cl/_b_cl/_d_cl`, with D3D's clamp argument;
+  * packed f16 ops with inline constants, `v_pack_b32_f16` with op_sel.
+* **Packed constants are an assumption:** the ISA guide does not say what VOP3P inline constants
+  give the high half. The translator lets both halves read the constant, because LLVM encodes
+  `v_pk_mul_f16 v1, v2, 2.0` with op_sel_hi set. The GPU test checks our model, not hardware.
+* **Far jumps:** most "indirect jumps" were `s_getpc_b64 sX; s_add_u32 sX, sX, k; s_addc_u32
+  sX+1, sX+1, 0; s_setpc_b64 sX`, or backward with `s_sub_u32`/`s_subb_u32`: the long branches
+  compilers emit past 16-bit offsets. `rdna2::scan_program` resolves them (`far_jumps`) and the
+  translator makes them block jumps. Real indirect jumps (a computed address) are still refused.
+* **Stream pipelines (slot 86) retry:** a stream pipeline whose shaders were not compiled when
+  it was created never got a host pipeline. Now it keeps its description, lists the missing
+  shaders for the service, and draws look again every 2 s. Derived pipelines (slot 55) copy the
+  description and get their own blend state; before, they shared the base's host pipeline.
+  Compute misses are listed for the service when the pipeline is made, not only once a dispatch
+  waits on them.
+* `am-shaders disasm <48-digit marker>` lists one program by its marker (the runtime's name for
+  it) and decodes the "data" regions too (code reached only by jumps we do not follow).
+* **The watchdog still trips** (`+0x23cf683` after 5-8 "a list waits ... not met"). In the
+  run, the compute programs missing just before the waits were: `1b16...`
+  (`image_bvh_intersect_ray`), `24ea...` and `3db4...` (far jumps, compiled by the build
+  from this session), `a5c8...` (never listed, fixed above), and a few with packed constants
+  (fixed). The writer of the awaited values is most likely one of these. Next: one more run with
+  everything compiled, then look at what is still missing before the waits.
+* **Raytracing is the big remaining gap:** 56 programs use `image_bvh_intersect_ray` /
+  `image_bvh64_intersect_ray`, and command list slots 85 and 86 and device slot 71 are not
+  implemented yet (BVH build, copy, prebuild sizes). The ISA guide (section 8.2.10 and the
+  MIMG table) gives the inputs (node pointer, ray extent, origin, direction, inverse
+  direction; A16 packs the directions), the outputs (box node: 4 child pointers sorted by hit
+  distance; triangle node: t_num, t_denom, triangle id or I/J, hit status) and the T#
+  (base >> 8 in bits 0-39, box growing ULPs, sort enable, node count - 1, triangle return
+  mode). It does not give the node layouts in memory. XboxBvhBuilder's own compute programs
+  write those nodes, so their stores show the layout. Two ways forward:
+  * implement the instruction faithfully in HLSL from that layout (real raytracing, in compute);
+  * or a stand-in that reports no hit (child pointers all `0xFFFFFFFF`), which lets the frame
+    run with raytraced effects missing. That would be a stated exception, not emulation.
+* **DirectStorage `octa_imposters.ttpf` failures:** no failures in the last two runs (timing
+  dependent). A refused page destination now logs its page numbers and whether each is an
+  allocated page.
+* Lesson: in the Bash tool, a Python heredoc can lose backslashes (a doubled backslash
+  before `a` became a bell character in a document). Write scripts to files in the scratchpad and run them with
+  `python -I`.
