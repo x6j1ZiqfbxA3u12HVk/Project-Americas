@@ -1255,3 +1255,21 @@ pressure (analysis in `C:\Project Americas\crash`, WinDbg's cdb in the WinDbg pa
 * Shader service: `am-shaders serve 6` died twice without a message on the 2 MB compute
   programs while a game ran (memory, most likely); it runs with 3 jobs now
   (`logs\serve3.txt`, `serve3-err.txt`).
+
+## Past the stall: BC6H, and the next wall is BVH building (2026-11-26, evening)
+
+* **BCPack BC6H decoded** (`formats/bcpack.cpp`): the table file already held BC6H's
+  dictionary; records give the mode (byte 30 + 1), endpoint residuals (interleaved byte
+  pairs, zigzag, summed per channel at the mode's precision), index nibbles, the partition;
+  blocks are written in the public BC6H layout per mode. The 4,099 refused BCPack requests
+  (`options 0x20000c`, BC6H HDR textures) are gone; ~2,000 requests still fail, now logged
+  (`dstorage: request failed ...`, first 16) to see why.
+* **Where loading goes now (default settings, `to-past-stall.txt`):** 68,000-77,000
+  DirectStorage requests (4 GB: terrain, maps, props, interiors), then the title builds
+  raytracing structures and `XboxBvhBuilder.dll` throws a C++ exception (`0xe06d7363`; the
+  registers hold text ending "...plemente(d)") right after calling command list slots 26
+  (from game+0xfe4eeb: `1, ptr, ptr` - D3D12's ResourceBarrier shape) and 148 (from
+  XboxBvhBuilder+0x20ed9: `0x280, 0x10, ptr, 0x10, ...`), neither implemented. Before it:
+  "gpu memory: cannot open the allocation at 0xdc9600000 (2.1 GiB) for the GPU", repeated.
+  **Next:** implement those two slots (or find what the builder asks for), and the 2.1 GiB
+  allocation's GPU view.

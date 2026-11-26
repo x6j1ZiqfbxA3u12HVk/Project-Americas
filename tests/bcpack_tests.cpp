@@ -48,7 +48,7 @@ TEST_CASE(bcpack_refuses_what_it_cannot_decode) {
   CHECK(tables != nullptr);
   std::vector<uint8_t> out(16);
   const std::vector<uint8_t> src(64, 0);
-  CHECK(decode(6, src, out, *tables) == Status::Unsupported);  // BC6H: not yet
+  CHECK(decode(2, src, out, *tables) == Status::Unsupported);  // BC2: not yet
   std::vector<uint8_t> odd(12);
   CHECK(decode(1, src, odd, *tables) == Status::BadSize);  // BC1 blocks are 8 bytes
   CHECK(decode(1, {}, out, *tables) == Status::Corrupt);   // no input at all

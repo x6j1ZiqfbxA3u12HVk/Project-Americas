@@ -36,6 +36,14 @@ struct Bc7 {
   Bc7Ix ix;
 };
 
+// BC6H: four endpoints (R, G, B each, left-aligned to 16 bits with the top bit flipped), the
+// mode (1-14) and 16 signed indices.
+struct Bc6 {
+  uint16_t e[4][3] = {};
+  uint8_t mode = 0;
+  int16_t ix[16] = {};
+};
+
 }  // namespace
 
 struct TableData {
@@ -46,6 +54,7 @@ struct TableData {
   uint8_t rank1[256] = {}, rank3a[64] = {}, rank3c[256] = {}, rank4[64] = {}, rank5[64] = {};
   uint16_t ctrl7[512] = {};
   std::vector<Plain> bc1, bc3, bc4, bc5;
+  std::vector<Bc6> bc6;
   std::vector<Bc7> bc7;
 };
 
@@ -529,6 +538,166 @@ bool bc7(const std::vector<uint8_t>& records, size_t stride, std::span<uint8_t> 
   return true;
 }
 
+// ---- BC6H ----
+
+// Bits of endpoint 0's channels, then of the other endpoints' R, G and B, for modes 1-14.
+constexpr uint8_t kBc6Bits[15][4] = {{0, 0, 0, 0},     {10, 5, 5, 5},   {7, 6, 6, 6},    {11, 5, 4, 4},   {11, 4, 5, 4},
+                                     {11, 4, 4, 5},    {9, 5, 5, 5},    {8, 6, 5, 5},    {8, 5, 6, 5},    {8, 5, 5, 6},
+                                     {6, 6, 6, 6},     {10, 10, 10, 10}, {11, 9, 9, 9},  {12, 8, 8, 8},   {16, 4, 4, 4}};
+// The block's mode field (value, bits) for modes 1-14.
+constexpr uint8_t kBc6Code[15][2] = {{0, 0},  {0, 2},  {1, 2},  {2, 5},  {6, 5},  {10, 5}, {14, 5}, {18, 5},
+                                     {22, 5}, {26, 5}, {30, 5}, {3, 5},  {7, 5},  {11, 5}, {15, 5}};
+
+// One run of a BC6H header after the mode field: `len` bits from bit `first` of channel `ch`
+// (0 R, 1 G, 2 B; 3 is the 5-bit partition) of endpoint `ep`.
+struct Bc6Run {
+  uint8_t ch, ep, first, len;
+};
+constexpr uint8_t R = 0, G = 1, B = 2;
+constexpr Bc6Run kPart = {3, 0, 0, 5};
+// The format's header layouts per mode (modes 13 and 14 store the high base bits in ascending
+// order, as the console's packer writes them).
+constexpr Bc6Run kBc6Mode1[] = {{G, 2, 4, 1},  {B, 2, 4, 1}, {B, 3, 4, 1}, {R, 0, 0, 10}, {G, 0, 0, 10}, {B, 0, 0, 10},
+                                {R, 1, 0, 5},  {G, 3, 4, 1}, {G, 2, 0, 4}, {G, 1, 0, 5},  {B, 3, 0, 1},  {G, 3, 0, 4},
+                                {B, 1, 0, 5},  {B, 3, 1, 1}, {B, 2, 0, 4}, {R, 2, 0, 5},  {B, 3, 2, 1},  {R, 3, 0, 5},
+                                {B, 3, 3, 1},  kPart};
+constexpr Bc6Run kBc6Mode2[] = {{G, 2, 5, 1}, {G, 3, 4, 1}, {G, 3, 5, 1}, {R, 0, 0, 7}, {B, 3, 0, 1}, {B, 3, 1, 1},
+                                {B, 2, 4, 1}, {G, 0, 0, 7}, {B, 2, 5, 1}, {B, 3, 2, 1}, {G, 2, 4, 1}, {B, 0, 0, 7},
+                                {B, 3, 3, 1}, {B, 3, 5, 1}, {B, 3, 4, 1}, {R, 1, 0, 6}, {G, 2, 0, 4}, {G, 1, 0, 6},
+                                {G, 3, 0, 4}, {B, 1, 0, 6}, {B, 2, 0, 4}, {R, 2, 0, 6}, {R, 3, 0, 6}, kPart};
+constexpr Bc6Run kBc6Mode3[] = {{R, 0, 0, 10}, {G, 0, 0, 10}, {B, 0, 0, 10}, {R, 1, 0, 5}, {R, 0, 10, 1}, {G, 2, 0, 4},
+                                {G, 1, 0, 4},  {G, 0, 10, 1}, {B, 3, 0, 1},  {G, 3, 0, 4}, {B, 1, 0, 4},  {B, 0, 10, 1},
+                                {B, 3, 1, 1},  {B, 2, 0, 4},  {R, 2, 0, 5},  {B, 3, 2, 1}, {R, 3, 0, 5},  {B, 3, 3, 1}, kPart};
+constexpr Bc6Run kBc6Mode4[] = {{R, 0, 0, 10}, {G, 0, 0, 10}, {B, 0, 0, 10}, {R, 1, 0, 4}, {R, 0, 10, 1}, {G, 3, 4, 1},
+                                {G, 2, 0, 4},  {G, 1, 0, 5},  {G, 0, 10, 1}, {G, 3, 0, 4}, {B, 1, 0, 4},  {B, 0, 10, 1},
+                                {B, 3, 1, 1},  {B, 2, 0, 4},  {R, 2, 0, 4},  {B, 3, 0, 1}, {B, 3, 2, 1},  {R, 3, 0, 4},
+                                {G, 2, 4, 1},  {B, 3, 3, 1},  kPart};
+constexpr Bc6Run kBc6Mode5[] = {{R, 0, 0, 10}, {G, 0, 0, 10}, {B, 0, 0, 10}, {R, 1, 0, 4}, {R, 0, 10, 1}, {B, 2, 4, 1},
+                                {G, 2, 0, 4},  {G, 1, 0, 4},  {G, 0, 10, 1}, {B, 3, 0, 1}, {G, 3, 0, 4},  {B, 1, 0, 5},
+                                {B, 0, 10, 1}, {B, 2, 0, 4},  {R, 2, 0, 4},  {B, 3, 1, 1}, {B, 3, 2, 1},  {R, 3, 0, 4},
+                                {B, 3, 4, 1},  {B, 3, 3, 1},  kPart};
+constexpr Bc6Run kBc6Mode6[] = {{R, 0, 0, 9}, {B, 2, 4, 1}, {G, 0, 0, 9}, {G, 2, 4, 1}, {B, 0, 0, 9}, {B, 3, 4, 1},
+                                {R, 1, 0, 5}, {G, 3, 4, 1}, {G, 2, 0, 4}, {G, 1, 0, 5}, {B, 3, 0, 1}, {G, 3, 0, 4},
+                                {B, 1, 0, 5}, {B, 3, 1, 1}, {B, 2, 0, 4}, {R, 2, 0, 5}, {B, 3, 2, 1}, {R, 3, 0, 5},
+                                {B, 3, 3, 1}, kPart};
+constexpr Bc6Run kBc6Mode7[] = {{R, 0, 0, 8}, {G, 3, 4, 1}, {B, 2, 4, 1}, {G, 0, 0, 8}, {B, 3, 2, 1}, {G, 2, 4, 1},
+                                {B, 0, 0, 8}, {B, 3, 3, 1}, {B, 3, 4, 1}, {R, 1, 0, 6}, {G, 2, 0, 4}, {G, 1, 0, 5},
+                                {B, 3, 0, 1}, {G, 3, 0, 4}, {B, 1, 0, 5}, {B, 3, 1, 1}, {B, 2, 0, 4}, {R, 2, 0, 6},
+                                {R, 3, 0, 6}, kPart};
+constexpr Bc6Run kBc6Mode8[] = {{R, 0, 0, 8}, {B, 3, 0, 1}, {B, 2, 4, 1}, {G, 0, 0, 8}, {G, 2, 5, 1}, {G, 2, 4, 1},
+                                {B, 0, 0, 8}, {G, 3, 5, 1}, {B, 3, 4, 1}, {R, 1, 0, 5}, {G, 3, 4, 1}, {G, 2, 0, 4},
+                                {G, 1, 0, 6}, {G, 3, 0, 4}, {B, 1, 0, 5}, {B, 3, 1, 1}, {B, 2, 0, 4}, {R, 2, 0, 5},
+                                {B, 3, 2, 1}, {R, 3, 0, 5}, {B, 3, 3, 1}, kPart};
+constexpr Bc6Run kBc6Mode9[] = {{R, 0, 0, 8}, {B, 3, 1, 1}, {B, 2, 4, 1}, {G, 0, 0, 8}, {B, 2, 5, 1}, {G, 2, 4, 1},
+                                {B, 0, 0, 8}, {B, 3, 5, 1}, {B, 3, 4, 1}, {R, 1, 0, 5}, {G, 3, 4, 1}, {G, 2, 0, 4},
+                                {G, 1, 0, 5}, {B, 3, 0, 1}, {G, 3, 0, 4}, {B, 1, 0, 6}, {B, 2, 0, 4}, {R, 2, 0, 5},
+                                {B, 3, 2, 1}, {R, 3, 0, 5}, {B, 3, 3, 1}, kPart};
+constexpr Bc6Run kBc6Mode10[] = {{R, 0, 0, 6}, {G, 3, 4, 1}, {B, 3, 0, 1}, {B, 3, 1, 1}, {B, 2, 4, 1}, {G, 0, 0, 6},
+                                 {G, 2, 5, 1}, {B, 2, 5, 1}, {B, 3, 2, 1}, {G, 2, 4, 1}, {B, 0, 0, 6}, {G, 3, 5, 1},
+                                 {B, 3, 3, 1}, {B, 3, 5, 1}, {B, 3, 4, 1}, {R, 1, 0, 6}, {G, 2, 0, 4}, {G, 1, 0, 6},
+                                 {G, 3, 0, 4}, {B, 1, 0, 6}, {B, 2, 0, 4}, {R, 2, 0, 6}, {R, 3, 0, 6}, kPart};
+constexpr Bc6Run kBc6Mode11[] = {{R, 0, 0, 10}, {G, 0, 0, 10}, {B, 0, 0, 10}, {R, 1, 0, 10}, {G, 1, 0, 10}, {B, 1, 0, 10}};
+constexpr Bc6Run kBc6Mode12[] = {{R, 0, 0, 10}, {G, 0, 0, 10}, {B, 0, 0, 10}, {R, 1, 0, 9}, {R, 0, 10, 1},
+                                 {G, 1, 0, 9},  {G, 0, 10, 1}, {B, 1, 0, 9},  {B, 0, 10, 1}};
+constexpr Bc6Run kBc6Mode13[] = {{R, 0, 0, 10}, {G, 0, 0, 10}, {B, 0, 0, 10}, {R, 1, 0, 8}, {R, 0, 10, 2},
+                                 {G, 1, 0, 8},  {G, 0, 10, 2}, {B, 1, 0, 8},  {B, 0, 10, 2}};
+constexpr Bc6Run kBc6Mode14[] = {{R, 0, 0, 10}, {G, 0, 0, 10}, {B, 0, 0, 10}, {R, 1, 0, 4}, {R, 0, 10, 6},
+                                 {G, 1, 0, 4},  {G, 0, 10, 6}, {B, 1, 0, 4},  {B, 0, 10, 6}};
+constexpr std::span<const Bc6Run> kBc6Layout[15] = {
+    {},         kBc6Mode1,  kBc6Mode2,  kBc6Mode3,  kBc6Mode4,  kBc6Mode5,  kBc6Mode6, kBc6Mode7,
+    kBc6Mode8,  kBc6Mode9,  kBc6Mode10, kBc6Mode11, kBc6Mode12, kBc6Mode13, kBc6Mode14};
+
+uint8_t bc6_index_bits(uint8_t mode) { return mode >= 1 && mode <= 10 ? 3 : mode >= 11 && mode <= 14 ? 4 : 0; }
+
+// Two bytes' bits interleaved into 16: the first on the even bits.
+uint16_t interleave16(uint8_t a, uint8_t b) {
+  uint16_t v = 0;
+  for (int k = 0; k < 8; ++k) v |= static_cast<uint16_t>(((a >> k) & 1) << (2 * k) | ((b >> k) & 1) << (2 * k + 1));
+  return v;
+}
+
+uint16_t zz16(uint16_t v) { return static_cast<uint16_t>((v >> 1) ^ static_cast<uint16_t>(-(v & 1))); }
+
+// A record: references, the mode (byte 30, less one), endpoint 0 and 1 residuals as interleaved
+// byte pairs (4-15), endpoints 2 and 3 (two-subset modes) one byte each (16-21), index nibbles
+// (22-29), the partition (31). Endpoint 0 sums at the base precision, the others per channel,
+// each cut to its precision after the sum; one-subset modes carry endpoints 2 and 3 for the
+// next blocks: endpoint 0 at the channel precision, and endpoint 1.
+bool bc6(const std::vector<uint8_t>& records, size_t stride, std::span<uint8_t> dst, const TableData& t) {
+  std::vector<Bc6> history(kHistory);
+  Bc6 zero;
+  zero.mode = 11;
+  const size_t blocks = dst.size() / 16;
+  for (size_t i = 0; i < blocks; ++i) {
+    const uint8_t* s = records.data() + i * stride;
+    int ep_ref = 0, ix_ref = 0;
+    references(s, true, ep_ref, ix_ref);
+    const uint8_t mode = static_cast<uint8_t>(s[30] + 1);
+    if (mode < 1 || mode > 14) return false;
+    const bool two = mode < 11;
+    uint32_t shift[4];
+    for (int k = 0; k < 4; ++k) shift[k] = 16u - kBc6Bits[mode][k];
+    uint16_t res[4][3] = {};
+    for (int c = 0; c < 3; ++c) {
+      res[0][c] = zz16(interleave16(s[4 + 2 * c], s[5 + 2 * c]));
+      res[1][c] = zz16(interleave16(s[10 + 2 * c], s[11 + 2 * c]));
+      res[2][c] = two ? zz16(s[16 + 2 * c]) : res[0][c];
+      res[3][c] = two ? zz16(s[17 + 2 * c]) : res[1][c];
+    }
+    const Bc6& r = pick(i, ep_ref, history, t.bc6, zero);
+    Bc6 v;
+    v.mode = mode;
+    auto mask = [](uint32_t sh) { return static_cast<uint16_t>(0xFFFFu << sh); };
+    for (int c = 0; c < 3; ++c) {
+      v.e[0][c] = static_cast<uint16_t>((r.e[0][c] + (res[0][c] << shift[0])) & mask(shift[0]));
+    }
+    for (int k = 1; k < (two ? 4 : 2); ++k) {
+      for (int c = 0; c < 3; ++c) {
+        v.e[k][c] = static_cast<uint16_t>((r.e[k][c] + (res[k][c] << shift[1 + c])) & mask(shift[1 + c]));
+      }
+    }
+    if (!two) {
+      for (int c = 0; c < 3; ++c) v.e[2][c] = static_cast<uint16_t>((v.e[0][c] >> shift[0]) << shift[1]);
+      for (int c = 0; c < 3; ++c) v.e[3][c] = v.e[1][c];
+    }
+    const Bc6& rx = pick(i, ix_ref, history, t.bc6, zero);
+    const uint8_t bits = bc6_index_bits(mode);
+    for (int k = 0; k < 8; ++k) {
+      const std::array<int16_t, 2> pair = nibbles(s[22 + k], k < 6);
+      for (int h = 0; h < 2; ++h) {
+        const int p = 2 * k + h;
+        v.ix[p] = add_index(pair[h], bits, rx.ix[p], bc6_index_bits(rx.mode));
+      }
+    }
+    history[i % kHistory] = v;
+    // The block: the mode field, the header runs (fields from the working values, top bit
+    // flipped back), then the indices (the first, and the second subset's anchor, one bit short).
+    auto field = [&](int k, int c) -> uint64_t {
+      const uint32_t sh = k == 0 ? shift[0] : shift[1 + c];
+      return static_cast<uint16_t>(v.e[k][c] ^ 0x8000) >> sh;
+    };
+    Bits w;
+    w.put(kBc6Code[mode][0], kBc6Code[mode][1]);
+    const uint8_t part = s[31] & 31;
+    for (const Bc6Run& run : kBc6Layout[mode]) {
+      if (run.ch == 3) {
+        w.put(part, 5);
+      } else {
+        w.put(field(run.ep, run.ch) >> run.first, run.len);
+      }
+    }
+    const int anchor = two ? kAnchor2[part] : 0;
+    for (int p = 0; p < 16; ++p) {
+      const bool short_one = p == 0 || p == anchor;
+      const uint16_t value = static_cast<uint16_t>(static_cast<uint16_t>(v.ix[p]) + (1u << (bits - 1)));
+      w.put(value, bits - (short_one ? 1u : 0u));
+    }
+    put_le(dst.data() + i * 16, w.w[0], 8);
+    put_le(dst.data() + i * 16 + 8, w.w[1], 8);
+  }
+  return true;
+}
+
 }  // namespace
 
 Tables::Tables() : data_(std::make_unique<TableData>()) {}
@@ -588,7 +757,15 @@ std::unique_ptr<Tables> Tables::load(std::span<const uint8_t> bytes, std::string
   plain_dictionary(t.bc3, 8, 32);
   plain_dictionary(t.bc4, 2, 16);
   plain_dictionary(t.bc5, 4, 32);
-  r.p += kDictionary * (1 + 24 + 1 + 32);  // BC6H's entries (not decoded yet)
+  t.bc6.resize(kDictionary);
+  for (Bc6& e : t.bc6) {
+    r.u8();  // the endpoint entry's own mode byte: not used
+    for (auto& end : e.e) {
+      for (uint16_t& v : end) v = r.u16();
+    }
+    e.mode = r.u8();
+    for (int16_t& v : e.ix) v = static_cast<int16_t>(r.u16());
+  }
   t.bc7.resize(kDictionary);
   for (Bc7& e : t.bc7) {
     e.ep.ctrl = r.u16();
@@ -623,12 +800,14 @@ Status decode(int bc, std::span<const uint8_t> src, std::span<uint8_t> dst, cons
   static constexpr uint8_t kW3[] = {3, 3, 7, 5, 5, 5, 5, 4, 5, 4, 7, 7};
   static constexpr uint8_t kW4[] = {7, 7, 7, 7, 5, 5, 5, 5, 5, 5, 5, 5};
   static constexpr uint8_t kW5[] = {3, 3, 7, 7, 5, 5, 5, 5, 5, 5, 5, 5};
+  static constexpr uint8_t kW6[] = {3, 3, 7, 7, 7, 4, 4, 4, 5, 5, 5, 7, 7, 7, 7, 4};
   static constexpr uint8_t kW7[] = {3, 3, 7, 7, 7, 7, 7, 6, 6, 4, 5, 7, 7, 7, 7, 4};
   switch (bc) {
     case 1: block = 8, per = 1, widths = kW1; break;
     case 3: block = 16, per = 2, widths = kW3; break;
     case 4: block = 8, per = 1, widths = kW4; break;
     case 5: block = 16, per = 2, widths = kW5; break;
+    case 6: block = 16, per = 2, widths = kW6; break;
     case 7: block = 16, per = 2, widths = kW7; break;
     default: return Status::Unsupported;
   }
@@ -659,6 +838,7 @@ Status decode(int bc, std::span<const uint8_t> src, std::span<uint8_t> dst, cons
               bc4_alpha(v.ep[2], v.ep[3], v.ix + 16, out + 8);
             });
       return Status::Ok;
+    case 6: return bc6(records, stride, dst, t) ? Status::Ok : Status::Corrupt;
     default: return bc7(records, stride, dst, t) ? Status::Ok : Status::Corrupt;
   }
 }

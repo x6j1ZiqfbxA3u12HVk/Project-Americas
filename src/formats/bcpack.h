@@ -1,7 +1,7 @@
 #pragma once
 
 // BCPack: the console's lossless packing of BC block streams (DirectStorage unpacks it in
-// hardware there). Decoding only; BC1, BC3, BC4, BC5 and BC7 (BC6H and BC2 not yet).
+// hardware there). Decoding only; BC1, BC3, BC4, BC5, BC6H and BC7 (BC2 not yet).
 //
 // A packed stream has no header. It is 12 or 16 interleaved rANS lanes. Each lane is a run of
 // fragments (a header byte naming one of 128 static models, a length, the payload). A fixed
@@ -46,7 +46,7 @@ enum class Status : uint8_t {
 };
 const char* status_name(Status s);
 
-// Unpacks `src` (BC format `bc`: 1, 3, 4, 5, 7) into `dst`, whose size gives the block count.
+// Unpacks `src` (BC format `bc`: 1, 3, 4, 5, 6, 7) into `dst`, whose size gives the block count.
 // Bytes after the last one the lanes need are ignored.
 Status decode(int bc, std::span<const uint8_t> src, std::span<uint8_t> dst, const Tables& tables);
 

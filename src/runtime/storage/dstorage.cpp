@@ -439,7 +439,14 @@ void worker() {
            (request.options & kMemorySource) ? "from memory" : static_cast<const File*>(request.source)->name.c_str());
     }
     g_bytes.fetch_add(request.destination_size, std::memory_order_relaxed);
-    if (FAILED(hr)) g_failures.fetch_add(1, std::memory_order_relaxed);
+    if (FAILED(hr) && g_failures.fetch_add(1, std::memory_order_relaxed) < 16) {
+      // The first failures, whatever their path (the refusals above say why; these say what).
+      logf("dstorage: request failed 0x%08lx: options 0x%s, %s offset 0x%llx, %u -> %u bytes (intermediate %u), to %p",
+           static_cast<unsigned long>(hr), hex(request.options).c_str(),
+           (request.options & kMemorySource) ? "memory" : static_cast<const File*>(request.source)->name.c_str(),
+           static_cast<unsigned long long>(request.offset), request.source_size, request.destination_size,
+           request.intermediate_size, request.destination);
+    }
     lock.lock();
     c->state = Command::Done;  // deque elements stay put: only the front is ever removed
     c->result = hr;
