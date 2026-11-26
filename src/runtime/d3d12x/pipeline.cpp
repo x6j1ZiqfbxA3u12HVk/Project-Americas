@@ -798,8 +798,14 @@ bool stages_link(const std::vector<SignatureElement>& outputs, const std::vector
 // the fourth corner (it finds each triangle's right-angle corner k, the one facing its longest
 // edge on screen, and draws k, a, b and a + b - k as a strip of two triangles); for stages that
 // do not link (stages_link), the vertex outputs again in the pixel program's order, so each
-// lands in the register it is read from (0 for one the vertex program does not write). Empty
-// when none is needed, or when it cannot be made (then `failed`).
+// lands in the register it is read from. Empty when none is needed, or when it cannot be made
+// (then `failed`).
+//
+// The pixel program's inputs are paired with the vertex outputs by position, as the hardware
+// pairs them (pixel input k reads vertex parameter k), not by name: the stages' names need not
+// agree. One of the game's UI pipelines writes its colour to the second output, named
+// TEXCOORD1, and declares a third, COLOR0, that it never writes; its pixel program reads the
+// colour as its second input, named COLOR0. Paired by name, the small glyphs got alpha 0.
 std::vector<uint8_t> geometry_shader(const std::vector<uint8_t>& vs, const std::vector<uint8_t>& ps, bool rect_list, bool& failed) {
   failed = false;
   const std::vector<SignatureElement> outputs = output_signature(vs);
@@ -827,16 +833,23 @@ std::vector<uint8_t> geometry_shader(const std::vector<uint8_t>& vs, const std::
     decl += "struct P {\n";
     convert = "P to_p(V v) {\n  P p;\n";
     bool has_position = false;
+    std::vector<size_t> parameters;  // the vertex outputs that are not the position, in order
+    for (size_t j = 0; j < outputs.size(); ++j) {
+      if (outputs[j].system_value != 1) parameters.push_back(j);
+    }
+    size_t next = 0;
     for (size_t k = 0; k < inputs.size(); ++k) {
       const SignatureElement& in = inputs[k];
       if (in.system_value > 1) continue;
       const std::string field = "g" + std::to_string(k);
       decl += "  float4 " + field + " : " + semantic(in) + ";\n";
       std::string from = "float4(0, 0, 0, 0)";
-      for (size_t j = 0; j < outputs.size(); ++j) {
-        if (same_element(outputs[j], in)) from = "v.f" + std::to_string(j);
+      if (in.system_value == 1) {
+        from = "v." + position;
+        has_position = true;
+      } else if (next < parameters.size()) {
+        from = "v.f" + std::to_string(parameters[next++]);
       }
-      if (in.system_value == 1) has_position = true;
       convert += "  p." + field + " = " + from + ";\n";
     }
     if (!has_position) {
