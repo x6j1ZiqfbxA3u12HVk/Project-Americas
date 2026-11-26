@@ -314,10 +314,11 @@ int64_t far_target(std::span<const uint32_t> code, const size_t* recent, const I
   }
   const uint32_t d = jump.field(Field::SSRC0);
   if (std::string_view(get.info->name) != "s_getpc_b64" || get.field(Field::SDST) != d) return -1;
-  if (std::string_view(add.info->name) != "s_add_u32" || add.field(Field::SDST) != d || add.field(Field::SSRC0) != d) return -1;
-  if (std::string_view(addc.info->name) != "s_addc_u32" || addc.field(Field::SDST) != d + 1 || addc.field(Field::SSRC0) != d + 1) {
-    return -1;
-  }
+  // Forward: s_add_u32 / s_addc_u32; backward: s_sub_u32 / s_subb_u32.
+  const std::string_view an = add.info->name, cn = addc.info->name;
+  const bool sub = an == "s_sub_u32";
+  if ((an != "s_add_u32" && !sub) || add.field(Field::SDST) != d || add.field(Field::SSRC0) != d) return -1;
+  if (cn != (sub ? "s_subb_u32" : "s_addc_u32") || addc.field(Field::SDST) != d + 1 || addc.field(Field::SSRC0) != d + 1) return -1;
   uint32_t k = 0;
   const uint32_t ks = add.field(Field::SSRC1);
   if (ks == 255) k = add.literal();
@@ -326,10 +327,20 @@ int64_t far_target(std::span<const uint32_t> code, const size_t* recent, const I
   else return -1;
   const uint32_t hs = addc.field(Field::SSRC1);
   if (hs != 128 && hs != 193) return -1;  // 0 or -1
+  const uint64_t h = hs == 193 ? 0xFFFFFFFFull : 0;
   const uint64_t base = (recent[0] + get.dwords) * 4ull;
-  const uint64_t lo = (base & 0xFFFFFFFFull) + k;
-  const uint64_t hi = ((base >> 32) + (hs == 193 ? 0xFFFFFFFFull : 0) + (lo >> 32)) & 0xFFFFFFFFull;
-  const uint64_t target = hi << 32 | (lo & 0xFFFFFFFFull);
+  const uint64_t base_lo = base & 0xFFFFFFFFull, base_hi = base >> 32;
+  uint64_t lo, hi;
+  if (sub) {
+    const bool borrow = k > base_lo;
+    lo = (base_lo - k) & 0xFFFFFFFFull;
+    hi = (base_hi - h - (borrow ? 1 : 0)) & 0xFFFFFFFFull;
+  } else {
+    lo = base_lo + k;
+    hi = (base_hi + h + (lo >> 32)) & 0xFFFFFFFFull;
+    lo &= 0xFFFFFFFFull;
+  }
+  const uint64_t target = hi << 32 | lo;
   if (target % 4 || target / 4 >= code.size()) return -1;
   return static_cast<int64_t>(target / 4);
 }

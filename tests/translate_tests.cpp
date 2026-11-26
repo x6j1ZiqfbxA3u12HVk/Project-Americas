@@ -1146,3 +1146,26 @@ TEST_CASE(translate_far_jumps) {
   for (int l = 0; l < 64 && ok; ++l) ok = r.v(l, 1) == 1 && r.v(l, 2) == 3;
   CHECK(ok);
 }
+
+// A backward far jump: s_sub_u32 / s_subb_u32 from the address s_getpc_b64 gives.
+TEST_CASE(translate_backward_far_jumps) {
+  const std::vector<uint32_t> code = {
+      0xBF820002,  // s_branch 2                     (to dword 3)
+      0x7E040283,  // v_mov_b32_e32 v2, 3            (dword 1: the far jump's target)
+      0xBF810000,  // s_endpgm
+      0x7E020281,  // v_mov_b32_e32 v1, 1
+      0xBE841F00,  // s_getpc_b64 s[4:5]            (20)
+      0x80849004,  // s_sub_u32 s4, s4, 16          -> 4
+      0x82858005,  // s_subb_u32 s5, s5, 0
+      0xBE802004,  // s_setpc_b64 s[4:5]
+      0x7E020282,  // v_mov_b32_e32 v1, 2           (not reached)
+      0xBF810000,  // s_endpgm
+  };
+  const am::shader::rdna2::ProgramScan scan = am::shader::rdna2::scan_program(code);
+  CHECK(!scan.indirect && am::shader::rdna2::far_jump_target(scan, 7) == 1);
+  const Result r = run(code);
+  if (!r.ran) return;
+  bool ok = true;
+  for (int l = 0; l < 64 && ok; ++l) ok = r.v(l, 1) == 1 && r.v(l, 2) == 3;
+  CHECK(ok);
+}
