@@ -283,6 +283,11 @@ int wmain(int argc, wchar_t** argv) {
                              out.parent_path() / L"dxil" / (L"rt" + std::to_wstring(shader::kTranslatorVersion)), all, raw,
                              refresh);
   }
+  if (command == L"guard-loops" && positional.size() <= 1) {
+    const bool apply = !positional.empty() && positional[0] == L"apply";
+    return tools::invalidate_loops(out, out.parent_path() / L"runtime",
+                                   out.parent_path() / L"dxil" / (L"rt" + std::to_wstring(shader::kTranslatorVersion)), apply);
+  }
   if (command == L"serve" && positional.size() <= 1) {
     const unsigned jobs = positional.empty() ? std::max(1u, std::thread::hardware_concurrency() - 2) : std::stoul(positional[0]);
     return tools::serve(out, out.parent_path() / L"runtime",

@@ -31,6 +31,8 @@ int image_survey(const std::filesystem::path& pack_dir);
 // by its source's content key (dxil\by-source): no source is ever compiled twice, under any
 // marker or translator version. Files from before content keys are adopted as they are.
 // The shader service: compiles what the running game waits for first, then the rest.
+int invalidate_loops(const std::filesystem::path& pack_dir, const std::filesystem::path& runtime_dir,
+                     const std::filesystem::path& out_dir, bool apply);
 int serve(const std::filesystem::path& pack_dir, const std::filesystem::path& runtime_dir, const std::filesystem::path& out_dir,
           unsigned jobs,
           const std::filesystem::path& log = {});

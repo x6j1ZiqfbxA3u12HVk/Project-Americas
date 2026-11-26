@@ -598,6 +598,62 @@ void say(const char* format, ...) {
 
 }  // namespace
 
+// Whether a program can loop: a backward branch (or far jump), or a control flow the translator
+// runs as a dispatcher. Those are the programs the runaway guards matter for.
+bool has_loop(std::span<const uint32_t> code) {
+  namespace rd = shader::rdna2;
+  using rd::Field;
+  const rd::ProgramScan scan = rd::scan_program(code);
+  for (const auto& [at, target] : scan.far_jumps) {
+    if (target <= at) return true;
+  }
+  for (const uint32_t at : scan.starts) {
+    rd::Instruction insn;
+    if (rd::decode(code, at, insn) != rd::DecodeStatus::Ok || !(insn.info->flags & rd::kBranch)) continue;
+    if (!insn.has_field(Field::SIMM16)) continue;
+    if (static_cast<int16_t>(insn.field(Field::SIMM16)) < 0) return true;
+  }
+  return false;
+}
+
+// am-shaders guard-loops [apply]: the compiled programs (dxil\rt<N>\<marker>.dxil) that can loop,
+// counted; with `apply` their DXIL is removed so the shader service compiles them again with
+// the runaway guards (translations from before the guards could hang the GPU).
+int invalidate_loops(const fs::path& pack_dir, const fs::path& runtime_dir, const fs::path& out_dir, bool apply) {
+  std::vector<fs::path> files = containers(pack_dir);
+  for (const fs::path& f : containers(runtime_dir)) files.push_back(f);
+  std::set<std::string> seen;
+  size_t programs = 0, looping = 0, removed = 0;
+  for (const fs::path& f : files) {
+    std::string error;
+    const auto shader = load(f, error);
+    if (!shader) continue;
+    for (const shader::NativeBlob& b : shader->shader.blobs) {
+      for (const shader::NativeProgram& pr : b.programs) {
+        if (pr.stage != shader::HwStage::Vs && pr.stage != shader::HwStage::Ps && pr.stage != shader::HwStage::Cs) continue;
+        const auto bytes = b.code(pr);
+        const std::string marker = marker_of(bytes);
+        if (!seen.insert(marker).second) continue;
+        std::error_code ec;
+        const fs::path dxil = out_dir / widen(marker + ".dxil");
+        if (!fs::exists(dxil, ec)) continue;
+        ++programs;
+        std::vector<uint32_t> code(bytes.size() / 4);
+        std::memcpy(code.data(), bytes.data(), code.size() * 4);
+        if (!has_loop(code)) continue;
+        ++looping;
+        if (apply) {
+          removed += fs::remove(dxil, ec);
+          fs::remove(out_dir / widen(marker + ".src"), ec);
+        }
+      }
+    }
+  }
+  std::printf("guard-loops: %zu compiled programs, %zu of them can loop%s\n", programs, looping,
+              apply ? (", " + std::to_string(removed) + " removed for compiling again").c_str() : " (dry run; 'apply' removes them)");
+  return 0;
+}
+
 int serve(const fs::path& pack_dir, const fs::path& runtime_dir, const fs::path& out_dir, unsigned jobs, const fs::path& log) {
   SetPriorityClass(GetCurrentProcess(), BELOW_NORMAL_PRIORITY_CLASS);
   if (!log.empty()) g_serve_log = _wfsopen(log.c_str(), L"a", _SH_DENYNO);
@@ -663,7 +719,20 @@ int serve(const fs::path& pack_dir, const fs::path& runtime_dir, const fs::path&
   struct Location {
     size_t file = 0, blob = 0, program = 0, code_size = 0;
     shader::HwStage stage = shader::HwStage::Cs;
+    bool loops = false;  // it can loop: compiled before the runaway guards, it is compiled again
   };
+  // Programs compiled with the runaway guards (guarded.txt, one marker a line). A program that
+  // can loop and is not listed is compiled again: first when the game waits for it, the rest
+  // when nothing else is left. Its old DXIL serves until then.
+  std::set<std::string> guarded;
+  {
+    std::ifstream in(out_dir / L"guarded.txt");
+    for (std::string m; std::getline(in, m);) {
+      if (!m.empty() && m.back() == '\r') m.pop_back();
+      if (!m.empty()) guarded.insert(m);
+    }
+  }
+  std::ofstream guarded_out(out_dir / L"guarded.txt", std::ios::app);
   std::vector<fs::path> files;
   std::map<std::string, Location> where;
   std::mutex lock;
@@ -689,14 +758,25 @@ int serve(const fs::path& pack_dir, const fs::path& runtime_dir, const fs::path&
               const shader::NativeProgram& pr = b.programs[pi];
               if (pr.stage != shader::HwStage::Vs && pr.stage != shader::HwStage::Ps && pr.stage != shader::HwStage::Cs) continue;
               const std::string marker = marker_of(b.code(pr));
+              std::vector<uint32_t> code(b.code(pr).size() / 4);
+              std::memcpy(code.data(), b.code(pr).data(), code.size() * 4);
+              const bool loops = has_loop(code);
               std::lock_guard<std::mutex> g(lock);
-              where.try_emplace(marker, Location{i, bi, pi, b.code(pr).size(), pr.stage});
+              where.try_emplace(marker, Location{i, bi, pi, b.code(pr).size(), pr.stage, loops});
             }
           }
         }
       });
     }
     for (std::thread& t : workers) t.join();
+  };
+  // Under `lock`: whether `m` needs compiling: no DXIL yet, or DXIL from before the guards for
+  // a program that can loop.
+  const auto needs = [&](const std::string& m) {
+    std::error_code e;
+    if (!fs::exists(out_dir / widen(m + ".dxil"), e)) return true;
+    const auto it = where.find(m);
+    return it != where.end() && it->second.loops && !guarded.count(m);
   };
   std::set<fs::path> seen_runtime;
   const auto add_runtime_files = [&] {
@@ -721,6 +801,7 @@ int serve(const fs::path& pack_dir, const fs::path& runtime_dir, const fs::path&
   add_runtime_files();
   // The rest: the game's pipelines' programs (cpipe-index.tsv, as the precompile wrote it).
   std::vector<std::string> bulk;
+  std::vector<std::string> upgrades;  // compiled before the guards, able to loop: last
   {
     std::set<std::string> listed;
     std::ifstream in(out_dir / L"cpipe-index.tsv");
@@ -736,11 +817,17 @@ int serve(const fs::path& pack_dir, const fs::path& runtime_dir, const fs::path&
     for (const std::string& m : listed) {
       if (where.count(m) && !fs::exists(out_dir / widen(m + ".dxil"), ec)) bulk.push_back(m);
     }
+    // Compiled before the guards and able to loop: again, after everything else.
+    for (const auto& [m, at] : where) {
+      if (at.loops && !guarded.count(m) && fs::exists(out_dir / widen(m + ".dxil"), ec)) upgrades.push_back(m);
+    }
+    std::sort(upgrades.begin(), upgrades.end(), [&](const std::string& a, const std::string& b) { return where[a].code_size > where[b].code_size; });
     std::sort(bulk.begin(), bulk.end(), [&](const std::string& a, const std::string& b) { return where[a].code_size > where[b].code_size; });
   }
   say("serve: %zu programs mapped in %zu containers (%.0f s); %zu of the game's pipelines' programs not compiled yet; "
-              "%u at a time\n",
-              where.size(), files.size(), std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), bulk.size(), jobs);
+              "%zu to compile again with the runaway guards; %u at a time\n",
+              where.size(), files.size(), std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), bulk.size(),
+              upgrades.size(), jobs);
   std::fflush(stdout);
 
   std::deque<std::string> urgent;  // what the game waits for, oldest first
@@ -801,8 +888,8 @@ int serve(const fs::path& pack_dir, const fs::path& runtime_dir, const fs::path&
         read = size;
         bool unknown = false;
         for (const std::string& m : fresh) {
-          if (fs::exists(out_dir / widen(m + ".dxil"), ec)) continue;
           std::lock_guard<std::mutex> g(lock);
+          if (!needs(m)) continue;
           if (!where.count(m)) unknown = true;
           if (!taken.count(m)) urgent.push_back(m);
         }
@@ -810,7 +897,7 @@ int serve(const fs::path& pack_dir, const fs::path& runtime_dir, const fs::path&
           if (const size_t added = add_runtime_files()) {
             std::lock_guard<std::mutex> g(lock);
             for (const std::string& m : fresh) {
-              if (where.count(m) && !taken.count(m) && !fs::exists(out_dir / widen(m + ".dxil"), ec)) urgent.push_back(m);
+              if (where.count(m) && !taken.count(m) && needs(m)) urgent.push_back(m);
             }
             say("serve: %zu new stream containers mapped\n", added);
           }
@@ -863,6 +950,9 @@ int serve(const fs::path& pack_dir, const fs::path& runtime_dir, const fs::path&
       fs::copy_file(stored, out_dir / widen(marker + ".dxil"), fs::copy_options::overwrite_existing, ec);
       std::ofstream(out_dir / widen(marker + ".src")) << key;
       ++reused;
+      std::lock_guard<std::mutex> g(lock);
+      guarded.insert(marker);
+      guarded_out << marker << '\n' << std::flush;
       return;
     }
     const auto c0 = std::chrono::steady_clock::now();
@@ -899,6 +989,8 @@ int serve(const fs::path& pack_dir, const fs::path& runtime_dir, const fs::path&
     std::ofstream(out_dir / widen(marker + ".src")) << key;
     ++compiled;
     std::lock_guard<std::mutex> g(lock);
+    guarded.insert(marker);
+    guarded_out << marker << '\n' << std::flush;
     say("  %s%s %s, %zu KiB of HLSL, %.1f s (%zu compiled, %zu reused)\n", waited ? "waited for: " : "",
                 shader::hw_stage_name(at.stage), marker.c_str(), t.hlsl.size() >> 10, took, compiled.load(), reused.load());
     std::fflush(stdout);
@@ -928,6 +1020,11 @@ int serve(const fs::path& pack_dir, const fs::path& runtime_dir, const fs::path&
             bulk.pop_back();
             if (taken.insert(m).second) marker = m;
           }
+          while (marker.empty() && !upgrades.empty()) {
+            std::string m = upgrades.back();
+            upgrades.pop_back();
+            if (taken.insert(m).second) marker = m;
+          }
           if (!marker.empty()) {
             ++busy;
             idle_told = false;
@@ -947,7 +1044,12 @@ int serve(const fs::path& pack_dir, const fs::path& runtime_dir, const fs::path&
           Sleep(200);
           continue;
         }
-        if (!fs::exists(out_dir / widen(marker + ".dxil"), ec) && !compiled_elsewhere(marker)) {
+        bool wanted_compile = false;
+        {
+          std::lock_guard<std::mutex> g(lock);
+          wanted_compile = needs(marker);
+        }
+        if (wanted_compile && !compiled_elsewhere(marker)) {
           std::ofstream(compiling_dir / widen(marker)) << GetCurrentProcessId();
           compile_one(marker, waited);
           std::error_code rm;

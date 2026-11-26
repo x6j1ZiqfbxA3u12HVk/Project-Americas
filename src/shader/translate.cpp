@@ -2149,7 +2149,10 @@ const std::unordered_map<std::string, Handler>& table() {
 }
 
 // The helpers every program gets, and the binding model's memory functions.
-const char* kHelpers = R"(
+const char* kHelpers = R"(// Runaway guards (see the structurer): passes of loops, and of the dispatcher, per thread.
+#define AM_SPIN_LIMIT 4194304u
+#define AM_DISPATCH_LIMIT 16777216u
+
 uint64_t am_u64(uint lo, uint hi) { return (uint64_t(hi) << 32) | lo; }
 // f32 to f16, rounded to nearest even as the console does: f32tof16 truncates on some GPUs
 // (seen on RDNA 4), so the next half up is taken when it is nearer (ties to the even one).
@@ -3000,7 +3003,10 @@ class Structurer {
     }
     std::sort(ys.begin(), ys.end(), [&](int a, int c) { return rpo_[a] > rpo_[c]; });
     if (header_[x]) {
-      line("[loop] for (;;) {");
+      // A runaway guard: a loop that wrong data keeps going (a linked list with a cycle) ends
+      // the program after AM_SPIN_LIMIT passes instead of hanging the GPU (a hang once took the
+      // whole display down).
+      line("[loop] for (;;) { if (++am_spins > AM_SPIN_LIMIT) return;");
       frames_.push_back({Kind::Loop, x});
       node_within(x, ys, 0);
       line("break;");
@@ -3269,12 +3275,13 @@ Translation finish_graphics(const TranslateInput& in, const Ctx& c, Translation 
   }
   h += "  { uint4 b = WaveActiveBallot(true); s[126] = b.x; s[127] = " + std::string(c.wave64 ? "b.y" : "0u") + "; }\n";
   const std::string merged = merge_lane_guards(body);
+  h += "  uint am_spins = 0u;\n";
   if (tr.structured) {
     if (uses_br) h += "  uint am_br = 0u;\n";
     h += merged;
     h += "}\n";
   } else {
-    h += "  uint pc = 0u;\n  [loop] for (;;) {\n    [forcecase] switch (pc) {\n";
+    h += "  uint pc = 0u;\n  [loop] for (;;) {\n    if (++am_spins > AM_DISPATCH_LIMIT) return;\n    [forcecase] switch (pc) {\n";
     h += merged;
     h += "    default:\n      return;\n    }\n  }\n}\n";
   }
@@ -3512,12 +3519,13 @@ Translation translate(const TranslateInput& in, Binding binding) {
     h += d;
   }
   body = merge_lane_guards(body);
+  h += "  uint am_spins = 0u;\n";
   if (tr.structured) {
     if (uses_br) h += "  uint am_br = 0u;\n";
     h += body;
     h += "}\n";
   } else {
-    h += "  uint pc = 0u;\n  [loop] for (;;) {\n    [forcecase] switch (pc) {\n";
+    h += "  uint pc = 0u;\n  [loop] for (;;) {\n    if (++am_spins > AM_DISPATCH_LIMIT) return;\n    [forcecase] switch (pc) {\n";
     h += body;
     h += "    default:\n      return;\n    }\n  }\n}\n";
   }

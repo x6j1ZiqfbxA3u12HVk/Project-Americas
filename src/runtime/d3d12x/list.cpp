@@ -530,7 +530,7 @@ ID3D12PipelineState* fill_pipeline() {
 void am_fill(uint3 id : SV_DispatchThreadID) {
   const uint64_t base = am_u64(am_user[0].x, am_user[0].y);
   const uint count = am_user[0].z, value = am_user[0].w;
-  for (uint i = id.x; i < count; i += 64u * 4096u) am_store(base + uint64_t(i) * 4u, value);
+  for (uint i = id.x, n = 0u; i < count && n < 1024u; i += 64u * 4096u, ++n) am_store(base + uint64_t(i) * 4u, value);
 }
 )";
     const host::CompileResult r = host::compile_hlsl(hlsl, "am_fill", "cs_6_6");
@@ -565,6 +565,16 @@ void clear_uav(HostList& h, ID3D12GraphicsCommandList* list, const Command& c, c
   const uint32_t stride = (v[1] >> 16) & 0x3FFFu;
   const uint64_t bytes = stride ? uint64_t{v[2]} * stride : v[2];
   if (!base || !bytes) return skip("an empty view");
+  // The range must lie in the cleared resource's memory, as our records have it (a misread
+  // descriptor once made a fill of billions of dwords, the GPU timed out and the display did
+  // not come back), and be of a sane size.
+  D3D12_RESOURCE_DESC rd{};
+  uint64_t raddress = 0;
+  if (!resource_memory(reinterpret_cast<const void*>(c.a[2]), &rd, &raddress) || rd.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) {
+    return skip("not a buffer resource of ours");
+  }
+  if (base < raddress || base + bytes > raddress + rd.Width) return skip("its view lies outside its resource");
+  if (bytes > (uint64_t{256} << 20)) return skip("over 256 MiB");
   uint32_t values[4] = {};
   if (c.data_size >= sizeof values && c.data_at + sizeof values <= r.data.size()) std::memcpy(values, r.data.data() + c.data_at, sizeof values);
   // The Float clear's value is a float's bits already (as the title passes them).
