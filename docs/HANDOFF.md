@@ -1455,3 +1455,32 @@ pressure (analysis in `C:\Project Americas\crash`, WinDbg's cdb in the WinDbg pa
   sizes), command list slots 85/86 (BVH build and copy) and 101, XG texture computer slot 9,
   "a shader used a texture we did not make" (all-zero T#s), the 2.1 GiB allocation at
   0xdc9600000 that cannot be opened for the GPU.
+
+## Batched fixes, and the loading loop at full speed (2026-11-26, near midnight)
+
+The user asked for fixes in batches with one test run each (runs take 10-20 minutes, because
+loading does). Work that way.
+
+* **Batch 1** (b43a52d): ray-tracing stand-in answers zero child pointers (the game's
+  traversals push children above 7, so 0xFFFFFFFF children were pushed forever); console
+  pipelines (slot 57) are made on two threads of their own (draws skip until made);
+  `image_gather4_l` (four SampleLevel reads at texel centres); a replacement shader service
+  starts at once (`dxil\rt5\compiling\<marker>` holds the compiling process id). Result: the
+  loading loop runs at about 27 fps (was 20 frames a minute) and the screen stays on the loading
+  background and spinner; later in the run, dispatches of three loop-free compute programs
+  (549c..., f714..., 3061...) ran for seconds and the device was lost (`0x887a0007`) again.
+* **Batch 2:** pixel inputs skip system values in the record and match two-attribute registers
+  by component mask (11 programs); a program refused by the same am-shaders build is not tried
+  again (failures.tsv's fourth column); GPU-visible allocations over 1 GiB are made of 1 GiB host
+  allocations (D3D12 would not open the 2.1 GiB one; vertex and index buffers in it were bound
+  null); dispatches over 2^20 groups are logged with their size and program, and ones over
+  D3D12's 65,535 a dimension skipped. A loop-free program running for seconds means a huge grid:
+  check those log lines first.
+* **Shader numbers (rt5):** 12,358 programs compiled; the game asked for 182 in the runs so far,
+  180 compiled (the two far-jump giants are not). Mesh (9,282) and geometry (195) programs are
+  not translated at all yet: needed once the game draws its world. Every translator version
+  bump recompiles all of rt<N> (2+ hours); avoid bumps for additions that do not change existing
+  output.
+* **Device slot 71** is not the prebuild query: it fills two descriptions (one with 0x20004 at
+  +0x30) and passes a descriptor handle ([r12+0x18]); its result is not read. Probably a view
+  creation (ray-tracing acceleration structure view?). Not implemented.
