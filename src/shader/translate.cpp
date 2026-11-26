@@ -989,6 +989,9 @@ const std::unordered_map<std::string, Handler>& table() {
     int_op(t, "v_alignbit_b32", "uint(am_u64(B, A) >> (C & 31u))");
     int_op(t, "v_alignbyte_b32", "uint(am_u64(B, A) >> ((C & 3u) * 8u))");
     int_op(t, "v_ffbh_u32", "(A == 0u ? 0xFFFFFFFFu : 31u - firstbithigh(A))");
+    // The first bit from the top that differs from the sign; none (0 or -1): all ones.
+    int_op(t, "v_ffbh_i32", "((asint(A) == 0 || asint(A) == -1) ? 0xFFFFFFFFu : 31u - firstbithigh(asint(A)))");
+    int_op(t, "v_xnor_b32", "(~(A ^ B))");
     int_op(t, "v_cvt_floor_i32_f32", "asuint(am_cvt_i32(floor(asfloat(A))))");
     int_op(t, "v_cvt_rpi_i32_f32", "asuint(am_cvt_i32(floor(asfloat(A) + 0.5f)))");
     // Cube maps: face id, the face's s and t, and twice the major axis.
@@ -1741,6 +1744,38 @@ const std::unordered_map<std::string, Handler>& table() {
       c.touch_v(c.f(Field::DATA0));
       c.line("if (AM_ACT) am_lds[(v[" + num(c.f(Field::ADDR)) + "] + " + num(c.f(Field::OFFSET0) | c.f(Field::OFFSET1) << 8) +
              "u) >> 2] = v[" + num(c.f(Field::DATA0)) + "];");
+      return true;
+    };
+    // 16 bits into their half of an LDS dword (atomically: lanes may write both halves of one).
+    t["ds_write_b16"] = [](Ctx& c) {
+      c.uses_lds = true;
+      c.touch_v(c.f(Field::ADDR));
+      c.touch_v(c.f(Field::DATA0));
+      c.line("if (AM_ACT) { uint a = v[" + num(c.f(Field::ADDR)) + "] + " + num(c.f(Field::OFFSET0) | c.f(Field::OFFSET1) << 8) +
+             "u; uint sh = (a & 2u) * 8u; uint o; InterlockedAnd(am_lds[a >> 2], ~(0xFFFFu << sh), o); "
+             "InterlockedOr(am_lds[a >> 2], (v[" + num(c.f(Field::DATA0)) + "] & 0xFFFFu) << sh, o); }");
+      return true;
+    };
+    // Compare and store: the dword becomes DATA1 where it equals DATA0; the value before returns.
+    t["ds_cmpst_rtn_b32"] = [](Ctx& c) {
+      c.uses_lds = true;
+      const uint32_t a = c.f(Field::ADDR), d0 = c.f(Field::DATA0), d1 = c.f(Field::DATA1);
+      c.touch_v(a);
+      c.touch_v(d0);
+      c.touch_v(d1);
+      c.line("if (AM_ACT) { uint o; InterlockedCompareExchange(am_lds[(v[" + num(a) + "] + " +
+             num(c.f(Field::OFFSET0) | c.f(Field::OFFSET1) << 8) + "u) >> 2], v[" + num(d0) + "], v[" + num(d1) + "], o); " +
+             c.vdst(c.f(Field::VDST)) + " = o; }");
+      return true;
+    };
+    // Backward permute: each lane reads DATA0 from the lane its address (in bytes) names.
+    t["ds_bpermute_b32"] = [](Ctx& c) {
+      const uint32_t a = c.f(Field::ADDR), d0 = c.f(Field::DATA0), off = c.f(Field::OFFSET0) | c.f(Field::OFFSET1) << 8;
+      c.touch_v(a);
+      c.touch_v(d0);
+      c.line("{ uint l = ((v[" + num(a) + "] + " + num(off) + "u) >> 2) & (WaveGetLaneCount() - 1u); uint x = WaveReadLaneAt(v[" +
+             num(d0) + "], l);");
+      c.line("  if (AM_ACT) " + c.vdst(c.f(Field::VDST)) + " = x; }");
       return true;
     };
     t["ds_write_b64"] = [](Ctx& c) {

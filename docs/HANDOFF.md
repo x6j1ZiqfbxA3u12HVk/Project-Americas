@@ -1318,3 +1318,11 @@ pressure (analysis in `C:\Project Americas\crash`, WinDbg's cdb in the WinDbg pa
   write of a value), a queue-level signal to memory, the raytracing calls (85/86, probes:
   nothing happens). Next: log the arguments of 131/132/142 and of the queue's slots for an
   address in that range; the right one writes `reference` there.
+* **Translator additions (night):** `v_swap_b32`, `v_xnor_b32`, `v_ffbh_i32`, `ds_write_b16`
+  (atomic half-dword), `ds_cmpst_rtn_b32`, `ds_bpermute_b32` - all from programs the title waits
+  for after loading (they were refused). Still refused there: indirect jumps (`s_setpc_b64`,
+  2 programs) and `image_bvh_intersect_ray` (raytracing). The GPU-wait watchdog still trips
+  (5 waits not met in the last run); one of those programs may be the counters' writer.
+  `am-shaders serve` restarted with them (`logs\serve9.txt`). DirectStorage: ~1,600 requests
+  fail with E_INVALIDARG, page destinations for `octa_imposters.ttpf` (64 KiB destinations):
+  `write_pages` refusing a page number; next to look at.
