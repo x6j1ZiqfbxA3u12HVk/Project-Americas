@@ -897,3 +897,19 @@ Then the larger pieces before the 3D world shows:
   * So c3b98c6 is probably not the cause; it made the UI streamer load more, which adds to
     the pressure. **Do not run the game while the precompile runs**, and bring c3b98c6 back
     when the user agrees.
+* **Update (03:40): the tiling answer was the trouble.** With XG slot 10 answered, the UI
+  streamer asks for 64 KiB tiles (BCPack and zlib requests with 64 KiB destinations) that we
+  refuse as corrupt; runs then lost the device (0x887a0007, a GPU hang), aborted in the host C
+  runtime (ucrtbase abort, 0xC0000409), and the PC bugchecked twice. Slot 10 is a probe again
+  (1d72dc7); the linkage geometry shader and rect-list streams are back (6ba904e) and a run
+  through the setup pages is clean. **Before answering slot 10 again:** decode the tile
+  requests (what layout a 64 KiB tile's stream holds, mode 10 textures) and keep the device
+  alive when a texture's data is refused.
+* **abort() is logged now**: crash.txt gets the escaped exception's message and the stack.
+* **Missing letters, probes so far:** the panel's row buffer (VS table + 32: stride 16,
+  144 records, OOB mode 0) covers every placement (n up to 23); the rows hold sane colours, a
+  mask mapping and 2x3 position transforms (same em-box height for every glyph). So the rows
+  are not it. Next: the vertex data per placement (do the vanished glyphs' vertices carry
+  alpha > 0, and what positions), dumped once from a panel draw.
+* **Memory rule (the user asked):** do not run the game while `am-shaders precompile` runs;
+  stop it (`Stop-Process -Name am-shaders`), run, restart it (it skips finished programs).
