@@ -652,6 +652,15 @@ uint64_t WINAPI record(CommandList* self, uint64_t a1, uint64_t a2, uint64_t a3,
   Command c;
   c.op = static_cast<uint16_t>(S);
   c.a[0] = a1, c.a[1] = a2, c.a[2] = a3, c.a[3] = a4, c.a[4] = a5, c.a[5] = a6, c.a[6] = a7;
+  if constexpr (S == 75 || S == 126 || S == 131 || S == 132 || S == 142) {
+    // Taken quietly; their first calls are logged (one may write a value the title waits for).
+    static std::atomic<int> told{0};
+    if (told.fetch_add(1, std::memory_order_relaxed) < 6) {
+      logf("d3d12x: list slot %d (%s): %llx %llx %llx %llx %llx %llx", S, "quiet", static_cast<unsigned long long>(a1),
+           static_cast<unsigned long long>(a2), static_cast<unsigned long long>(a3), static_cast<unsigned long long>(a4),
+           static_cast<unsigned long long>(a5), static_cast<unsigned long long>(a6));
+    }
+  }
   capture(self->rec, c);
   self->rec.commands.push_back(c);
   forward(self, self->rec.commands.back());

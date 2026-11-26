@@ -1503,6 +1503,20 @@ const std::unordered_map<std::string, Handler>& table() {
       c.line("if (AM_ACT) { uint x = " + c.src(c.f(Field::SRC0)) + "; v[min(" + num(d) + "u + s[124], am_nv - 1u)] = x; }");
       return true;
     };
+    // Swaps two VGPRs (VOP1: the destination and src0, which must be a VGPR).
+    t["v_swap_b32"] = [](Ctx& c) {
+      if (!vector_form(c)) return false;
+      const uint32_t sr = c.f(Field::SRC0), d = vop_dst(c);
+      if (sr < 256) return c.fail("v_swap_b32 of a scalar source");
+      c.touch_v(sr - 256);
+      c.touch_v(d);
+      c.line("{");
+      c.line("uint am_swap_a = " + c.src(sr) + ", am_swap_b = " + c.src(256 + d) + ";");
+      c.vwrite(d, "am_swap_a");
+      c.vwrite(sr - 256, "am_swap_b");
+      c.line("}");
+      return true;
+    };
     t["v_movrelsd_b32"] = [](Ctx& c) {
       if (!vector_form(c)) return false;
       c.uses_movrel = true;
