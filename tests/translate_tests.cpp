@@ -977,3 +977,16 @@ TEST_CASE(translate_pixel_shader_depth_export) {
   CHECK(cp.ok);
   if (!cp.ok) std::printf("    DXC: %s\n", cp.messages.substr(0, 1500).c_str());
 }
+
+// Half-precision compares: VOPC to VCC with an f16 inline constant, VOP3 to an SGPR pair.
+TEST_CASE(translate_f16_compares) {
+  const Result r = run({
+      0x7E02A100,              // v_cvt_f16_u16 v1, v0             (the lane, as a half)
+      0x7D9202F6,              // v_cmp_lt_f16 vcc, 4.0, v1         (lanes 5..63)
+      0xD4ED0004, 0x0201E901,  // v_cmp_neq_f16_e64 s[4:5], v1, 2.0 (all but lane 2)
+      0xBF810000,              // s_endpgm
+  });
+  if (!r.ran) return;
+  CHECK(r.s(106) == 0xFFFFFFE0u && r.s(107) == 0xFFFFFFFFu);
+  CHECK(r.s(4) == 0xFFFFFFFBu && r.s(5) == 0xFFFFFFFFu);
+}

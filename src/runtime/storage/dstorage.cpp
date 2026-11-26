@@ -314,9 +314,15 @@ HRESULT execute(const Request& r) {
     const bool full = res.status == formats::InflateStatus::OutputFull;
     if (full) {
       static std::atomic<int> told{0};
-      if (told.fetch_add(1) < 4) {
-        logf("dstorage: zlib stream longer than its destination (%u -> %zu bytes): what fits is kept", r.source_size,
-             t_out.size());
+      if (told.fetch_add(1) < 32) {
+        // How long the stream really is, to tell a short destination from a wrong source.
+        std::vector<uint8_t> whole(std::max<size_t>(t_out.size() * 64, size_t{16} << 20));
+        const auto all = formats::inflate_zlib(data, whole);
+        logf("dstorage: zlib stream longer than its destination (%u -> %zu bytes, whole stream %s %llu bytes): what fits is "
+             "kept; options 0x%s, %s offset 0x%llx, intermediate %u, %s",
+             r.source_size, t_out.size(), formats::inflate_status_name(all.status), static_cast<unsigned long long>(all.written),
+             hex(r.options).c_str(), (r.options & kMemorySource) ? "memory" : static_cast<const File*>(r.source)->name.c_str(),
+             static_cast<unsigned long long>(r.offset), r.intermediate_size, r.name ? r.name : "");
       }
     }
     if (res.status != formats::InflateStatus::Ok && !full) {

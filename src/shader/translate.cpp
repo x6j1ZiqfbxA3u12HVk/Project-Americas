@@ -722,13 +722,16 @@ void int_op(std::unordered_map<std::string, Handler>& t, const char* name, const
 
 // Compares: VOPC writes VCC (v_cmpx: EXEC), VOP3 the SGPR(s) in its VDST field.
 void compare(std::unordered_map<std::string, Handler>& t, const std::string& name, const std::string& cond, bool fl,
-             bool is64 = false) {
+             bool is64 = false, bool f16 = false) {
   for (const bool x : {false, true}) {
     const std::string full = (x ? "v_cmpx_" : "v_cmp_") + name;
-    t[full] = [cond, fl, x, is64](Ctx& c) {
+    t[full] = [cond, fl, x, is64, f16](Ctx& c) {
       if (!vector_form(c)) return false;
       std::string a, b;
-      if (is64) {
+      if (f16) {  // the low halves
+        a = fsrc16(c, 0);
+        b = fsrc16(c, 1);
+      } else if (is64) {
         a = c.src64(c.f(Field::SRC0));
         b = is_vop3(*c.in) ? c.src64(c.f(Field::SRC1)) : "am_u64(v[" + num(c.f(Field::VSRC1)) + "], v[" + num(c.f(Field::VSRC1) + 1) + "])";
       } else if (fl) {
@@ -867,6 +870,17 @@ const std::unordered_map<std::string, Handler>& table() {
     t["v_cvt_f16_f32"] = [](Ctx& c) {
       if (!form16(c)) return false;
       write16(c, f16_result(c, fsrc(c, 0)));
+      return true;
+    };
+    // 16-bit integers to halves.
+    t["v_cvt_f16_u16"] = [](Ctx& c) {
+      if (!form16(c)) return false;
+      write16(c, f16_result(c, "float(" + src16(c, 0) + ")"));
+      return true;
+    };
+    t["v_cvt_f16_i16"] = [](Ctx& c) {
+      if (!form16(c)) return false;
+      write16(c, f16_result(c, "float(asint(" + src16(c, 0) + " << 16u) >> 16)"));
       return true;
     };
     // Round toward zero: f32tof16 does that (on the GPUs tested); am_f16 rounds to nearest even.
@@ -1049,7 +1063,10 @@ const std::unordered_map<std::string, Handler>& table() {
                         {"o", "(A == A && B == B)"}, {"u", "(A != A || B != B)"}, {"nge", "!(A >= B)"},
                         {"nlg", "!(A < B || A > B)"}, {"ngt", "!(A > B)"}, {"nle", "!(A <= B)"}, {"neq", "!(A == B)"},
                         {"nlt", "!(A < B)"}, {"tru", "true"}};
-    for (const Cmp& x : fcmp) compare(t, std::string(x.name) + "_f32", x.cond, true);
+    for (const Cmp& x : fcmp) {
+      compare(t, std::string(x.name) + "_f32", x.cond, true);
+      compare(t, std::string(x.name) + "_f16", x.cond, true, false, true);
+    }
     const Cmp icmp[] = {{"f", "false"}, {"lt", "A < B"}, {"eq", "A == B"}, {"le", "A <= B"}, {"gt", "A > B"},
                         {"ne", "A != B"}, {"ge", "A >= B"}, {"t", "true"}};
     for (const Cmp& x : icmp) {
