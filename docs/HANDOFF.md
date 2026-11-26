@@ -1092,3 +1092,20 @@ pressure (analysis in `C:\Project Americas\crash`, WinDbg's cdb in the WinDbg pa
   sources are real stream starts and `page_offset + size` ends on a 32/64 KiB boundary,
   which fits packs storing the smallest mips first, so keeping the stream's prefix is right.
   `AMERICAS_SKIP_PAGE_WRITES=1` (diagnosis only) skips those writes.
+* **The commit hog, found and fixed (c44c25e):** thread stacks taken mid-growth (end a run
+  with `--timeout 20` and read `logs\hang.txt`) showed the AMD shader compiler
+  (`amdxc64.dll`) building compute pipelines from `make_host_compute`. The runtime made all
+  ~2,700 compute pipelines the title creates at boot, and the driver's compiler kept ~15 GB
+  in its own heap afterwards. Compute pipelines are now made when a dispatch first needs
+  one (`AMERICAS_EAGER_COMPUTE=1` for the old way): 10.2 GB private at the same point
+  instead of 25.5 GB. (`AMERICAS_NO_COMPUTE` only skips dispatches; pipelines were still
+  made.) Tools used: `AMERICAS_TRACE_MALLOC=1` traces the title's CRT heap by call stack
+  (small: the title's heap use is not the problem).
+* **Overnight chain:** `tools\overnight-chain.ps1` (started through WMI so it outlives the
+  session; pid in `tools\overnight-chain.pid`, progress in `logs\overnight-chain.txt`).
+  After the first rt5 precompile ends it runs `precompile` with the new translator (the
+  refused programs now translated: `logs\precompile16.txt`), then `precompile refresh`
+  (the rt4-seeded programs: `logs\precompile17.txt`), then shuts down with a 5-minute
+  warning. The new `am-shaders.exe` was built beside the running one (renamed
+  `am-shaders-pass1.exe`). The earlier watcher (pid 10216) had died: processes started
+  from a tool call are killed with it unless started through WMI.

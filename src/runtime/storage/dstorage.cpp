@@ -415,7 +415,12 @@ void worker() {
     for (std::vector<uint8_t>* v : {&t_source, &t_out, &t_blocks}) {
       if (v->capacity() > (64u << 20)) std::vector<uint8_t>().swap(*v);
     }
-    g_requests.fetch_add(1, std::memory_order_relaxed);
+    // Progress, for telling a slow load from a stalled one.
+    if (const uint64_t n = g_requests.fetch_add(1, std::memory_order_relaxed) + 1; n % 1000 == 0) {
+      logf("dstorage: %llu requests so far, %llu MiB, %llu failed (last %s)", static_cast<unsigned long long>(n),
+           static_cast<unsigned long long>(g_bytes.load() >> 20), static_cast<unsigned long long>(g_failures.load()),
+           (request.options & kMemorySource) ? "from memory" : static_cast<const File*>(request.source)->name.c_str());
+    }
     g_bytes.fetch_add(request.destination_size, std::memory_order_relaxed);
     if (FAILED(hr)) g_failures.fetch_add(1, std::memory_order_relaxed);
     lock.lock();
