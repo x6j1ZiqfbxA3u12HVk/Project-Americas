@@ -84,26 +84,6 @@ TEST_CASE(memory_translate_title_placeholders) {
   CHECK(translate(request(0, kMiB, MEM_RESERVE, 0x1021, PAGE_READWRITE)).unknown_flags == 0x1000);
 }
 
-// A GPU-visible allocation of 2 GiB or more is made of plain 1 GiB host allocations side by side
-// (each one the GPU can open), contiguous, writable throughout, and released whole.
-TEST_CASE(memory_large_gpu_allocation_in_pieces) {
-  TitleMemory memory({16 * kPage64K, 0});
-  const uint64_t size = 2048 * kMiB + 64 * kMiB;
-  void* a = memory.allocate(request(0, size, 0x20003000, 0x283, 0x2404));
-  CHECK(a != nullptr);
-  if (!a) return;
-  MEMORY_BASIC_INFORMATION first{}, second{};
-  VirtualQuery(a, &first, sizeof first);
-  VirtualQuery(static_cast<uint8_t*>(a) + (uint64_t{1} << 30), &second, sizeof second);
-  CHECK(first.AllocationBase == a && first.State == MEM_COMMIT && first.Type == MEM_PRIVATE);
-  CHECK(second.AllocationBase == static_cast<uint8_t*>(a) + (uint64_t{1} << 30) && second.State == MEM_COMMIT);
-  static_cast<volatile uint8_t*>(a)[(uint64_t{1} << 30) - 1] = 1;
-  static_cast<volatile uint8_t*>(a)[(uint64_t{1} << 30)] = 2;
-  static_cast<volatile uint8_t*>(a)[size - 1] = 3;
-  CHECK(memory.free(a, 0, MEM_RELEASE));
-  CHECK(state(a) == MEM_FREE && state(static_cast<uint8_t*>(a) + (uint64_t{1} << 30)) == MEM_FREE);
-}
-
 TEST_CASE(memory_physical_pages_alias_and_unmap) {
   TitleMemory memory({16 * kPage64K, 0});
   void* a = memory.allocate(request(0, kMiB, 0x20402000, 0x21, PAGE_READWRITE));

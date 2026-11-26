@@ -37,6 +37,7 @@
 #include "runtime/d3d12x/d3d12x.h"
 #include "runtime/d3d12x/gpu_memory.h"
 #include "runtime/d3d12x/host.h"
+#include "runtime/d3d12x/pipeline_cache.h"
 #include "runtime/hle/xmem.h"
 #include "runtime/d3d12x/root_signature.h"
 #include "runtime/d3d12x/object.h"
@@ -1335,6 +1336,8 @@ void frame_present() {
            format_bytes(pm.PrivateUsage).c_str(), format_bytes(pm.WorkingSetSize).c_str(), gpu_text.c_str(),
            host_memory_counts().c_str());
     }
+    save_pipeline_cache();  // what this run compiled, for the next one
+    logf("frame %llu: %s", static_cast<unsigned long long>(f.frame), pipeline_cache_counts().c_str());
     logf("frame %llu: compute pipelines %s; copies done %llu, not done %llu; UAV clears done %llu, not done %llu",
          static_cast<unsigned long long>(f.frame), compute_pipeline_counts().c_str(), static_cast<unsigned long long>(copies_done()),
          static_cast<unsigned long long>(copies_skipped()), static_cast<unsigned long long>(g_clears_done.load()),

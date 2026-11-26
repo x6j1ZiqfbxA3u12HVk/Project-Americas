@@ -38,6 +38,7 @@
 #include "runtime/d3d12x/host.h"
 #include "shader/container.h"
 #include "runtime/d3d12x/object.h"
+#include "runtime/d3d12x/pipeline_cache.h"
 #include "runtime/log.h"
 #include "runtime/present/host_gpu.h"
 #include "runtime/process.h"
@@ -335,7 +336,9 @@ void make_host_compute(PipelineState* p, present::HostGpu* gpu, bool large_lane)
     host.pRootSignature = translated_root_signature();
     host.CS = {code.data(), code.size()};
     const ULONGLONG start = GetTickCount64();
-    m->hr = host.pRootSignature ? gpu->device->CreateComputePipelineState(&host, IID_PPV_ARGS(&m->pso)) : E_FAIL;
+    ID3D12PipelineState* made = host.pRootSignature ? cached_compute_pipeline(host) : nullptr;  // from the library, or compiled
+    m->hr = made ? S_OK : E_FAIL;
+    m->pso.Attach(made);
     const ULONGLONG took = GetTickCount64() - start;
     ++(SUCCEEDED(m->hr) ? g_compute_made : g_compute_refused);
     static std::atomic<int> told{0};

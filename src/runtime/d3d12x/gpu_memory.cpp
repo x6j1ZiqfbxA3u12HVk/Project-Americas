@@ -12,6 +12,7 @@
 #include "core/text.h"
 #include "runtime/log.h"
 #include "runtime/memory/title_memory.h"
+#include "runtime/memory/write_watch.h"
 #include "runtime/present/host_gpu.h"
 
 namespace am::rt::d3d12x {
@@ -155,6 +156,11 @@ struct GpuMemory {
     Window w;
     w.base = base;
     w.size = size;
+    // D3D12 opens only an allocation whose pages are all read-write: one read-only page (the
+    // texture write watch leaves watched pages so) and it refuses the whole allocation (the
+    // title's 2.1 GiB allocation, full of textures, was refused so). Watched ranges in it are
+    // released first: reported written, their textures are uploaded again.
+    mem::release_for_host_write(reinterpret_cast<const void*>(base), size);
     if (FAILED(device->OpenExistingHeapFromAddress(reinterpret_cast<void*>(base), IID_PPV_ARGS(&w.heap)))) {
       uint64_t committed = 0;
       MEMORY_BASIC_INFORMATION m;

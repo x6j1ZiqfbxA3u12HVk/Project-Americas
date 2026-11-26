@@ -39,6 +39,7 @@ add_library(am_runtime STATIC
   d3d12x/list.cpp
   d3d12x/object.cpp
   d3d12x/pipeline.cpp
+  d3d12x/pipeline_cache.cpp
   d3d12x/present.cpp
   d3d12x/queue.cpp
   d3d12x/resource.cpp

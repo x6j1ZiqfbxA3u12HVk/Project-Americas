@@ -235,7 +235,10 @@ struct Bindings {
     uint64_t fence;
     const void* list;  // the list that reads it
     ComPtr<ID3D12Resource> resource;
+    uint64_t bytes = 0;  // its size (upload memory in flight)
   };
+  static constexpr uint64_t kUploadBudget = uint64_t{512} << 20;
+  uint64_t uploads_deferred = 0;
   std::vector<Retired> retired;
   // Textures dropped because the title's memory under them now holds another texture: their
   // resource and view slot go once the GPU is past a fence signalled 3 frames later (lists
@@ -425,7 +428,8 @@ struct Bindings {
     }
     std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
     list->ResourceBarrier(1, &b);
-    retired.push_back({kPending, recording, std::move(up)});
+    const uint64_t up_bytes = up->GetDesc().Width;
+    retired.push_back({kPending, recording, std::move(up), up_bytes});
   }
 
   // Textures whose memory changed since their upload are uploaded again. Live ones (new, or
@@ -564,8 +568,28 @@ struct Bindings {
     }
     u->fence = kPending;
     recording = u->list.Get();
+    // Upload memory (system memory, one buffer an upload) waiting for the GPU is bounded: past
+    // kUploadBudget the remaining textures stay dirty for a later submission. Unbounded, it
+    // reached gigabytes while the GPU was busy, and the process's commit with it.
+    uint64_t in_flight = 0;
+    for (const Retired& r : retired) in_flight += r.bytes;
+    size_t deferred = 0;
     for (Texture& t : textures) {
-      if (t.dirty && t.resource) upload_texture(u->list.Get(), t);
+      if (!t.dirty || !t.resource) continue;
+      if (in_flight >= kUploadBudget) {
+        ++deferred;
+        continue;
+      }
+      const size_t before = retired.size();
+      upload_texture(u->list.Get(), t);
+      for (size_t k = before; k < retired.size(); ++k) in_flight += retired[k].bytes;
+    }
+    if (deferred) {
+      ++uploads_deferred;
+      static std::atomic<int> told{0};
+      if (told.fetch_add(1, std::memory_order_relaxed) < 8) {
+        logf("bindings: %zu texture uploads wait for the GPU (%s of uploads in flight)", deferred, format_bytes(in_flight).c_str());
+      }
     }
     if (FAILED(u->list->Close())) return nullptr;
     return u->list.Get();
@@ -587,7 +611,7 @@ struct Bindings {
         ComPtr<ID3D12Resource> grown =
             buffer(bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
         if (!grown) return;  // the old table stays (and stays dirty): tried again at the next flush
-        if (table) retired.push_back({kPending, recording, table});
+        if (table) retired.push_back({kPending, recording, table, table->GetDesc().Width});
         table = std::move(grown);
         table_bytes = bytes;
       }
@@ -603,7 +627,8 @@ struct Bindings {
       list->CopyBufferRegion(table.Get(), 0, up.Get(), 0, bytes);
       std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
       list->ResourceBarrier(1, &b);
-      retired.push_back({kPending, recording, std::move(up)});
+      const uint64_t up_bytes = up->GetDesc().Width;
+      retired.push_back({kPending, recording, std::move(up), up_bytes});
       table_dirty = false;
       return;  // a fresh table has no misses to read
     }
@@ -898,11 +923,12 @@ void add_texture(Bindings* b, const D3D12_RESOURCE_DESC& resource, const D3D12_S
       return;
     }
   }
-  // Textures the new one's memory overlaps, unless they are the same memory (same address and
-  // size, another view of it): the title has put something else there, they are dropped.
+  // Textures the new one's memory overlaps, unless they start where it starts (the same
+  // texture viewed with another mip count or format: dropping those made them replace each other
+  // over and over): the title has put something else there, they are dropped.
   for (auto it = b->textures.begin(); it != b->textures.end();) {
     const bool overlaps = address < it->address + it->size && it->address < address + layout.size;
-    if (!overlaps || (it->address == address && it->size == layout.size)) {
+    if (!overlaps || it->address == address) {
       ++it;
       continue;
     }
@@ -1055,7 +1081,11 @@ std::string host_memory_counts() {
   std::string text;
   {
     std::lock_guard g(bindings().lock);
-    text = "textures alive " + std::to_string(bindings().textures.size()) + ", dropped " + std::to_string(bindings().evictions) + "; ";
+    uint64_t in_flight = 0;
+    for (const auto& r : bindings().retired) in_flight += r.bytes;
+    text = "textures alive " + std::to_string(bindings().textures.size()) + ", dropped " + std::to_string(bindings().evictions) +
+           " (" + std::to_string(bindings().evicted.size()) + " not yet released), uploads in flight " + format_bytes(in_flight) +
+           " (deferred " + std::to_string(bindings().uploads_deferred) + " times); ";
   }
   for (int k = 0; k < static_cast<int>(HostMemoryKind::Count); ++k) {
     text += (k ? ", " : "") + std::string(kNames[k]) + " " + std::to_string(g_host_count[k].load()) + " (" + format_bytes(g_host_bytes[k].load()) + ")";

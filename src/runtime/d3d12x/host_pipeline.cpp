@@ -18,6 +18,7 @@
 
 #include "runtime/d3d12x/gpu_memory.h"
 #include "runtime/d3d12x/host.h"
+#include "runtime/d3d12x/pipeline_cache.h"
 #include "runtime/log.h"
 #include "runtime/present/host_gpu.h"
 #include "runtime/process.h"
@@ -103,8 +104,9 @@ ID3D12PipelineState* make_host_graphics_pipeline(D3D12_GRAPHICS_PIPELINE_STATE_D
   ID3D12RootSignature* root = translated_graphics_root_signature();
   if (!gpu || !root) return nullptr;
   desc.pRootSignature = root;
-  ID3D12PipelineState* pso = nullptr;
-  const HRESULT hr = gpu->device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pso));
+  HRESULT hr = E_FAIL;
+  ID3D12PipelineState* pso = cached_graphics_pipeline(desc, &hr);  // from the library, or compiled
+  if (pso) hr = S_OK;
   static std::atomic<int> logged{0};
   if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
     logf("gpu: host pipeline for %s: %s (0x%08lx)", what, SUCCEEDED(hr) ? "made" : "refused", static_cast<unsigned long>(hr));
