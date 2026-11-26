@@ -911,5 +911,24 @@ Then the larger pieces before the 3D world shows:
   mask mapping and 2x3 position transforms (same em-box height for every glyph). So the rows
   are not it. Next: the vertex data per placement (do the vanished glyphs' vertices carry
   alpha > 0, and what positions), dumped once from a panel draw.
-* **Memory rule (the user asked):** do not run the game while `am-shaders precompile` runs;
-  stop it (`Stop-Process -Name am-shaders`), run, restart it (it skips finished programs).
+* Running the game while `am-shaders precompile` runs is fine (the user's call, see below).
+
+## The missing letters: fixed (2026-11-26, morning)
+
+* **Cause:** the UI draws small glyphs (anything no taller than the x-height, and punctuation)
+  from a CPU-rasterized A8 atlas (2048x2048 at 0xde2f60000, mode 0) with slot-57 pipeline
+  VS 03ff6febefaa9317 / PS 03ff910a25acddcd; larger glyphs are triangle meshes (VS
+  03fe0bb222c474c3 / PS 03ff45e826ecca2a). The small-glyph pipeline was refused (stage
+  signatures do not link) until the linkage geometry shader; that shader then paired stages by
+  semantic name, and the PS's colour input (named COLOR0) got the VS's never-written COLOR0
+  output instead of its second output (TEXCOORD1). **The hardware pairs by position**; the
+  geometry shader now does too (bf15cb8). The legal pages' body text is whole.
+* How it was found: rasterizing the mesh pipeline's own vertex data offline gave the same
+  missing letters, so they were never in that pipeline; the frame's full draw list (logged
+  per draw) showed the refused pipeline next to it.
+* **Small leftover:** a few letters near the panel's diagonal edge on the right have gaps
+  (e.g. "peopl", "sp... hip" on the Copyright page). Probably the panel's clip mask (the
+  3840x2160 A8 target at 0xdd7c90000) along that edge.
+* **Running alongside the precompile is fine** (the user's call): several runs with both today
+  were clean once XG slot 10 stayed a probe. To reach the legal pages, press Enter every 2 s
+  from 20 s (`AMERICAS_PRESS=A:20,A:22,...,A:90`).
