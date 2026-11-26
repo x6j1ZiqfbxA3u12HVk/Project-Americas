@@ -745,6 +745,29 @@ int serve(const fs::path& pack_dir, const fs::path& runtime_dir, const fs::path&
 
   std::deque<std::string> urgent;  // what the game waits for, oldest first
   std::set<std::string> taken;     // compiled, compiling, failed or unknown this session
+  // This build (its executable's size and time): a program it refused before is not tried
+  // again (failures.tsv's fourth column); a new build tries them all once more.
+  const std::string build = [] {
+    std::wstring self(32768, L'\0');
+    self.resize(GetModuleFileNameW(nullptr, self.data(), static_cast<DWORD>(self.size())));
+    WIN32_FILE_ATTRIBUTE_DATA a{};
+    if (!GetFileAttributesExW(self.c_str(), GetFileExInfoStandard, &a)) return std::string("unknown");
+    char text[48];
+    std::snprintf(text, sizeof text, "%llx-%llx", (static_cast<unsigned long long>(a.nFileSizeHigh) << 32) | a.nFileSizeLow,
+                  (static_cast<unsigned long long>(a.ftLastWriteTime.dwHighDateTime) << 32) | a.ftLastWriteTime.dwLowDateTime);
+    return std::string(text);
+  }();
+  {
+    size_t known = 0;
+    std::ifstream in(out_dir / L"failures.tsv");
+    for (std::string line; std::getline(in, line);) {
+      const size_t last = line.rfind('\t');
+      if (last == std::string::npos || line.compare(last + 1, std::string::npos, build) != 0) continue;
+      const std::string marker = line.substr(0, line.find('\t'));
+      if (taken.insert(marker).second) ++known;
+    }
+    if (known) say("serve: %zu programs this build refused before are not tried again (failures.tsv)\n", known);
+  }
   std::ofstream failures(out_dir / L"failures.tsv", std::ios::app);
   std::atomic<size_t> compiled{0}, reused{0}, refused{0};
   std::map<std::string, size_t> refusals;  // by reason (its first 60 characters)
@@ -817,7 +840,7 @@ int serve(const fs::path& pack_dir, const fs::path& runtime_dir, const fs::path&
         if (ch == '\n' || ch == '\t') ch = ' ';
       }
       std::lock_guard<std::mutex> g(lock);
-      failures << marker << '\t' << shader::hw_stage_name(at.stage) << '\t' << why << '\n';
+      failures << marker << '\t' << shader::hw_stage_name(at.stage) << '\t' << why << '\t' << build << '\n';
       failures.flush();
       ++refused;
       ++refusals[why.substr(0, 60)];
