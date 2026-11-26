@@ -1898,6 +1898,24 @@ const std::unordered_map<std::string, Handler>& table() {
       add("image_store", ImgOp{ImgKind::Store});
       add("image_get_resinfo", ImgOp{ImgKind::Info});
       add("image_get_lod", ImgOp{ImgKind::Lod});
+      // Ray tracing, a STAND-IN (the user's choice, 2026-11-26): every ray hits nothing. The BVH
+      // node layout the hardware reads is not known yet, so instead of a real intersection:
+      // box and instance nodes (node pointer type 4-7, the low 3 bits) return no children (all
+      // four pointers invalid, 0xFFFFFFFF), which ends a traversal at its root; triangle nodes
+      // return t = +inf over 1 with no hit (hit status / I, J 0). Raytraced effects show
+      // nothing until this is the real instruction (HANDOFF, "Raytracing").
+      const auto bvh = [](Ctx& c) {
+        const uint32_t vd = c.f(Field::VDATA), a = c.f(Field::VADDR);
+        c.touch_v(a);
+        c.touch_v(vd + 3);
+        c.line("// image_bvh_intersect_ray stand-in: no hit");
+        c.line("if (AM_ACT) { bool box = (v[" + num(a) + "] & 4u) != 0u; v[" + num(vd) + "] = box ? 0xFFFFFFFFu : 0x7F800000u; v[" +
+               num(vd + 1) + "] = box ? 0xFFFFFFFFu : 0x3F800000u; v[" + num(vd + 2) + "] = box ? 0xFFFFFFFFu : 0u; v[" + num(vd + 3) +
+               "] = box ? 0xFFFFFFFFu : 0u; }");
+        return true;
+      };
+      t["image_bvh_intersect_ray"] = bvh;
+      t["image_bvh64_intersect_ray"] = bvh;
       static const char* const kAtomics[] = {"swap", "cmpswap", "add", "sub", "smin", "umin", "smax", "umax", "and", "or", "xor"};
       for (uint32_t k = 0; k < 11; ++k) {
         o = ImgOp{ImgKind::Atomic};

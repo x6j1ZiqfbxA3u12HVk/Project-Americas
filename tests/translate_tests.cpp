@@ -1223,3 +1223,25 @@ TEST_CASE(translate_narrow_global_memory) {
   for (uint32_t k = 0; k < 32 && stored; ++k) stored = r.memory[0x40 + k] == ((0x8100u + 2 * k) | (0x8101u + 2 * k) << 16);
   CHECK(stored);
 }
+
+// The ray-tracing stand-in: a box node gives no children, a triangle node no hit (t = +inf).
+TEST_CASE(translate_bvh_intersect_stand_in) {
+  const Result r = run({
+      0x7E020285,              // v_mov_b32_e32 v1, 5                            (a box node)
+      0xF1989F01, 0x00000C01,  // image_bvh_intersect_ray v[12:15], v[1:11], s[0:3]
+      0xBF8C3F70,              // s_waitcnt vmcnt(0)
+      0x7E020280,              // v_mov_b32_e32 v1, 0                            (a triangle node)
+      0xF19C9F01, 0x00001001,  // image_bvh64_intersect_ray v[16:19], v[1:12], s[0:3]
+      0xBF8C3F70,              // s_waitcnt vmcnt(0)
+      0xBF810000,              // s_endpgm
+  });
+  if (!r.ran) return;
+  bool ok = true;
+  for (uint32_t l = 0; l < 64 && ok; ++l) {
+    ok = r.v(l, 12) == 0xFFFFFFFFu && r.v(l, 13) == 0xFFFFFFFFu && r.v(l, 14) == 0xFFFFFFFFu && r.v(l, 15) == 0xFFFFFFFFu &&
+         r.v(l, 16) == 0x7F800000u && r.v(l, 17) == 0x3F800000u && r.v(l, 18) == 0 && r.v(l, 19) == 0;
+    if (!ok) std::printf("    lane %u: %08x %08x %08x %08x / %08x %08x %08x %08x\n", l, r.v(l, 12), r.v(l, 13), r.v(l, 14), r.v(l, 15),
+                         r.v(l, 16), r.v(l, 17), r.v(l, 18), r.v(l, 19));
+  }
+  CHECK(ok);
+}

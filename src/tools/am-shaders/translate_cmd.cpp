@@ -783,6 +783,10 @@ int serve(const fs::path& pack_dir, const fs::path& runtime_dir, const fs::path&
     const shader::NativeBlob& b = shader->shader.blobs[at.blob];
     const shader::Translation t = shader::translate(input_of(shader->bytes, b, b.programs[at.program]), shader::Binding::Runtime);
     if (!t.ok) return fail(t.failure);
+    // The dispatcher form (one loop over a switch) of a large program keeps DXC busy for hours
+    // (two of about 80,000 instructions ran past 45 minutes at 3 GB each): refused until such
+    // programs get a better form, so they do not hold the large-compile slot.
+    if (!t.structured && t.hlsl.size() > (1u << 20)) return fail("dispatcher form over 1 MiB of HLSL (DXC takes hours)");
     const std::string key = source_key(t);
     const fs::path stored = by_source / widen(key + ".dxil");
     if (fs::exists(stored, ec)) {
