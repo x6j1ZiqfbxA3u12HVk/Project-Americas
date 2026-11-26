@@ -574,6 +574,8 @@ TEST_CASE(translate_images) {
           0x7E600280,                          // v_mov_b32 v48, 0
           0x7E620280,                          // v_mov_b32 v49, 0
           0xF0443108, 0x00102F30,              // image_atomic_add v47, v[48:49], s[64:71] dmask:0x1 dim:2D unorm glc
+          0x7E6E0280,                          // v_mov_b32 v55, 0
+          0xF110020A, 0x0182380B, 0x0000370C,  // image_gather4_l v[56:59], [v11, v12, v55], s[8:15], s[48:51] dmask:0x2 dim:2D
           0xBF8C3F70,                          // s_waitcnt vmcnt(0)
           0xBF810000,                          // s_endpgm
       },
@@ -617,6 +619,9 @@ TEST_CASE(translate_images) {
     // Gather of green at the centre of the 4x4: texels (1,2) (2,2) (2,1) (1,1).
     ok = ok && close_to(r.v(l, 42), unorm(32)) && close_to(r.v(l, 43), unorm(32)) && close_to(r.v(l, 44), unorm(16)) &&
          close_to(r.v(l, 45), unorm(16));
+    // Gather at level 0 (four SampleLevel reads at texel centres): the same four texels.
+    ok = ok && r.v(l, 56) == r.v(l, 42) && r.v(l, 57) == r.v(l, 43) && r.v(l, 58) == r.v(l, 44) && r.v(l, 59) == r.v(l, 45);
+    if (!ok) std::printf("    lane %u: gather4_l %08x %08x %08x %08x\n", l, r.v(l, 56), r.v(l, 57), r.v(l, 58), r.v(l, 59));
     if (!ok) {
       std::printf("    lane %u: resinfo %u %u %u %u gather %08x %08x %08x %08x\n", l, r.v(l, 37), r.v(l, 38), r.v(l, 39),
                   r.v(l, 40), r.v(l, 42), r.v(l, 43), r.v(l, 44), r.v(l, 45));
@@ -1224,7 +1229,7 @@ TEST_CASE(translate_narrow_global_memory) {
   CHECK(stored);
 }
 
-// The ray-tracing stand-in: a box node gives no children, a triangle node no hit (t = +inf).
+// The ray-tracing stand-in: a box node gives no children (zero pointers), a triangle node no hit (t = +inf).
 TEST_CASE(translate_bvh_intersect_stand_in) {
   const Result r = run({
       0x7E020285,              // v_mov_b32_e32 v1, 5                            (a box node)
@@ -1238,7 +1243,7 @@ TEST_CASE(translate_bvh_intersect_stand_in) {
   if (!r.ran) return;
   bool ok = true;
   for (uint32_t l = 0; l < 64 && ok; ++l) {
-    ok = r.v(l, 12) == 0xFFFFFFFFu && r.v(l, 13) == 0xFFFFFFFFu && r.v(l, 14) == 0xFFFFFFFFu && r.v(l, 15) == 0xFFFFFFFFu &&
+    ok = r.v(l, 12) == 0 && r.v(l, 13) == 0 && r.v(l, 14) == 0 && r.v(l, 15) == 0 &&
          r.v(l, 16) == 0x7F800000u && r.v(l, 17) == 0x3F800000u && r.v(l, 18) == 0 && r.v(l, 19) == 0;
     if (!ok) std::printf("    lane %u: %08x %08x %08x %08x / %08x %08x %08x %08x\n", l, r.v(l, 12), r.v(l, 13), r.v(l, 14), r.v(l, 15),
                          r.v(l, 16), r.v(l, 17), r.v(l, 18), r.v(l, 19));

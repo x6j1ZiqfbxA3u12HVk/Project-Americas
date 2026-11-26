@@ -71,6 +71,7 @@ struct ConsolePipeline {
   // (am-shaders serve compiles what draws wait for while the game runs).
   uint64_t retry_at = 0;
   std::map<std::vector<uint32_t>, Microsoft::WRL::ComPtr<ID3D12PipelineState>> made;
+  std::set<std::vector<uint32_t>> making;  // queued on the graphics pipeline maker
 };
 
 // A stream pipeline's host description, kept while its shaders are not all precompiled: draws
@@ -110,8 +111,9 @@ struct PipelineState : Object {
   }
 };
 
-ID3D12PipelineState* console_host_pipeline(ConsolePipeline& c, const DXGI_FORMAT* targets, uint32_t count, DXGI_FORMAT depth,
-                                           bool rect_list);
+struct PipelineState;
+ID3D12PipelineState* console_host_pipeline(PipelineState* owner, ConsolePipeline& c, const DXGI_FORMAT* targets, uint32_t count,
+                                           DXGI_FORMAT depth, bool rect_list);
 
 const Kind& pipeline_kind() {
   static const Kind k("pipeline state", 16, {});
@@ -475,7 +477,7 @@ ID3D12PipelineState* host_pipeline(const void* object, const void** root_signatu
     return p->host.Get();
   }
   if (p->host) return p->host.Get();
-  return p->console ? console_host_pipeline(*p->console, targets, target_count, depth, rect_list) : nullptr;
+  return p->console ? console_host_pipeline(p, *p->console, targets, target_count, depth, rect_list) : nullptr;
 }
 
 const std::vector<UserSlot>* compute_user_layout(const void* object) {
@@ -992,8 +994,16 @@ std::vector<uint8_t> geometry_shader(const std::vector<uint8_t>& vs, const std::
 // A slot 57 pipeline's host pipeline for these render-target formats: its precompiled vertex and
 // pixel programs, its input layout and blend; no culling and no depth until their registers are
 // read.
-ID3D12PipelineState* console_host_pipeline(ConsolePipeline& c, const DXGI_FORMAT* targets, uint32_t count, DXGI_FORMAT depth,
-                                           bool rect_list) {
+// Graphics pipelines are made on threads of their own: the driver compiles each new one (often
+// seconds), and made inside a draw that stalled the title's recording threads past its watchdog.
+// A draw whose pipeline is still being made is skipped.
+PipelineMaker& graphics_pipeline_maker() {
+  static PipelineMaker* const m = new PipelineMaker(2);
+  return *m;
+}
+
+ID3D12PipelineState* console_host_pipeline(PipelineState* owner, ConsolePipeline& c, const DXGI_FORMAT* targets, uint32_t count,
+                                           DXGI_FORMAT depth, bool rect_list) {
   std::lock_guard g(c.lock);
   if (c.failed) return nullptr;
   if (c.retry_at && GetTickCount64() < c.retry_at) return nullptr;
@@ -1001,6 +1011,7 @@ ID3D12PipelineState* console_host_pipeline(ConsolePipeline& c, const DXGI_FORMAT
   key.push_back(rect_list);
   key.push_back(depth);  // last: the depth view's format (the pipeline must match the bound views)
   if (auto it = c.made.find(key); it != c.made.end()) return it->second.Get();
+  if (c.making.count(key)) return nullptr;
   std::vector<uint8_t> vs, ps;
   for (const std::string& m : c.markers) {
     std::vector<uint8_t> code;
@@ -1066,13 +1077,41 @@ ID3D12PipelineState* console_host_pipeline(ConsolePipeline& c, const DXGI_FORMAT
   }
   if (!gs.empty()) d.GS = {gs.data(), gs.size()};
   d.DSVFormat = depth;  // depth testing stays off until the depth registers are read
-  std::vector<D3D12_INPUT_ELEMENT_DESC> elements = c.elements;
-  for (size_t k = 0; k < elements.size(); ++k) elements[k].SemanticName = c.names[k].c_str();
-  d.InputLayout = {elements.empty() ? nullptr : elements.data(), static_cast<UINT>(elements.size())};
-  Microsoft::WRL::ComPtr<ID3D12PipelineState> pso;
-  pso.Attach(make_host_graphics_pipeline(d, "a console pipeline (slot 57)"));
-  c.made[key] = pso;
-  return pso.Get();
+  // Everything the description points to, kept with the job.
+  struct Job {
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC d{};
+    std::vector<uint8_t> vs, ps, gs;
+    std::vector<D3D12_INPUT_ELEMENT_DESC> elements;
+    std::vector<std::string> names;
+    std::vector<uint32_t> key;
+  };
+  auto job = std::make_shared<Job>();
+  job->vs = std::move(vs);
+  job->ps = std::move(ps);
+  job->gs = gs;
+  job->names = c.names;
+  job->elements = c.elements;
+  job->key = key;
+  for (size_t k = 0; k < job->elements.size(); ++k) job->elements[k].SemanticName = job->names[k].c_str();
+  job->d = d;
+  job->d.VS = {job->vs.data(), job->vs.size()};
+  job->d.PS = job->ps.empty() ? D3D12_SHADER_BYTECODE{} : D3D12_SHADER_BYTECODE{job->ps.data(), job->ps.size()};
+  job->d.GS = job->gs.empty() ? D3D12_SHADER_BYTECODE{} : D3D12_SHADER_BYTECODE{job->gs.data(), job->gs.size()};
+  job->d.InputLayout = {job->elements.empty() ? nullptr : job->elements.data(), static_cast<UINT>(job->elements.size())};
+  c.making.insert(key);
+  add_ref(owner);  // kept alive until its pipeline is made
+  ConsolePipeline* cp = &c;
+  graphics_pipeline_maker().add([owner, cp, job] {
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> pso;
+    pso.Attach(make_host_graphics_pipeline(job->d, "a console pipeline (slot 57)"));
+    {
+      std::lock_guard g(cp->lock);
+      cp->made[job->key] = pso;
+      cp->making.erase(job->key);
+    }
+    release(owner);
+  });
+  return nullptr;
 }
 
 // Slot 57's description: the root signature, then (address, size) pairs: blocks of metadata in

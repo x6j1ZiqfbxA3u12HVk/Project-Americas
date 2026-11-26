@@ -622,21 +622,42 @@ int serve(const fs::path& pack_dir, const fs::path& runtime_dir, const fs::path&
   HANDLE stop = CreateEventW(nullptr, TRUE, FALSE, shader::kServiceStopEvent);
   HANDLE instance = CreateMutexW(nullptr, TRUE, shader::kServiceMutex);
   if (!instance) return 1;
+  // Whether this service holds the mutex (and so answers the stop event) yet.
+  std::atomic<bool> owner{true};
   if (GetLastError() == ERROR_ALREADY_EXISTS) {
     // A replacement (the stop event is set: the running one finishes its compiles, then ends)
-    // waits its turn; otherwise one is running already.
+    // starts work at once, skipping what the old one is compiling (compiling\<marker>), and
+    // takes the mutex when the old one ends; otherwise one is running already.
     if (!stop || WaitForSingleObject(stop, 0) != WAIT_OBJECT_0) {
       say("serve: another am-shaders serve is running; this one ends\n");
       return 1;
     }
-    record_self();  // the build that takes over: a run meanwhile starts no third one
-    say("serve: the running service finishes its compiles first\n");
-    std::fflush(stdout);
-    const DWORD w = WaitForSingleObject(instance, INFINITE);
-    if (w != WAIT_OBJECT_0 && w != WAIT_ABANDONED) return 1;
+    owner = false;
+    say("serve: the service it replaces finishes its compiles meanwhile\n");
+    std::thread([&owner, instance, stop] {
+      const DWORD w = WaitForSingleObject(instance, INFINITE);
+      if (w == WAIT_OBJECT_0 || w == WAIT_ABANDONED) {
+        ResetEvent(stop);
+        owner = true;
+      }
+    }).detach();
+  } else if (stop) {
+    ResetEvent(stop);
   }
-  if (stop) ResetEvent(stop);
-  record_self();
+  record_self();  // the build that runs: a run meanwhile starts no third one
+  // Programs being compiled, by any service: compiling\<marker> holds the process id.
+  const fs::path compiling_dir = out_dir / L"compiling";
+  fs::create_directories(compiling_dir, ec);
+  const auto compiled_elsewhere = [&](const std::string& marker) {
+    std::ifstream in(compiling_dir / widen(marker));
+    DWORD pid = 0;
+    if (!(in >> pid) || pid == GetCurrentProcessId()) return false;
+    HANDLE h = OpenProcess(SYNCHRONIZE, FALSE, pid);
+    if (!h) return false;
+    const bool alive = WaitForSingleObject(h, 0) == WAIT_TIMEOUT;
+    CloseHandle(h);
+    return alive;
+  };
   const fs::path by_source = out_dir.parent_path() / L"by-source";
   fs::create_directories(by_source, ec);
   struct Location {
@@ -903,14 +924,22 @@ int serve(const fs::path& pack_dir, const fs::path& runtime_dir, const fs::path&
           Sleep(200);
           continue;
         }
-        if (!fs::exists(out_dir / widen(marker + ".dxil"), ec)) compile_one(marker, waited);
+        if (!fs::exists(out_dir / widen(marker + ".dxil"), ec) && !compiled_elsewhere(marker)) {
+          std::ofstream(compiling_dir / widen(marker)) << GetCurrentProcessId();
+          compile_one(marker, waited);
+          std::error_code rm;
+          fs::remove(compiling_dir / widen(marker), rm);
+        }
         std::lock_guard<std::mutex> g(lock);
         --busy;
       }
     }).detach();
   }
   // Until stopped (a newer build replaces this one): the compiles in flight finish (the largest
-  // take many minutes, and the replacement would start them over), nothing new starts.
+  // take many minutes, and the replacement would start them over), nothing new starts. A
+  // replacement answers the stop event only once it holds the mutex (the event is still set
+  // for the service it replaced until then).
+  while (!owner) Sleep(500);
   if (stop) WaitForSingleObject(stop, INFINITE);
   else Sleep(INFINITE);
   {

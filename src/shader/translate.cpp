@@ -547,8 +547,15 @@ bool image(Ctx& c, const ImgOp& op) {
         if (dim == 3) return c.fail(name + " (cube offset)");
         off = "int2(int(" + offset + " << 26) >> 26, int(" + offset + " << 18) >> 26)";
       }
-      if (dim == 3) c.line("  uint4 r = am_gather_cube(im, sm, am_cube_dir(" + fco + "), " + num(channels[0]) + "u);");
-      else c.line("  uint4 r = am_gather_2d(im, sm, " + fco + ", " + num(channels[0]) + "u, " + off + ");");
+      if (op.lod) {
+        // At a given level (D3D's Gather has none): am_gather_l_2d.
+        if (dim == 3) return c.fail(name + " (cube at a level)");
+        c.line("  uint4 r = am_gather_l_2d(im, sm, " + fco + ", " + fl(lod) + ", " + num(channels[0]) + "u, " + off + ");");
+      } else if (dim == 3) {
+        c.line("  uint4 r = am_gather_cube(im, sm, am_cube_dir(" + fco + "), " + num(channels[0]) + "u);");
+      } else {
+        c.line("  uint4 r = am_gather_2d(im, sm, " + fco + ", " + num(channels[0]) + "u, " + off + ");");
+      }
       write_results({0, 1, 2, 3}, false);
       break;
     }
@@ -1891,6 +1898,11 @@ const std::unordered_map<std::string, Handler>& table() {
       o.offset = true;
       add("image_gather4_o", o);
       add("image_gather4_lz_o", o);
+      o = ImgOp{ImgKind::Gather};
+      o.lod = true;
+      add("image_gather4_l", o);
+      o.offset = true;
+      add("image_gather4_l_o", o);
       add("image_load", ImgOp{ImgKind::Load});
       o = ImgOp{ImgKind::Load};
       o.lod = true;
@@ -1900,18 +1912,19 @@ const std::unordered_map<std::string, Handler>& table() {
       add("image_get_lod", ImgOp{ImgKind::Lod});
       // Ray tracing, a STAND-IN (the user's choice, 2026-11-26): every ray hits nothing. The BVH
       // node layout the hardware reads is not known yet, so instead of a real intersection:
-      // box and instance nodes (node pointer type 4-7, the low 3 bits) return no children (all
-      // four pointers invalid, 0xFFFFFFFF), which ends a traversal at its root; triangle nodes
-      // return t = +inf over 1 with no hit (hit status / I, J 0). Raytraced effects show
-      // nothing until this is the real instruction (HANDOFF, "Raytracing").
+      // box and instance nodes (node pointer type 4-7, the low 3 bits) return no children, as
+      // four zero pointers: the game's traversals push a child when its pointer is above 7
+      // (0xFFFFFFFF passed that test, and the traversal never ended: a GPU hang); one that tests
+      // against 0xFFFFFFFF instead visits node 0 once more, a triangle node, which misses.
+      // Triangle nodes return t = +inf over 1 with no hit (hit status / I, J 0). Raytraced
+      // effects show nothing until this is the real instruction (HANDOFF, "Raytracing").
       const auto bvh = [](Ctx& c) {
         const uint32_t vd = c.f(Field::VDATA), a = c.f(Field::VADDR);
         c.touch_v(a);
         c.touch_v(vd + 3);
         c.line("// image_bvh_intersect_ray stand-in: no hit");
-        c.line("if (AM_ACT) { bool box = (v[" + num(a) + "] & 4u) != 0u; v[" + num(vd) + "] = box ? 0xFFFFFFFFu : 0x7F800000u; v[" +
-               num(vd + 1) + "] = box ? 0xFFFFFFFFu : 0x3F800000u; v[" + num(vd + 2) + "] = box ? 0xFFFFFFFFu : 0u; v[" + num(vd + 3) +
-               "] = box ? 0xFFFFFFFFu : 0u; }");
+        c.line("if (AM_ACT) { bool box = (v[" + num(a) + "] & 4u) != 0u; v[" + num(vd) + "] = box ? 0u : 0x7F800000u; v[" + num(vd + 1) +
+               "] = box ? 0u : 0x3F800000u; v[" + num(vd + 2) + "] = 0u; v[" + num(vd + 3) + "] = 0u; }");
         return true;
       };
       t["image_bvh_intersect_ray"] = bvh;
@@ -2583,6 +2596,47 @@ uint4 am_gather_2d(AmImage im, AmSampler sm, float3 c, uint comp, int2 o) {
   SamplerState s = SamplerDescriptorHeap[sm.index];
   if (AM_ARR(im)) AM_CLASS_RET(Texture2DArray, im.srv, AM_GATHER(t, s, c, o))
   AM_CLASS_RET(Texture2D, im.srv, AM_GATHER(t, s, c.xy, o))
+}
+// Gather at a level (image_gather4_l): the 2x2 texels around c at level round(lod), in Gather's
+// order (-x+y, +x+y, +x-y, -x-y). Float images read each texel with SampleLevel at its centre
+// (exact under point and linear filtering, and the sampler's addressing applies); integer
+// images load it, clamped to the level.
+float am_pick(float4 v, uint comp) { return comp == 0u ? v.x : comp == 1u ? v.y : comp == 2u ? v.z : v.w; }
+uint am_pick_u(uint4 v, uint comp) { return comp == 0u ? v.x : comp == 1u ? v.y : comp == 2u ? v.z : v.w; }
+uint4 am_gather_l_2d(AmImage im, AmSampler sm, float3 c, float lod, uint comp, int2 o) {
+  if (!AM_SAMPLED(im, sm)) return AM_NONE;
+  SamplerState s = SamplerDescriptorHeap[sm.index];
+  const bool arr = AM_ARR(im);
+  uint w = 1u, h = 1u, e = 1u, n = 1u;
+  if (arr) AM_CLASS_DO(Texture2DArray, im.srv, t.GetDimensions(0, w, h, e, n))
+  else AM_CLASS_DO(Texture2D, im.srv, t.GetDimensions(0, w, h, n))
+  const uint L = min(uint(max(lod, 0.0f) + 0.5f), max(n, 1u) - 1u);
+  const float2 size = float2(max(w >> L, 1u), max(h >> L, 1u));
+  const float2 b = floor(c.xy * size - 0.5f) + float2(o);
+  const float2 q[4] = {b + float2(0.5f, 1.5f), b + float2(1.5f, 1.5f), b + float2(1.5f, 0.5f), b + float2(0.5f, 0.5f)};
+  const uint cl = im.flags & 3u;
+  uint4 r = AM_NONE;
+  [unroll] for (int k = 0; k < 4; ++k) {
+    if (cl == 0u) {
+      float4 v;
+      if (arr) { Texture2DArray<float4> t = ResourceDescriptorHeap[im.srv]; v = t.SampleLevel(s, float3(q[k] / size, c.z), float(L)); }
+      else { Texture2D<float4> t = ResourceDescriptorHeap[im.srv]; v = t.SampleLevel(s, q[k] / size, float(L)); }
+      r[k] = asuint(am_pick(v, comp));
+    } else {
+      const int2 at = clamp(int2(floor(q[k])), int2(0, 0), int2(size) - 1);
+      const int slice = int(round(c.z));
+      uint4 u;
+      if (cl == 1u) {
+        if (arr) { Texture2DArray<uint4> t = ResourceDescriptorHeap[im.srv]; u = t.Load(int4(at, slice, int(L))); }
+        else { Texture2D<uint4> t = ResourceDescriptorHeap[im.srv]; u = t.Load(int3(at, int(L))); }
+      } else {
+        if (arr) { Texture2DArray<int4> t = ResourceDescriptorHeap[im.srv]; u = asuint(t.Load(int4(at, slice, int(L)))); }
+        else { Texture2D<int4> t = ResourceDescriptorHeap[im.srv]; u = asuint(t.Load(int3(at, int(L)))); }
+      }
+      r[k] = am_pick_u(u, comp);
+    }
+  }
+  return r;
 }
 uint4 am_gather_cube(AmImage im, AmSampler sm, float4 c, uint comp) {
   if (!AM_SAMPLED(im, sm)) return AM_NONE;
