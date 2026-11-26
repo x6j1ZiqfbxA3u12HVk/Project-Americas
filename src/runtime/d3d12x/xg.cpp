@@ -7,9 +7,8 @@
 // Both describe textures by D3D12's resource description. The computer has no IUnknown: slot 0
 // is AddRef and slot 1 Release. Slot 2 fills the texture's layout (size, planes, each mip's
 // offset, size and pitch). The game calls slot 8 with (texture memory, plane, subresource,
-// linear data, row pitch, slice pitch): the copy of linear data into the texture's layout, and
-// slot 10 for its 64 KiB tiles (GetResourceTiling). Its other slots are probes until the
-// game's calls show them. Every answer comes from layout.h, the
+// linear data, row pitch, slice pitch): the copy of linear data into the texture's layout. Its
+// other slots are probes until the game's calls show them. Every answer comes from layout.h, the
 // model GetResourceAllocationInfo uses.
 
 #include <windows.h>
@@ -130,71 +129,6 @@ HRESULT WINAPI copy_into_subresource(TextureComputer* self, void* memory, UINT p
   return S_OK;
 }
 
-// Slot 10: GetResourceTiling(&tiles, &packed mips, &tile shape, &tiling count, first tiling,
-// tilings), D3D12's without the resource (the UI texture streamer maps a texture's 64 KiB
-// tiles from it). Over our layout: the standard 64 KiB tile shapes by element size; a mip is
-// a standard one while it covers a whole tile in both directions, the rest are packed into
-// the tiles from the first of them on. Each tile starts at its mip's offset in 64 KiB steps.
-HRESULT WINAPI get_resource_tiling(TextureComputer* self, UINT* tiles, D3D12_PACKED_MIP_INFO* packed, D3D12_TILE_SHAPE* shape,
-                                   UINT* count, UINT first, D3D12_SUBRESOURCE_TILING* tilings) {
-  constexpr uint64_t kTile = 64 << 10;
-  const TextureLayout& l = self->layout;
-  const D3D12_RESOURCE_DESC& d = self->desc;
-  const bool three_d = d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
-  const uint32_t array = three_d ? 1 : std::max<uint32_t>(d.DepthOrArraySize, 1);
-  const uint32_t mips = std::min<uint32_t>(l.mips, static_cast<uint32_t>(l.subresources.size()));
-  // 64 KiB of elements: 256x256 of 1 byte down to 64x64 of 16; in texels for block formats.
-  uint32_t w = 64, h = 64;
-  switch (l.element_bytes) {
-    case 1: w = 256, h = 256; break;
-    case 2: w = 256, h = 128; break;
-    case 4: w = 128, h = 128; break;
-    case 8: w = 128, h = 64; break;
-    default: break;
-  }
-  const uint32_t block = std::max<uint32_t>(l.element_texels, 1);
-  w *= block, h *= block;
-  uint32_t standard = 0;
-  while (standard < mips && std::max<uint32_t>(static_cast<uint32_t>(d.Width >> standard), 1) >= w &&
-         std::max<uint32_t>(d.Height >> standard, 1) >= h) {
-    ++standard;
-  }
-  const uint64_t slice_bytes = l.size / array;
-  const uint64_t packed_at = standard < mips ? l.subresources[standard].offset : slice_bytes;
-  if (tiles) *tiles = static_cast<UINT>((l.size + kTile - 1) / kTile);
-  if (packed) {
-    packed->NumStandardMips = static_cast<UINT8>(standard);
-    packed->NumPackedMips = static_cast<UINT8>(mips - standard);
-    packed->NumTilesForPackedMips = standard < mips ? static_cast<UINT>((slice_bytes - packed_at + kTile - 1) / kTile) : 0;
-    packed->StartTileIndexInOverallResource = standard < mips ? static_cast<UINT>(packed_at / kTile) : 0;
-  }
-  if (shape) *shape = {w, h, 1};
-  if (count) {
-    const uint32_t subresources = mips * array, wanted = *count;
-    uint32_t n = 0;
-    for (uint32_t k = first; k < subresources && n < wanted && tilings; ++k, ++n) {
-      const uint32_t mip = k % mips, slice = k / mips;
-      D3D12_SUBRESOURCE_TILING& t = tilings[n];
-      if (mip >= standard) {
-        t = {0, 0, 0, D3D12_PACKED_TILE};
-        continue;
-      }
-      t.WidthInTiles = (std::max<uint32_t>(static_cast<uint32_t>(d.Width >> mip), 1) + w - 1) / w;
-      t.HeightInTiles = static_cast<UINT16>((std::max<uint32_t>(d.Height >> mip, 1) + h - 1) / h);
-      t.DepthInTiles = 1;
-      t.StartTileIndexInOverallResource = static_cast<UINT>((slice * slice_bytes + l.subresources[mip].offset) / kTile);
-    }
-    *count = n;
-  }
-  static std::atomic<int> logged{0};
-  if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
-    log_desc("GetResourceTiling", d, l.swizzle_mode);
-    logf("xg: %u tiles of %ux%u, %u standard mips, packed from tile %llu", tiles ? *tiles : 0, w, h, standard,
-         static_cast<unsigned long long>(packed_at / kTile));
-  }
-  return S_OK;
-}
-
 const Kind& computer_kind() {
   static const Kind k("XG texture computer", 32,
                       {
@@ -202,7 +136,6 @@ const Kind& computer_kind() {
                           {1, "Release", reinterpret_cast<void*>(&release)},
                           {2, "GetResourceLayout", reinterpret_cast<void*>(&get_resource_layout)},
                           {8, "CopyIntoSubresource", reinterpret_cast<void*>(&copy_into_subresource)},
-                          {10, "GetResourceTiling", reinterpret_cast<void*>(&get_resource_tiling)},
                       });
   return k;
 }
