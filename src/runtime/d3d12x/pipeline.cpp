@@ -98,6 +98,7 @@ struct PipelineState : Object {
   std::vector<UserSlot> compute_layout;  // where its root parameters go (user-data dwords)
   std::atomic<bool> compute_tried{false};  // a job has run (made or refused)
   std::atomic<bool> compute_done{false};   // that job has finished: made, refused or not precompiled
+  std::atomic<uint64_t> compute_wait_since{0};  // the first dispatch that waited for it (its tick)
   std::atomic<uint64_t> compute_missing_at{0};  // its program was not precompiled at this tick
   std::atomic<bool> compute_urgent{false};  // a dispatch waited: moved to the front once
   uint32_t console_programs = 0;  // slot 57: GPU programs given by address
@@ -287,7 +288,8 @@ PipelineMaker& pipeline_maker() {
 // over one (a 1.4 MB program held both workers, and every pipeline after it, for good).
 constexpr size_t kLargeDxil = 256 << 10;
 PipelineMaker& large_pipeline_maker() {
-  static PipelineMaker* const m = new PipelineMaker(1);
+  // Two lanes (one on small hosts): one large program no longer holds up every one after it.
+  static PipelineMaker* const m = new PipelineMaker(std::thread::hardware_concurrency() >= 8 ? 2 : 1);
   return *m;
 }
 
@@ -512,9 +514,14 @@ ID3D12PipelineState* host_compute_pipeline_waiting(const void* object, const voi
   auto* p = static_cast<PipelineState*>(o);
   if (!p->compute) return nullptr;
   const ULONGLONG start = GetTickCount64();
-  // Queued (urgently, by host_compute_pipeline) or being made: wait for the job to finish.
-  while (!(host = p->host_compute.load(std::memory_order_acquire)) && !p->compute_done.load() &&
-         GetTickCount64() < start + max_ms) {
+  // Queued (urgently, by host_compute_pipeline) or being made: wait for the job to finish, at
+  // most `max_ms` from the first dispatch that waited for this pipeline. Dispatches are made
+  // while the title records its lists, on its own threads: a longer stall stops its main loop,
+  // and its watchdog ends the run after 30 s without progress.
+  uint64_t since = 0;
+  p->compute_wait_since.compare_exchange_strong(since, start);
+  const uint64_t until = (since ? since : start) + max_ms;
+  while (!(host = p->host_compute.load(std::memory_order_acquire)) && !p->compute_done.load() && GetTickCount64() < until) {
     Sleep(2);
   }
   const ULONGLONG took = GetTickCount64() - start;

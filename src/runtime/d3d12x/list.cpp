@@ -380,7 +380,13 @@ void dispatch(HostList& h, ID3D12GraphicsCommandList* list, const Command& c) {
     return;
   }
   const void* rs_object = nullptr;
-  ID3D12PipelineState* pso = host_compute_pipeline_waiting(h.pipeline, &rs_object, 120000);
+  // AMERICAS_PIPELINE_WAIT_MS: how long dispatches of one pipeline wait for it in all (5 s).
+  static const uint32_t wait_ms = [] {
+    char text[16] = {};
+    return GetEnvironmentVariableA("AMERICAS_PIPELINE_WAIT_MS", text, sizeof text) ? static_cast<uint32_t>(std::strtoul(text, nullptr, 10))
+                                                                                     : 5000u;
+  }();
+  ID3D12PipelineState* pso = host_compute_pipeline_waiting(h.pipeline, &rs_object, wait_ms);
   const RootSignatureDesc* rs = root_signature_desc(h.compute_root_signature ? h.compute_root_signature : rs_object);
   if (!pso || !rs) {
     ++g_dispatches_skipped;
