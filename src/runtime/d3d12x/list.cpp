@@ -14,6 +14,7 @@
 #include <wrl/client.h>
 
 #include <algorithm>
+#include <bit>
 #include <atomic>
 #include <condition_variable>
 #include <cstdlib>
@@ -30,6 +31,7 @@
 #include "runtime/d3d12x/d3d12x.h"
 #include "runtime/d3d12x/gpu_memory.h"
 #include "runtime/d3d12x/host.h"
+#include "runtime/hle/xmem.h"
 #include "runtime/d3d12x/root_signature.h"
 #include "runtime/d3d12x/object.h"
 #include "runtime/log.h"
@@ -101,12 +103,23 @@ struct HostList {
   D3D12_VIEWPORT viewport{};
 };
 
+// Space a list hands out for data its commands carry (slot 148): title memory from the graphics
+// allocator, which the GPU reads as it reads the rest of the title's memory. Chunks stay with the
+// list and are handed out again from the start when the list is reset.
+struct ListSpace {
+  std::vector<std::pair<uint8_t*, uint64_t>> chunks;
+  size_t chunk = 0;
+  uint64_t used = 0;
+  size_t space_count() const { return chunks.size(); }
+};
+
 struct CommandList : Object {
   uint8_t console[kConsoleFields - sizeof(void*)] = {};  // the console object's fields, as the title sees them
   uint32_t desc[4] = {};
   Object* allocator = nullptr;
   Recording rec;
   HostList host;
+  ListSpace space;
 };
 
 const Kind& list_kind();
@@ -663,7 +676,40 @@ HRESULT WINAPI list_close(CommandList* self) {
   return S_OK;
 }
 
+// Slot 148: space for `size` bytes at `alignment` that the list's commands use (the BVH builder
+// writes its build inputs there); nullptr when there is no memory (the caller then throws).
+void* WINAPI list_allocate_space(CommandList* self, uint64_t size, uint64_t alignment) {
+  constexpr uint64_t kChunk = 1u << 20;
+  alignment = std::max<uint64_t>(std::bit_ceil(std::max<uint64_t>(alignment, 16)), 16);
+  ListSpace& a = self->space;
+  for (;;) {
+    if (a.chunk < a.space_count()) {
+      auto [base, capacity] = a.chunks[a.chunk];
+      const uint64_t at = (a.used + alignment - 1) & ~(alignment - 1);
+      if (at + size <= capacity) {
+        a.used = at + size;
+        return base + at;
+      }
+      ++a.chunk;
+      a.used = 0;
+      continue;
+    }
+    const uint64_t capacity = std::max(kChunk, (size + alignment + 0xFFFF) & ~uint64_t{0xFFFF});
+    void* memory = hle::xmem_alloc(capacity, resource_attributes(capacity, 65536));
+    static std::atomic<int> told{0};
+    if (told.fetch_add(1) < 8) {
+      logf("d3d12x: command list space: %s more at 0x%s (asked %llu bytes, alignment %llu)", format_bytes(capacity).c_str(),
+           hex(reinterpret_cast<uint64_t>(memory)).c_str(), static_cast<unsigned long long>(size),
+           static_cast<unsigned long long>(alignment));
+    }
+    if (!memory) return nullptr;
+    a.chunks.emplace_back(static_cast<uint8_t*>(memory), capacity);
+  }
+}
+
 HRESULT WINAPI list_reset(CommandList* self, Object* allocator, Object* /*pipeline*/) {
+  self->space.chunk = 0;
+  self->space.used = 0;
   self->rec.commands.clear();
   self->rec.data.clear();
   self->rec.closed = false;
@@ -681,14 +727,22 @@ Method rec_method() {
   return {S, op_name(S), reinterpret_cast<void*>(&record<S>)};
 }
 
+// Slot 80: Dispatch(x, y, z, dispatch initiator flags), what the BVH builder calls when its
+// list has no room for the dispatch packet it would write itself. Recorded as a Dispatch.
+uint64_t WINAPI dispatch_with_initiator(CommandList* self, uint64_t x, uint64_t y, uint64_t z, uint64_t /*initiator*/) {
+  return record<kDispatch>(self, x & 0xFFFFFFFF, y & 0xFFFFFFFF, z & 0xFFFFFFFF, 0, 0, 0, 0);
+}
+
 std::vector<Method> list_methods() {
   std::vector<Method> m = {
       {kClose, "Close", reinterpret_cast<void*>(&list_close)},
       {kReset, "Reset", reinterpret_cast<void*>(&list_reset)},
       {kClearDepthStencilView, "ClearDepthStencilView", reinterpret_cast<void*>(&clear_depth_stencil)},
+      {148, "AllocateSpace", reinterpret_cast<void*>(&list_allocate_space)},
+      {80, "DispatchX", reinterpret_cast<void*>(&dispatch_with_initiator)},
       rec_method<12>(), rec_method<13>(), rec_method<14>(), rec_method<15>(), rec_method<16>(), rec_method<17>(),
       rec_method<18>(), rec_method<19>(), rec_method<20>(), rec_method<21>(), rec_method<22>(), rec_method<23>(),
-      rec_method<24>(), rec_method<25>(), rec_method<32>(), rec_method<33>(), rec_method<34>(), rec_method<35>(),
+      rec_method<24>(), rec_method<25>(), rec_method<26>(), rec_method<32>(), rec_method<33>(), rec_method<34>(), rec_method<35>(),
       rec_method<36>(), rec_method<37>(), rec_method<38>(), rec_method<39>(), rec_method<40>(), rec_method<41>(),
       rec_method<42>(), rec_method<43>(), rec_method<44>(), rec_method<45>(), rec_method<46>(), rec_method<47>(),
       rec_method<48>(), rec_method<49>(), rec_method<50>(), rec_method<52>(), rec_method<53>(), rec_method<54>(),
@@ -877,6 +931,7 @@ std::string describe_clear(const Recording& r, const Command& c) {
 const char* op_name(uint16_t op) {
   switch (op) {
     case kClose: return "Close";
+    case 26: return "ResourceBarrier";
     case kDrawInstanced: return "DrawInstanced";
     case kDrawIndexedInstanced: return "DrawIndexedInstanced";
     case kDispatch: return "Dispatch";

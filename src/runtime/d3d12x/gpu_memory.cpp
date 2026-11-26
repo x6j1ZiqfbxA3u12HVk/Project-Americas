@@ -155,7 +155,17 @@ struct GpuMemory {
     w.base = base;
     w.size = size;
     if (FAILED(device->OpenExistingHeapFromAddress(reinterpret_cast<void*>(base), IID_PPV_ARGS(&w.heap)))) {
-      logf("gpu memory: cannot open the allocation at 0x%s (%s) for the GPU", hex(base).c_str(), format_bytes(size).c_str());
+      uint64_t committed = 0;
+      MEMORY_BASIC_INFORMATION m;
+      for (uint64_t p = base; p < base + size && VirtualQuery(reinterpret_cast<void*>(p), &m, sizeof m) == sizeof m;
+           p = reinterpret_cast<uint64_t>(m.BaseAddress) + m.RegionSize) {
+        if (m.State == MEM_COMMIT) committed += m.RegionSize;
+      }
+      static std::atomic<int> told_open{0};
+      if (told_open.fetch_add(1, std::memory_order_relaxed) < 8) {
+        logf("gpu memory: cannot open the allocation at 0x%s (%s, %s of it committed) for the GPU", hex(base).c_str(),
+             format_bytes(size).c_str(), format_bytes(committed).c_str());
+      }
       return false;
     }
     D3D12_RESOURCE_DESC bd{D3D12_RESOURCE_DIMENSION_BUFFER, 0, size, 1, 1, 1, DXGI_FORMAT_UNKNOWN, {1, 0}, D3D12_TEXTURE_LAYOUT_ROW_MAJOR,

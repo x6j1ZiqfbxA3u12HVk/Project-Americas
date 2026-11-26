@@ -1273,3 +1273,26 @@ pressure (analysis in `C:\Project Americas\crash`, WinDbg's cdb in the WinDbg pa
   "gpu memory: cannot open the allocation at 0xdc9600000 (2.1 GiB) for the GPU", repeated.
   **Next:** implement those two slots (or find what the builder asks for), and the 2.1 GiB
   allocation's GPU view.
+
+## BVH building runs; the next stop is a GPU-wait watchdog (2026-11-26, night)
+
+* **Command list slot 148** is "allocate space in the list" (size, alignment) -> pointer;
+  XboxBvhBuilder throws E_FAIL on null (the crash before). Now a per-list arena of title memory
+  (graphics allocator chunks of 1 MiB), reset with the list.
+* **Slot 80** is Dispatch(x, y, z, initiator): the builder writes the dispatch packet itself
+  when its list has room, else calls 80 (our list keeps its buffer fields 0, so always 80).
+  Recorded as a Dispatch. **Slot 26** (ResourceBarrier) is taken quietly.
+* **DirectStorage: 0 failed requests** in the run after these (74,000 requests, 4.1 GB).
+* **Where it stops now:** the title's deliberate fatal (`+0x23cf683`, `mov [0], 0x4d8bd421`,
+  on a thread of its own) after lists waited for memory values that stayed 0 ("a list waits
+  for the value at 0xd8437ff78 (comparison 7, reference 3435, now 0): not met in 2 s, let
+  go", 8 times). Unimplemented calls seen in that run: command list 85 (from game+0x4f49be:
+  `ptr, 0, 0, 0, ptr`) and 86 (from game+0x4f4b52: `ptr, ptr, 0, 0x1600000000,
+  0x1001002100000119, ...`), device 71 (from game+0x511f267). One of them likely writes the
+  awaited values. The 2.1 GiB allocation at 0xdc9600000 is fully committed but
+  OpenExistingHeapFromAddress still refuses it (size limit? MEM_WRITE_WATCH?).
+* **Loading screen draws:** 5 a frame, none skipped (graphics "waiting for shaders 0"): two
+  full-screen passes, two 30-vertex indexed draws (the spinner), the final pass. No artwork
+  draw is issued at all; the title's loading-screen art may wait on the same stuck work.
+* **am-shaders died on the largest programs with a stack overflow (0xC00000FD)**, not memory:
+  DXC recurses deeply on 2 MB of HLSL. It now links with a 256 MiB stack reservation.
