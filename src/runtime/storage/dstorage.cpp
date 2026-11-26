@@ -367,6 +367,21 @@ HRESULT execute(const Request& r) {
     return S_OK;
   }
   if (!guarded_copy(r.destination, data.data(), data.size())) return E_INVALIDARG;
+  // AMERICAS_WATCH_ADDR=<hex> (diagnosis): requests whose destination covers that address are
+  // logged with their source and the 8 bytes they put there.
+  static const uint64_t watch = [] {
+    char text[32] = {};
+    return GetEnvironmentVariableA("AMERICAS_WATCH_ADDR", text, sizeof text) ? std::strtoull(text, nullptr, 16) : 0ull;
+  }();
+  if (const uint64_t at = reinterpret_cast<uint64_t>(r.destination); watch && watch >= at && watch < at + data.size()) {
+    uint64_t v = 0;
+    std::memcpy(&v, data.data() + (watch - at), std::min<size_t>(8, data.size() - (watch - at)));
+    logf("dstorage: watched 0x%llx written by a request: %s offset 0x%llx, %u -> %zu bytes at 0x%llx, options 0x%s: 0x%016llx",
+         static_cast<unsigned long long>(watch),
+         (r.options & kMemorySource) ? "memory" : static_cast<const File*>(r.source)->name.c_str(),
+         static_cast<unsigned long long>(r.offset), r.source_size, data.size(), static_cast<unsigned long long>(at),
+         hex(r.options).c_str(), static_cast<unsigned long long>(v));
+  }
   // Textures over these bytes are uploaded again. (Page destinations are not reported yet:
   // their pages' virtual addresses are not known here.)
   d3d12x::notify_title_write(reinterpret_cast<uint64_t>(r.destination), data.size());

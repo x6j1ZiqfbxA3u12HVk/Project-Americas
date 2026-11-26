@@ -1109,3 +1109,30 @@ pressure (analysis in `C:\Project Americas\crash`, WinDbg's cdb in the WinDbg pa
   warning. The new `am-shaders.exe` was built beside the running one (renamed
   `am-shaders-pass1.exe`). The earlier watcher (pid 10216) had died: processes started
   from a tool call are killed with it unless started through WMI.
+* **With memory fixed, loading still stops (the next task):** after Confirm, DirectStorage
+  serves ~25,000 requests (1.25 GB: shaders, audio, bvh4, data, packs, levels, anim,
+  story000, script) and then none at all, by about frame 4,500, while the dark loading
+  screen keeps drawing. Most runs then crash in the title's code; the crash differs:
+  * `+0x52ed0a7` (seen 3 times, same object every time): the caller (`+0x3aea37`) walks up
+    to 4 entries at `container+0x150` (count at `+0x170`); each entry `+0x20` is passed to
+    `+0x52ed040`, which reads 4 pointers at `+0x30`. Entry `0x5f17245c0` holds
+    `0x90b7d61d_00000004` there (another run: `0x6a6e6e7d_00694c4c`): a hash and a small
+    number, not a pointer. The object is inside a resource DirectStorage loaded intact
+    (`AMERICAS_WATCH_ADDR=5f1724610`: `story000.rpf` offset `0x356ad05c0`, zlib 1,168 ->
+    37,328 bytes at `0x5f1720000`, putting a 0 at that field). Something writes the
+    field afterwards: looks like an unresolved by-hash reference.
+  * `+0xf6349`: `object->vfunc[0x3f8](type hash 0x33f70dfaf2c50989, key 0x0f0c08ae)`
+    returns null, then the same with type `0x4eaa16dd829995bc` also returns null, and the
+    code assumes it cannot. A by-hash lookup of something never registered.
+  * Also seen once each: `+0x3768dc6` (a write through a field holding 2), `+0xf2cb40`.
+  * **Ruled out:** memory (fixed), page-destination texture writes
+    (`AMERICAS_SKIP_PAGE_WRITES=1` still crashes), refused file paths (`D:\decorations\*`
+    gets PATH_NOT_FOUND, which is right), DirectStorage failures (0 in every run).
+  * **Next:** catch the CPU write to `0x5f1724610` after the load (a hardware data
+    breakpoint, DR0-DR3 on every thread, or a guard page on that page with single-step
+    re-arm), and look at what the title does with those 37,328 bytes (decompress
+    `story000.rpf` at `0x356ad05c0` offline: what is at `+0x4610`?). Crash reports now name
+    the classes of objects registers point to (RTTI), when they are objects.
+* **Tonight's run recipe:** `AMERICAS_SCRIPT=@C:\Project Americas\scripts-run\to-stall.txt`
+  reaches Confirm and waits 90 s (about 6 minutes in all); `to-load-long.txt` waits ~8
+  minutes after it.
