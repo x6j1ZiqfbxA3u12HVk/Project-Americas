@@ -312,7 +312,8 @@ std::shared_ptr<MadeCompute> made_compute(const std::string& marker) {
 void make_host_compute(PipelineState* p, present::HostGpu* gpu, bool large_lane) {
   const std::string& marker = p->compute_marker;
   std::vector<uint8_t> code;
-  if (!load_precompiled(marker, code)) {  // a dispatch that waits for it lists it for the precompile
+  if (!load_precompiled(marker, code)) {
+    note_wanted(marker);  // for the shader service, before any dispatch waits for it
     ++g_compute_missing;
     p->compute_missing_at = GetTickCount64();
     release(p);

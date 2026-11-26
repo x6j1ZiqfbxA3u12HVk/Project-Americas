@@ -1169,3 +1169,22 @@ TEST_CASE(translate_backward_far_jumps) {
   for (int l = 0; l < 64 && ok; ++l) ok = r.v(l, 1) == 1 && r.v(l, 2) == 3;
   CHECK(ok);
 }
+
+// Packed math with an inline constant (both halves read it) and v_pack_b32_f16's op_sel and neg.
+TEST_CASE(translate_packed_constants_and_pack) {
+  const Result r = run({
+      0x7E0402FF, 0x42003E00,  // v_mov_b32_e32 v2, 0x42003e00                   (3.0, 1.5)
+      0xCC104001, 0x1A01E902,  // v_pk_mul_f16 v1, v2, 2.0
+      0x7E0602FF, 0x3C00BC00,  // v_mov_b32_e32 v3, 0x3c00bc00                   (1.0, -1.0)
+      0xD7111804, 0x02020702,  // v_pack_b32_f16 v4, v2, v3 op_sel:[1,1,0]
+      0xD7110005, 0x22020702,  // v_pack_b32_f16 v5, -v2, v3
+      0xBF810000,              // s_endpgm
+  });
+  if (!r.ran) return;
+  bool ok = true;
+  for (uint32_t l = 0; l < 64 && ok; ++l) {
+    ok = r.v(l, 1) == 0x46004200u && r.v(l, 4) == 0x3C004200u && r.v(l, 5) == 0xBC00BE00u;
+    if (!ok) std::printf("    lane %u: v1 %08x v4 %08x v5 %08x\n", l, r.v(l, 1), r.v(l, 4), r.v(l, 5));
+  }
+  CHECK(ok);
+}

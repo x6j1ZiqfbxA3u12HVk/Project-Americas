@@ -707,10 +707,10 @@ void packed16(std::unordered_map<std::string, Handler>& t, const char* name, con
     std::string lo[3], hi[3];
     for (int k = 0; k < sources; ++k) {
       const uint32_t code = c.f(fields[k]);
-      if (code >= 128 && code < 256 && code != 253 && code != 251 && code != 252) {
-        return c.fail(std::string(c.in->info->name) + " (constant operand)");
-      }
-      const std::string x = c.src(code);
+      // An inline constant is a 16-bit value both halves read (its f16 encoding for float ops),
+      // as LLVM encodes splat constants (op_sel_hi left set); a literal is its 32 bits.
+      std::string x = c.src(code, fl);
+      if (code >= 128 && code <= 248) x = "((" + x + " & 0xFFFFu) * 0x10001u)";
       for (int h = 0; h < 2; ++h) {
         const bool upper = ((h ? selhi : sel) >> k) & 1;
         std::string v = "((" + x + (upper ? " >> 16u" : "") + ") & 0xFFFFu)";
@@ -983,7 +983,18 @@ const std::unordered_map<std::string, Handler>& table() {
     };
     // Round toward zero: f32tof16 does that (on the GPUs tested); am_f16 rounds to nearest even.
     int_op(t, "v_cvt_pkrtz_f16_f32", "(f32tof16(asfloat(A)) | (f32tof16(asfloat(B)) << 16))");
-    int_op(t, "v_pack_b32_f16", "((A & 0xFFFFu) | (B << 16))");
+    // Two f16 into one register: op_sel picks each source's half, abs and neg act on its sign.
+    t["v_pack_b32_f16"] = [](Ctx& c) {
+      if (!form16(c)) return false;
+      std::string h[2];
+      for (int k = 0; k < 2; ++k) {
+        h[k] = src16(c, k);
+        if (is_vop3(*c.in) && ((c.f(Field::ABS) >> k) & 1)) h[k] = "(" + h[k] + " & 0x7FFFu)";
+        if (is_vop3(*c.in) && ((c.f(Field::NEG) >> k) & 1)) h[k] = "(" + h[k] + " ^ 0x8000u)";
+      }
+      c.vwrite(vop_dst(c), "(" + h[0] + " | (" + h[1] + " << 16))");
+      return true;
+    };
     int_op(t, "v_cvt_pk_u8_f32", "am_cvt_pk_u8(asfloat(A), B, C)");
 
     // -- vector integers and bits --
