@@ -1053,6 +1053,9 @@ pressure (analysis in `C:\Project Americas\crash`, WinDbg's cdb in the WinDbg pa
     before them.
   * Now there is `dxil\by-source` (content keys) and `precompile refresh`, which recompiles
     only programs whose translated source changed.
-  * `precompile all` (every program of the game) runs overnight:
-    `logs\precompile-all.txt`.
+  * Tonight follows START HERE instead: the translator-5 precompile into `rt5`
+    (`logs\precompile15.txt`). `precompile all` can come after it.
+* **Safety-net shutdown:** a detached watcher (`tools\overnight-shutdown.ps1`, its pid in
+  `tools\overnight-shutdown.pid`) shuts the PC down 45 minutes after `am-shaders` exits,
+  with a 5-minute warning (`shutdown /a` cancels). Kill it to keep working longer.
 * Menu path for the Legal Terms page (the user again): Enter, Down, Enter, Down, Enter.
