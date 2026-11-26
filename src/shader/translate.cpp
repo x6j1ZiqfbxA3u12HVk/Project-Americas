@@ -6,6 +6,7 @@
 #include <set>
 #include <string_view>
 #include <unordered_map>
+#include <vector>
 
 #include "shader/rdna2.h"
 
@@ -21,6 +22,54 @@ std::string hex32(uint32_t v) {
   return b;
 }
 std::string num(uint64_t v) { return std::to_string(v); }
+
+// Runs of lane-masked VGPR writes ("if (AM_ACT != 0u) v[N] = ...;" at one indentation) under
+// one test: they write no SGPR, so the lane mask is the same for all of them. One branch for
+// the run instead of one per instruction is far less for DXC to work through (its value
+// propagation and jump threading grow with the number of blocks).
+std::string merge_lane_guards(const std::string& body) {
+  static constexpr std::string_view kGuard = "if (AM_ACT != 0u) v[";
+  // The indentation of a lane-masked VGPR write, or npos.
+  const auto guarded = [](std::string_view l) {
+    const size_t ind = l.find_first_not_of(' ');
+    if (ind == std::string_view::npos || l.substr(ind, kGuard.size()) != kGuard || l.back() != ';') return std::string_view::npos;
+    size_t at = ind + kGuard.size();
+    const size_t digits = at;
+    while (at < l.size() && l[at] >= '0' && l[at] <= '9') ++at;
+    if (at == digits || l.substr(at, 4) != "] = ") return std::string_view::npos;
+    return ind;
+  };
+  std::vector<std::string_view> lines;
+  for (size_t at = 0; at < body.size();) {
+    const size_t nl = std::min(body.find('\n', at), body.size());
+    lines.push_back(std::string_view(body).substr(at, nl - at));
+    at = nl + 1;
+  }
+  std::string out;
+  out.reserve(body.size());
+  for (size_t i = 0; i < lines.size();) {
+    const size_t ind = guarded(lines[i]);
+    size_t j = i + 1;
+    if (ind != std::string_view::npos) {
+      while (j < lines.size() && guarded(lines[j]) == ind) ++j;
+    }
+    if (j - i < 2) {
+      out += lines[i];
+      out += '\n';
+      ++i;
+      continue;
+    }
+    const std::string pad(ind, ' ');
+    out += pad + "if (AM_ACT != 0u) {\n";
+    for (; i < j; ++i) {
+      out += pad + "  ";
+      out += lines[i].substr(ind + kGuard.size() - 2);  // from "v["
+      out += '\n';
+    }
+    out += pad + "}\n";
+  }
+  return out;
+}
 
 // Fills a template's placeholders (A, B, C; X for a single source) in one pass over the
 // template: what is put in is never scanned again, so sources may contain those letters
@@ -2850,13 +2899,14 @@ Translation finish_graphics(const TranslateInput& in, const Ctx& c, Translation 
     }
   }
   h += "  { uint4 b = WaveActiveBallot(true); s[126] = b.x; s[127] = " + std::string(c.wave64 ? "b.y" : "0u") + "; }\n";
+  const std::string merged = merge_lane_guards(body);
   if (tr.structured) {
     if (uses_br) h += "  uint am_br = 0u;\n";
-    h += body;
+    h += merged;
     h += "}\n";
   } else {
     h += "  uint pc = 0u;\n  [loop] for (;;) {\n    [forcecase] switch (pc) {\n";
-    h += body;
+    h += merged;
     h += "    default:\n      return;\n    }\n  }\n}\n";
   }
   if (vs) {
@@ -3061,6 +3111,7 @@ Translation translate(const TranslateInput& in, Binding binding) {
     d += " am_dump.Store(" + num(kDumpSgprs + 512) + "u, scc ? 1u : 0u); } }\n";
     h += d;
   }
+  body = merge_lane_guards(body);
   if (tr.structured) {
     if (uses_br) h += "  uint am_br = 0u;\n";
     h += body;

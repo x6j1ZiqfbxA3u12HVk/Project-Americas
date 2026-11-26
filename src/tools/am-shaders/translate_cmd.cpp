@@ -404,100 +404,161 @@ int precompile(const fs::path& pack_dir, const fs::path& runtime_dir, const fs::
               "first, %zu containers to look through%s\n",
               wanted.size(), new_bundles, first.size(), files.size(), all ? " (all of their programs)" : "");
   std::fflush(stdout);
+  // Pass 1, over the containers in parallel: what each wanted program needs. Programs already
+  // compiled, or whose source was compiled before (by-source), are settled here; the rest become
+  // jobs, one a distinct source (the markers sharing it get the same DXIL).
+  struct Job {
+    size_t file = 0, blob = 0, program = 0;  // where the program is, to translate it again
+    size_t hlsl_size = 0;
+    bool first = false;
+    std::string key;
+    std::vector<std::pair<std::string, shader::HwStage>> markers;
+  };
+  std::vector<Job> jobs;
+  std::map<std::string, size_t> job_of_key;
+  std::set<std::string> claimed;
   std::atomic<size_t> next{0}, done{0}, skipped{0}, failed{0}, reused{0};
   std::mutex lock;
   std::ofstream failures(out_dir / L"failures.tsv", std::ios::app);
-  // Round 0, when the game waited for some programs: those alone. Round 1: everything else.
-  for (int round = first.empty() ? 1 : 0; round < 2; ++round) {
-  next = 0;
-  std::vector<std::thread> workers;
-  for (unsigned w = 0; w < std::max(1u, std::thread::hardware_concurrency()); ++w) {
-    workers.emplace_back([&, round] {
-      for (size_t i; (i = next.fetch_add(1)) < files.size();) {
-        const bool runtime_file = files[i].parent_path() == runtime_dir;
-        std::string error;
-        const auto shader = load(files[i], error);
-        if (!shader) continue;
-        for (const shader::NativeBlob& b : shader->shader.blobs) {
-          for (const shader::NativeProgram& p : b.programs) {
-            if (p.stage != shader::HwStage::Vs && p.stage != shader::HwStage::Ps && p.stage != shader::HwStage::Cs) continue;
-            const std::string marker = marker_of(b.code(p));
-            if (round == 0 && !first.count(marker)) continue;
-            if (!all && !runtime_file && !wanted.count(marker)) continue;
-            const fs::path out = out_dir / widen(marker + ".dxil");
-            const fs::path sidecar = out_dir / widen(marker + ".src");
-            const bool have = fs::exists(out, ec);
-            if (have && hlsl_dir.empty() && !refresh) {
-              ++skipped;
-              continue;
-            }
-            const shader::Translation t = shader::translate(input_of(shader->bytes, b, p), shader::Binding::Runtime);
-            // With --raw, every wanted program's HLSL too (for reading it), compiled or not.
-            if (!hlsl_dir.empty() && t.ok) {
-              fs::create_directories(hlsl_dir, ec);
-              std::ofstream(hlsl_dir / widen(marker + ".hlsl"), std::ios::binary) << t.hlsl;
-            }
-            // The translation's content key: its source, entry and profile. DXIL is kept under
-            // it too (by-source), so a source compiled once is never compiled again, under any
-            // marker or translator version.
-            const std::string key = t.ok ? source_key(t) : std::string();
-            const fs::path stored = by_source / widen(key + ".dxil");
-            if (have) {
-              std::string was;
-              std::ifstream in(sidecar);
-              std::getline(in, was);
-              in.close();
-              // Unchanged, or files from before content keys (adopted as they are on a
-              // refresh), or a program that no longer translates: kept.
-              if (!t.ok || was == key || was.empty()) {
-                if (t.ok && was.empty()) {
-                  std::ofstream(sidecar) << key;
-                  if (!fs::exists(stored, ec)) fs::copy_file(out, stored, ec);
-                }
+  const unsigned threads = std::max(1u, std::thread::hardware_concurrency());
+  const auto fail = [&](const std::string& marker, shader::HwStage stage, std::string why) {
+    for (char& ch : why) {
+      if (ch == '\n' || ch == '\t') ch = ' ';
+    }
+    failures << marker << '\t' << shader::hw_stage_name(stage) << '\t' << why << '\n';
+    ++failed;
+  };
+  {
+    std::vector<std::thread> workers;
+    for (unsigned w = 0; w < threads; ++w) {
+      workers.emplace_back([&] {
+        for (size_t i; (i = next.fetch_add(1)) < files.size();) {
+          const bool runtime_file = files[i].parent_path() == runtime_dir;
+          std::string error;
+          const auto shader = load(files[i], error);
+          if (!shader) continue;
+          for (size_t bi = 0; bi < shader->shader.blobs.size(); ++bi) {
+            const shader::NativeBlob& b = shader->shader.blobs[bi];
+            for (size_t pi = 0; pi < b.programs.size(); ++pi) {
+              const shader::NativeProgram& p = b.programs[pi];
+              if (p.stage != shader::HwStage::Vs && p.stage != shader::HwStage::Ps && p.stage != shader::HwStage::Cs) continue;
+              const std::string marker = marker_of(b.code(p));
+              if (!all && !runtime_file && !wanted.count(marker)) continue;
+              {
                 std::lock_guard<std::mutex> g(lock);
+                if (!claimed.insert(marker).second) continue;
+              }
+              const fs::path out = out_dir / widen(marker + ".dxil");
+              const fs::path sidecar = out_dir / widen(marker + ".src");
+              const bool have = fs::exists(out, ec);
+              if (have && hlsl_dir.empty() && !refresh) {
                 ++skipped;
                 continue;
               }
-            }
-            if (t.ok && fs::exists(stored, ec)) {  // the same source compiled before
-              fs::copy_file(stored, out, fs::copy_options::overwrite_existing, ec);
-              std::ofstream(sidecar) << key;
-              std::lock_guard<std::mutex> g(lock);
-              ++reused;
-              continue;
-            }
-            std::string why = t.ok ? std::string() : t.failure;
-            host::CompileResult c;
-            if (t.ok) {
-              c = host::compile_hlsl(t.hlsl, t.entry, t.profile);
-              if (!c.ok) why = "DXC: " + c.messages.substr(0, 200);
-            }
-            std::lock_guard<std::mutex> g(lock);
-            if (!why.empty()) {
-              for (char& ch : why) {
-                if (ch == '\n' || ch == '\t') ch = ' ';
+              const shader::Translation t = shader::translate(input_of(shader->bytes, b, p), shader::Binding::Runtime);
+              // With --raw, every wanted program's HLSL too (for reading it), compiled or not.
+              if (!hlsl_dir.empty() && t.ok) {
+                fs::create_directories(hlsl_dir, ec);
+                std::ofstream(hlsl_dir / widen(marker + ".hlsl"), std::ios::binary) << t.hlsl;
               }
-              failures << marker << '\t' << shader::hw_stage_name(p.stage) << '\t' << why << '\n';
-              ++failed;
-              continue;
+              // The translation's content key: its source, entry and profile. DXIL is kept under
+              // it too (by-source), so a source compiled once is never compiled again, under any
+              // marker or translator version.
+              const std::string key = t.ok ? source_key(t) : std::string();
+              const fs::path stored = by_source / widen(key + ".dxil");
+              if (have) {
+                std::string was;
+                std::ifstream in(sidecar);
+                std::getline(in, was);
+                in.close();
+                // Unchanged, or files from before content keys (adopted as they are on a
+                // refresh), or a program that no longer translates: kept.
+                if (!t.ok || was == key || was.empty()) {
+                  if (t.ok && was.empty()) {
+                    std::ofstream(sidecar) << key;
+                    if (!fs::exists(stored, ec)) fs::copy_file(out, stored, ec);
+                  }
+                  ++skipped;
+                  continue;
+                }
+              }
+              if (t.ok && fs::exists(stored, ec)) {  // the same source compiled before
+                fs::copy_file(stored, out, fs::copy_options::overwrite_existing, ec);
+                std::ofstream(sidecar) << key;
+                ++reused;
+                continue;
+              }
+              std::lock_guard<std::mutex> g(lock);
+              if (!t.ok) {
+                fail(marker, p.stage, t.failure);
+                continue;
+              }
+              const auto [it, fresh] = job_of_key.emplace(key, jobs.size());
+              if (fresh) jobs.push_back(Job{i, bi, pi, t.hlsl.size(), false, key, {}});
+              Job& j = jobs[it->second];
+              j.markers.emplace_back(marker, p.stage);
+              j.first = j.first || first.count(marker);
             }
-            std::ofstream(out, std::ios::binary).write(reinterpret_cast<const char*>(c.dxil.data()), static_cast<std::streamsize>(c.dxil.size()));
-            std::ofstream(stored, std::ios::binary).write(reinterpret_cast<const char*>(c.dxil.data()), static_cast<std::streamsize>(c.dxil.size()));
-            std::ofstream(sidecar) << key;
-            ++done;
-            std::printf("  %s %s\n", shader::hw_stage_name(p.stage), marker.c_str());
-            std::fflush(stdout);
           }
         }
-      }
-    });
+      });
+    }
+    for (std::thread& t : workers) t.join();
   }
-  for (std::thread& t : workers) t.join();
-  if (round == 0) {
-    std::printf("precompile: the programs the game waited for are done (%zu compiled, %zu failed so far)\n", done.load(),
-                failed.load());
-    std::fflush(stdout);
-  }
+  // Pass 2: the compiles, on every core: what the game waited for first, then the largest
+  // sources first, so no long compile is left running alone at the end.
+  std::sort(jobs.begin(), jobs.end(), [](const Job& a, const Job& b) {
+    if (a.first != b.first) return a.first;
+    return a.hlsl_size > b.hlsl_size;
+  });
+  size_t hlsl_total = 0;
+  for (const Job& j : jobs) hlsl_total += j.hlsl_size;
+  std::printf("precompile: %zu sources to compile (%zu MiB of HLSL), %zu there already, %zu reused, %zu failed to translate; "
+              "%u at a time\n",
+              jobs.size(), hlsl_total >> 20, skipped.load(), reused.load(), failed.load(), threads);
+  std::fflush(stdout);
+  const auto start = std::chrono::steady_clock::now();
+  std::atomic<size_t> hlsl_done{0};
+  next = 0;
+  {
+    std::vector<std::thread> workers;
+    for (unsigned w = 0; w < threads; ++w) {
+      workers.emplace_back([&] {
+        for (size_t i; (i = next.fetch_add(1)) < jobs.size();) {
+          const Job& j = jobs[i];
+          std::string error;
+          const auto shader = load(files[j.file], error);
+          if (!shader) continue;
+          const shader::NativeBlob& b = shader->shader.blobs[j.blob];
+          const shader::Translation t =
+              shader::translate(input_of(shader->bytes, b, b.programs[j.program]), shader::Binding::Runtime);
+          const auto t0 = std::chrono::steady_clock::now();
+          const host::CompileResult c = host::compile_hlsl(t.hlsl, t.entry, t.profile);
+          const double took = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+          std::lock_guard<std::mutex> g(lock);
+          if (!c.ok) {
+            for (const auto& [m, stage] : j.markers) fail(m, stage, "DXC: " + c.messages.substr(0, 200));
+            continue;
+          }
+          const auto write = [&](const fs::path& f) {
+            std::ofstream(f, std::ios::binary).write(reinterpret_cast<const char*>(c.dxil.data()), static_cast<std::streamsize>(c.dxil.size()));
+          };
+          write(by_source / widen(j.key + ".dxil"));
+          for (const auto& [m, stage] : j.markers) {
+            write(out_dir / widen(m + ".dxil"));
+            std::ofstream(out_dir / widen(m + ".src")) << j.key;
+          }
+          ++done;
+          hlsl_done += j.hlsl_size;
+          const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+          const double left = hlsl_done ? elapsed * static_cast<double>(hlsl_total - hlsl_done) / static_cast<double>(hlsl_done) : 0;
+          std::printf("  %zu/%zu %s %s, %zu KiB of HLSL, %.1f s (about %.0f min left)\n", done.load(), jobs.size(),
+                      shader::hw_stage_name(j.markers[0].second), j.markers[0].first.c_str(), j.hlsl_size >> 10, took, left / 60);
+          std::fflush(stdout);
+        }
+      });
+    }
+    for (std::thread& t : workers) t.join();
   }
   std::printf("precompile: %zu compiled, %zu reused from earlier compiles of the same source, %zu there already, %zu failed (%s)\n",
               done.load(), reused.load(), skipped.load(), failed.load(), narrow((out_dir / L"failures.tsv").wstring()).c_str());
