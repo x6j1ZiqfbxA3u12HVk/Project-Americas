@@ -844,3 +844,41 @@ Then the larger pieces before the 3D world shows:
   * The setup text still misses letters ("The d f lt t l"): check whether those glyph
     atlases are written by compute into memory the uploads do not see again.
   * The loading phase after Confirm, compute correctness, XOR-mode detiling.
+
+## Video timing, write watch, two PC crashes (2026-11-26, early morning)
+
+* **Texture freshness:** changed textures are uploaded in a list of their own ahead of the
+  title's lists in each ExecuteCommandLists (4f645d0). Live textures (new ones, ones that
+  changed lately, ones whose pages a slot-31 mapping just placed) are hashed at every
+  submission; the rest by a watcher thread (48 MiB a round). Textures over private memory are
+  watched for writes (`memory/write_watch`, 7459cf2): read-only after upload, the first write
+  faults and marks them. The intro video starts with no green frame and plays through (the
+  user confirmed it clean).
+* **Do not watch physical-page views:** Bink writes the video planes through another view of
+  the same pages, so a watch there never fires (the video froze on its stars).
+* **The PC bugchecked twice** in game runs about 20 s in (frame ~600): 0xC2 BAD_POOL_CALLER
+  (0x61) at 02:58, then 0x133 DPC_WATCHDOG_VIOLATION at 03:02 (with the write watch off). Both
+  came after c3b98c6 (geometry shaders between mismatched stages; XG slot 10
+  GetResourceTiling, after which the game maps its UI textures' tiles); that commit is
+  reverted (0235919). Earlier the same day dozens of runs did not crash. Minidumps are in
+  `C:\WINDOWS\Minidump` (administrator only). **Before more runs:** decide with the user
+  whether to analyse them (needs the Windows debugging tools, a system-wide install) and test
+  the two parts of c3b98c6 one at a time.
+* **What c3b98c6 found (worth bringing back carefully):**
+  * Two pipelines were refused every frame on the setup and legal pages: a slot-57 one whose
+    pixel program reads fewer of the vertex outputs (D3D12 "signatures between stages are
+    incompatible": COLOR0 in another register), and a slot-86 stream pipeline with the
+    console's rect-list topology type 19.
+  * XG texture computer slot 10 is GetResourceTiling, D3D12's parameter layout without the
+    resource (from the call at game+0x344283: tiles, 12-byte packed-mip info, 12-byte tile
+    shape, count in/out = 16, first 0, 12-byte tilings). The stub left the UI streamer with
+    zero tiles.
+* **Missing letters on the legal pages (not solved).** The body text on the right panel is
+  drawn by slot-57 pipeline VS 03fe0bb222c474c3 / PS 03ff45e826ecca2a, ~14 indexed draws of
+  ~4,000 indices per frame. Each vertex picks placement rows 6n..6n+5 (n = COLOR1.z, UNORM8)
+  from a buffer at the VS table + 32; the PS multiplies alpha by a mask (the 3840x2160 A8
+  render target at 0xdd7c90000, a host texture, cleared then one quad). Missing are exactly
+  the glyphs no taller than the x-height (a c e m n o r s u v w x z . , :); the left-hand
+  text of the same size is whole. **Next probe:** that row buffer's V# (records, OOB mode)
+  against the highest n of each draw. A collapsed transform (rows read as zero) would draw a
+  dot, as seen where "Brightness" loses its n.
