@@ -458,6 +458,14 @@ void dispatch(HostList& h, ID3D12GraphicsCommandList* list, const Command& c) {
     }
   }
   if (gx == 0 || gy == 0 || gz == 0) return;  // nothing to run
+  if (present::dred_enabled()) {  // names the dispatch's program and grid in DRED's breadcrumbs
+    char text[96];
+    std::snprintf(text, sizeof text, "CS %s %llux%llux%llu", compute_marker_of(h.pipeline).substr(0, 16).c_str(),
+                  static_cast<unsigned long long>(gx), static_cast<unsigned long long>(gy), static_cast<unsigned long long>(gz));
+    const std::string d = text;
+    const std::wstring w(d.begin(), d.end());
+    list->SetMarker(0, w.c_str(), static_cast<UINT>((w.size() + 1) * sizeof(wchar_t)));
+  }
   list->SetPipelineState(pso);
   list->SetComputeRoot32BitConstants(0, kUserDataConstants, cs, 0);
   list->Dispatch(static_cast<UINT>(gx), static_cast<UINT>(gy), static_cast<UINT>(gz));

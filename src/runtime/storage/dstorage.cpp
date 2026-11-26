@@ -363,6 +363,23 @@ HRESULT execute(const Request& r) {
     const uint64_t pages = (within + data.size() + kPage - 1) / kPage;
     std::vector<uint64_t> numbers(pages);
     if (!guarded_copy(numbers.data(), r.destination, pages * sizeof(uint64_t))) return E_INVALIDARG;
+    // A page list still holding 0 (no page) is filled later by the title, possibly by GPU work
+    // behind us (octa_imposters.ttpf's page lists sit in GPU-visible memory): read it again for
+    // up to 2 s before giving up.
+    if (std::find(numbers.begin(), numbers.end(), uint64_t{0}) != numbers.end()) {
+      const ULONGLONG start = GetTickCount64();
+      bool filled = false;
+      while (!filled && GetTickCount64() - start < 2000) {
+        Sleep(5);
+        if (!guarded_copy(numbers.data(), r.destination, pages * sizeof(uint64_t))) return E_INVALIDARG;
+        filled = std::find(numbers.begin(), numbers.end(), uint64_t{0}) == numbers.end();
+      }
+      static std::atomic<int> told{0};
+      if (told.fetch_add(1) < 16) {
+        logf("dstorage: a page list held page 0 at execution; %s after %llu ms", filled ? "filled" : "still 0",
+             static_cast<unsigned long long>(GetTickCount64() - start));
+      }
+    }
     if (!mem::title_memory().write_pages(numbers.data(), pages, within, data.data(), data.size())) {
       const DWORD error = GetLastError();
       static std::atomic<int> told{0};
