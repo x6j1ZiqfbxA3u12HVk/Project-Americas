@@ -56,6 +56,9 @@ const char* breadcrumb_name(D3D12_AUTO_BREADCRUMB_OP op) {
 
 // With AMERICAS_D3D12_DRED, the device keeps breadcrumbs (each list's operations and how far the
 // GPU got) and page faults; on device loss they go to the log, once.
+std::atomic<DispatchNamer> g_dispatch_namer{nullptr};
+void set_dispatch_namer(DispatchNamer namer) { g_dispatch_namer = namer; }
+
 void report_device_removed(ID3D12Device* device) {
   static std::atomic<bool> told{false};
   if (told.exchange(true)) return;
@@ -79,6 +82,12 @@ void report_device_removed(ID3D12Device* device) {
           if (n->pBreadcrumbContexts[c].BreadcrumbIndex == i && n->pBreadcrumbContexts[c].pContextString) {
             context = narrow(n->pBreadcrumbContexts[c].pContextString);
           }
+        }
+        if (n->pCommandHistory[i] == D3D12_AUTO_BREADCRUMB_OP_DISPATCH && context.empty()) {
+          // Which program: the list's dispatches are counted up to this one.
+          uint32_t nth = 0;
+          for (UINT j = 0; j < i; ++j) nth += n->pCommandHistory[j] == D3D12_AUTO_BREADCRUMB_OP_DISPATCH;
+          if (const DispatchNamer namer = g_dispatch_namer.load()) context = namer(n->pCommandList, nth);
         }
         logf("gpu: DRED:   %s%u %s%s%s", i == done ? "-> " : "   ", i, name ? name : ("op " + std::to_string(n->pCommandHistory[i])).c_str(),
              context.empty() ? "" : ": ", context.c_str());

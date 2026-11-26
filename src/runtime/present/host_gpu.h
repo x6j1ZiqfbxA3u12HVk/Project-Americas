@@ -1,5 +1,7 @@
 #pragma once
 
+#include <string>
+
 // The host's D3D12 device, one per process: the graphics back end records into it and the
 // presenter shows through it. Made on first use on the high-performance adapter; nullptr when
 // the PC has no D3D12 GPU (frames are then counted but not drawn).
@@ -45,5 +47,9 @@ HostGpu* host_gpu();
 // written to the log when the device is lost.
 bool dred_enabled();
 void report_device_removed(ID3D12Device* device);
+// Names the `nth` dispatch recorded in a host command list (set by the D3D12.X layer), for the
+// device-lost report.
+using DispatchNamer = std::string (*)(const void* list, uint32_t nth);
+void set_dispatch_namer(DispatchNamer namer);
 
 }  // namespace am::rt::present

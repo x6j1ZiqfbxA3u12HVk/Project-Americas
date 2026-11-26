@@ -184,6 +184,9 @@ void capture(Recording& r, Command& c) {
 
 // ---- the host list ----
 
+void forget_dispatch_names(const void* list);
+std::string dispatch_name(const void* list, uint32_t nth);
+
 ID3D12GraphicsCommandList* host_begin(CommandList* l) {
   HostList& h = l->host;
   if (h.open) return h.list.Get();
@@ -212,6 +215,11 @@ ID3D12GraphicsCommandList* host_begin(CommandList* l) {
   h.current = pick;
   h.open = true;
   h.dispatched.clear();
+  if (present::dred_enabled()) {
+    forget_dispatch_names(h.list.Get());
+    static std::once_flag once;
+    std::call_once(once, [] { present::set_dispatch_namer(&dispatch_name); });
+  }
   h.ready = false;
   h.states.clear();
   h.bound = false;
@@ -369,6 +377,29 @@ D3D12_GPU_VIRTUAL_ADDRESS set_heaps(HostList& h, ID3D12GraphicsCommandList* list
   return bindings_table();
 }
 
+// With DRED: each host list's dispatches, in order (program and grid), to name the one a lost
+// device stopped at. Cleared when the list is reset.
+std::mutex g_dispatch_names_lock;
+std::map<const void*, std::vector<std::string>> g_dispatch_names;
+
+void note_dispatch_name(const void* list, std::string name) {
+  std::lock_guard g(g_dispatch_names_lock);
+  auto& v = g_dispatch_names[list];
+  if (v.size() < 16384) v.push_back(std::move(name));
+}
+
+void forget_dispatch_names(const void* list) {
+  std::lock_guard g(g_dispatch_names_lock);
+  g_dispatch_names.erase(list);
+}
+
+std::string dispatch_name(const void* list, uint32_t nth) {
+  std::lock_guard g(g_dispatch_names_lock);
+  auto it = g_dispatch_names.find(list);
+  if (it == g_dispatch_names.end() || nth >= it->second.size()) return {};
+  return "program " + it->second[nth];
+}
+
 // A dispatch, when its compute pipeline has a host pipeline: the translated compute root
 // signature with the user data and the binding table, the dispatch, then a barrier so what it
 // wrote is seen by the work after it.
@@ -459,6 +490,8 @@ void dispatch(HostList& h, ID3D12GraphicsCommandList* list, const Command& c) {
   }
   if (gx == 0 || gy == 0 || gz == 0) return;  // nothing to run
   if (present::dred_enabled()) {  // names the dispatch's program and grid in DRED's breadcrumbs
+    note_dispatch_name(list, compute_marker_of(h.pipeline).substr(0, 16) + " " + std::to_string(gx) + "x" + std::to_string(gy) + "x" +
+                                 std::to_string(gz));
     char text[96];
     std::snprintf(text, sizeof text, "CS %s %llux%llux%llu", compute_marker_of(h.pipeline).substr(0, 16).c_str(),
                   static_cast<unsigned long long>(gx), static_cast<unsigned long long>(gy), static_cast<unsigned long long>(gz));
