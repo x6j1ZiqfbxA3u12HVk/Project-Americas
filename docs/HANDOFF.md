@@ -1059,3 +1059,36 @@ pressure (analysis in `C:\Project Americas\crash`, WinDbg's cdb in the WinDbg pa
   `tools\overnight-shutdown.pid`) shuts the PC down 45 minutes after `am-shaders` exits,
   with a 5-minute warning (`shutdown /a` cancels). Kill it to keep working longer.
 * Menu path for the Legal Terms page (the user again): Enter, Down, Enter, Down, Enter.
+
+## Past Confirm: what happens, and what kills it (2026-11-26, night)
+
+* **Translator 5 checked:** the rt5 precompile compiled the 16-bit interpolation programs
+  with no DXC errors (no `GetAttributeAtVertex`/`SV_Barycentrics` failures in
+  `rt5\failures.tsv`). To have something to draw while it runs, rt5 was seeded with rt4's
+  6,084 DXIL files, each with a `.src` sidecar reading `rt4`: a later `precompile refresh`
+  recompiles them (their content keys differ) and nothing else.
+* **The bundle index is big:** the runtime folder holds ~315,000 `.cpipe` bundles (not
+  48,000); a fresh `rt<N>` spends ~40 minutes indexing them before compiling anything.
+  Copying the previous version's `cpipe-index.tsv` first would skip that (bundles do not
+  depend on the translator).
+* **Translator additions tonight (no version bump; refused programs simply have no DXIL, so
+  a plain `precompile` picks them up; every earlier program's source is byte-identical, so
+  its content key holds):** depth export `exp mrtz` -> `SV_Depth` (2,536 refused before);
+  A16 sampling (f16 coordinates, gradients, lod; f16 bias in its own dword; 1D/3D gradient
+  padding); `image_get_lod` (helpers emitted only where used); f16 compares;
+  `v_cvt_f16_u16/i16`; `v_movrels/movreld/movrelsd_b32`. Tests for each.
+* **Menu script to Confirm and on:** `C:\Project Americas\scripts-run\to-load.txt`
+  (`AMERICAS_SCRIPT=@<that path>`). Timed `AMERICAS_PRESS` drifts with the frame rate; the
+  script anchors on the setup page and reaches Confirm every time.
+* **After Confirm** the game streams the world (ttdb props, interiors, maps; `levels.rpf`,
+  `navmeshes.rpf`) behind a dark loading screen (RGB ~34,34,44), then black.
+* **The crashes after Confirm differ every run** (a pointer of garbage at game+0x52ed0a7, a
+  null getter at +0xf6349, a write through a field of 2 at +0x3768dc6, `bad_alloc` in
+  DirectStorage and in texture uploads). The cause found: **the process runs out of
+  commit.** With the game at the loading screen it had 25.6 GB private commit (system 39.8
+  of 42 GB, 0.5 GB RAM free); 1,087 private allocations of ~16 MiB made 16.6 GiB of it.
+* **Ruled out:** the page-destination texture streams. Their zlib streams are longer than
+  the destination (e.g. 32 KiB stream, 4 KiB destination at page offset 0x6000); the
+  sources are real stream starts and `page_offset + size` ends on a 32/64 KiB boundary,
+  which fits packs storing the smallest mips first, so keeping the stream's prefix is right.
+  `AMERICAS_SKIP_PAGE_WRITES=1` (diagnosis only) skips those writes.

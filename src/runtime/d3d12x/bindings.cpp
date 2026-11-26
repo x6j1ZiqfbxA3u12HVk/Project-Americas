@@ -473,8 +473,26 @@ struct Bindings {
   };
   std::vector<UploadList> upload_lists;
 
+  // Lets go of the buffers the GPU is done with; logs the ones waiting as they grow.
+  void reclaim() {
+    present::HostGpu* gpu = present::host_gpu();
+    std::erase_if(retired, [gpu](const Retired& r) { return r.fence != kPending && gpu->done(r.fence); });
+    static size_t told = 64;
+    if (retired.size() >= told) {
+      uint64_t bytes = 0, pending = 0;
+      for (const Retired& r : retired) {
+        bytes += r.resource ? r.resource->GetDesc().Width : 0;
+        pending += r.fence == kPending;
+      }
+      logf("bindings: %zu buffers waiting for the GPU (%llu MiB, %llu not yet submitted)", retired.size(),
+           static_cast<unsigned long long>(bytes >> 20), static_cast<unsigned long long>(pending));
+      told *= 2;
+    }
+  }
+
   ID3D12CommandList* uploads_for_submission() {
     if (!usable) return nullptr;
+    reclaim();
     check_live();
     if (std::none_of(textures.begin(), textures.end(), [](const Texture& t) { return t.dirty && t.resource; })) return nullptr;
     present::HostGpu* gpu = present::host_gpu();
@@ -509,8 +527,7 @@ struct Bindings {
   void flush(ID3D12GraphicsCommandList* list) {
     if (!usable) return;
     // Freed once the GPU has run the lists that read them.
-    present::HostGpu* gpu = present::host_gpu();
-    std::erase_if(retired, [gpu](const Retired& r) { return r.fence != kPending && gpu->done(r.fence); });
+    reclaim();
     recording = list;
     take_misses();
     D3D12_RESOURCE_BARRIER b{};

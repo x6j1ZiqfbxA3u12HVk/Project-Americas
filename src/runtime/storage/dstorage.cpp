@@ -323,6 +323,9 @@ HRESULT execute(const Request& r) {
              r.source_size, t_out.size(), formats::inflate_status_name(all.status), static_cast<unsigned long long>(all.written),
              hex(r.options).c_str(), (r.options & kMemorySource) ? "memory" : static_cast<const File*>(r.source)->name.c_str(),
              static_cast<unsigned long long>(r.offset), r.intermediate_size, r.name ? r.name : "");
+        const auto* q = reinterpret_cast<const uint64_t*>(&r);
+        logf("dstorage:   request words %016llx %016llx %016llx %016llx %016llx %016llx %016llx %016llx %016llx",
+             q[0], q[1], q[2], q[3], q[4], q[5], q[6], q[7], q[8]);
       }
     }
     if (res.status != formats::InflateStatus::Ok && !full) {
@@ -350,6 +353,10 @@ HRESULT execute(const Request& r) {
     data = t_blocks;
   }
   if (r.options & kPageDestination) {
+    // AMERICAS_SKIP_PAGE_WRITES (diagnosis): page destinations are not written, the request
+    // reported done.
+    static const bool skip = GetEnvironmentVariableA("AMERICAS_SKIP_PAGE_WRITES", nullptr, 0) != 0;
+    if (skip) return S_OK;
     const uint64_t within = r.page_offset & 0xFFFF;
     const uint64_t pages = (within + data.size() + kPage - 1) / kPage;
     std::vector<uint64_t> numbers(pages);
