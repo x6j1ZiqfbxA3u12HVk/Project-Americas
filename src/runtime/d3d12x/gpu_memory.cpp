@@ -56,6 +56,7 @@ struct GpuMemory {
   // The GPU's own mappings as the CPU reads them (first page -> run); their own lock.
   struct GpuRun {
     uint64_t pages, source, step;  // source 0: the GPU sees nothing there
+    uint64_t view;  // where the title's CPU writes those bytes (its view of the pages; 0: none)
   };
   std::mutex gpu_runs_lock;
   std::map<uint64_t, GpuRun> gpu_runs;
@@ -397,7 +398,7 @@ namespace {
 void cut_gpu_runs(std::map<uint64_t, GpuMemory::GpuRun>& runs, uint64_t first, uint64_t count) {
   const uint64_t end = first + count;
   const auto rest = [](const GpuMemory::GpuRun& r, uint64_t skip) {
-    return GpuMemory::GpuRun{r.pages - skip, r.source ? r.source + skip * r.step : 0, r.step};
+    return GpuMemory::GpuRun{r.pages - skip, r.source ? r.source + skip * r.step : 0, r.step, r.view ? r.view + skip * r.step : 0};
   };
   auto it = runs.lower_bound(first);
   if (it != runs.begin()) {
@@ -424,9 +425,10 @@ void cut_gpu_runs(std::map<uint64_t, GpuMemory::GpuRun>& runs, uint64_t first, u
 // else the source view), as runs.
 void record_gpu_runs(GpuMemory& m, uint64_t address, const int64_t* pages, uint64_t count, uint64_t source, uint64_t source_step) {
   const uint64_t mirror = m.pool_mirror.load();
-  std::vector<uint64_t> at(count);
+  std::vector<uint64_t> at(count), view(count);
   for (uint64_t k = 0; k < count; ++k) {
-    at[k] = mirror && pages[k] >= 0 ? mirror + static_cast<uint64_t>(pages[k]) * kPage : source ? source + k * source_step : 0;
+    view[k] = source ? source + k * source_step : 0;
+    at[k] = mirror && pages[k] >= 0 ? mirror + static_cast<uint64_t>(pages[k]) * kPage : view[k];
   }
   std::lock_guard g(m.gpu_runs_lock);
   const uint64_t first = address / kPage;
@@ -435,8 +437,8 @@ void record_gpu_runs(GpuMemory& m, uint64_t address, const int64_t* pages, uint6
     uint64_t step = 0;
     if (k + 1 < count) step = !at[k] ? 0 : at[k + 1] == at[k] + kPage ? kPage : 0;
     uint64_t j = k + 1;
-    while (j < count && at[j] == (at[k] ? at[k] + (j - k) * step : 0)) ++j;
-    m.gpu_runs[first + k] = {j - k, at[k], step};
+    while (j < count && at[j] == (at[k] ? at[k] + (j - k) * step : 0) && view[j] == (view[k] ? view[k] + (j - k) * step : 0)) ++j;
+    m.gpu_runs[first + k] = {j - k, at[k], step, view[k]};
     k = j;
   }
 }
@@ -458,6 +460,36 @@ const void* gpu_bytes_at(uint64_t address, uint64_t* bytes) {
   }
   *bytes = next == m.gpu_runs.end() ? UINT64_MAX - address : next->first * kPage - address;
   return reinterpret_cast<const void*>(address);
+}
+
+bool gpu_write_ranges(uint64_t address, uint64_t size, std::vector<std::pair<uint64_t, uint64_t>>& out) {
+  GpuMemory& m = memory();
+  std::lock_guard g(m.gpu_runs_lock);
+  for (uint64_t at = address, end = address + size; at < end;) {
+    const uint64_t page = at / kPage, offset = at % kPage;
+    uint64_t from = at, bytes = 0;
+    auto next = m.gpu_runs.upper_bound(page);
+    bool in_run = false;
+    if (next != m.gpu_runs.begin()) {
+      const auto& [first, run] = *std::prev(next);
+      if (page - first < run.pages) {
+        const uint64_t k = page - first;
+        if (!run.view) return false;
+        in_run = true;
+        from = run.view + k * run.step + offset;
+        bytes = (run.step ? run.pages - k : 1) * kPage - offset;
+      }
+    }
+    if (!in_run) bytes = next == m.gpu_runs.end() ? end - at : next->first * kPage - at;
+    const uint64_t n = std::min(bytes, end - at);
+    if (!out.empty() && out.back().second == from) {
+      out.back().second += n;
+    } else {
+      out.emplace_back(from, from + n);
+    }
+    at += n;
+  }
+  return true;
 }
 
 void map_gpu_pages(uint64_t address, const int64_t* pages, uint64_t count, uint64_t source, uint64_t source_step) {

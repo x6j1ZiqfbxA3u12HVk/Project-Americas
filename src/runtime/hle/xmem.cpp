@@ -15,6 +15,7 @@
 #include "runtime/log.h"
 #include "runtime/memory/default_alloc.h"
 #include "runtime/memory/title_memory.h"
+#include "runtime/memory/write_watch.h"
 #include "runtime/process.h"
 
 namespace am::rt::hle {
@@ -149,6 +150,7 @@ BOOL WINAPI my_ReadFile(HANDLE file, LPVOID buffer, DWORD size, LPDWORD read, LP
     note_read_failure("committing the buffer", buffer, size, GetLastError());
     return FALSE;
   }
+  mem::release_for_host_write(buffer, size);  // the kernel's write would not fault: it would fail
   const BOOL ok = ReadFile(file, buffer, size, read, overlapped);
   if (!ok) {
     const DWORD error = GetLastError();
@@ -160,6 +162,7 @@ BOOL WINAPI my_ReadFile(HANDLE file, LPVOID buffer, DWORD size, LPDWORD read, LP
 BOOL WINAPI my_ReadFileEx(HANDLE file, LPVOID buffer, DWORD size, LPOVERLAPPED overlapped,
                           LPOVERLAPPED_COMPLETION_ROUTINE done) {
   if (!commit_buffer(buffer, size)) return FALSE;
+  mem::release_for_host_write(buffer, size);
   return ReadFileEx(file, buffer, size, overlapped, done);
 }
 BOOL WINAPI my_WriteFile(HANDLE file, LPCVOID buffer, DWORD size, LPDWORD written, LPOVERLAPPED overlapped) {

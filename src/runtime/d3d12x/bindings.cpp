@@ -14,6 +14,7 @@
 #include "runtime/d3d12x/gpu_memory.h"
 #include "runtime/d3d12x/layout.h"
 #include "runtime/log.h"
+#include "runtime/memory/write_watch.h"
 #include "runtime/present/host_gpu.h"
 #include "shader/image_bindings.h"
 
@@ -117,6 +118,12 @@ struct Texture {
   // Rounds in a row that found it unchanged since it last changed; kLiveRounds and under: live,
   // checked every round.
   uint32_t quiet = kLiveRounds - kNewRounds;
+  // Its memory is watched for writes (mem::watch_writes) since its last upload: neither hashed
+  // nor checked; a write marks it at the next submission. Watched where the title's CPU writes
+  // its bytes (gpu_write_ranges), when all of that is private read-write memory; textures in
+  // physical pages (the GPU's own mappings place those) are hashed instead.
+  bool watched = false;
+  std::vector<std::pair<uint64_t, uint64_t>> watch_ranges;
 };
 
 // A quick checksum of title memory (0 when it cannot be read). Not every write to a texture's
@@ -323,7 +330,13 @@ struct Bindings {
 
   void upload_texture(ID3D12GraphicsCommandList* list, Texture& t) {
     t.dirty = false;
-    t.checksum = checksum_of(t.address, t.size);
+    // Watched before it is read: a write from here on is seen.
+    static const bool watch = GetEnvironmentVariableA("AMERICAS_NO_WRITE_WATCH", nullptr, 0) == 0;
+    t.watch_ranges.clear();
+    t.watched = watch && gpu_write_ranges(t.address, t.size, t.watch_ranges) &&
+                std::all_of(t.watch_ranges.begin(), t.watch_ranges.end(),
+                            [](const auto& r) { return mem::watch_writes(r.first, r.second - r.first); });
+    t.checksum = t.watched ? 0 : checksum_of(t.address, t.size);
     const UINT subs = static_cast<UINT>(t.layout.subresources.size());
     std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> fp(subs);
     std::vector<UINT> rows(subs);
@@ -403,7 +416,7 @@ struct Bindings {
         for (size_t n = 0; n < count && budget; ++n) {
           const size_t i = next_check++ % count;
           const Texture& t = textures[i];
-          if (t.dirty || !t.resource || t.quiet <= kLiveRounds) continue;
+          if (t.dirty || t.watched || !t.resource || t.quiet <= kLiveRounds) continue;
           budget -= std::min(t.size, budget);
           round.push_back({i, t.address, t.size, t.checksum, 0});
         }
@@ -413,7 +426,7 @@ struct Bindings {
         std::lock_guard g(lock);
         for (const Watched& w : round) {
           Texture& t = textures[w.index];
-          if (t.dirty || t.checksum != w.checksum) continue;  // uploaded again meanwhile
+          if (t.dirty || t.watched || t.checksum != w.checksum) continue;  // uploaded again meanwhile
           if (w.now != w.checksum) {
             t.dirty = true;
             t.quiet = 0;
@@ -424,10 +437,24 @@ struct Bindings {
     }
   }
 
-  // At a submission, under the lock: live textures whose memory changed are marked.
+  // At a submission, under the lock: watched textures the title wrote, and live ones whose
+  // memory changed, are marked.
+  std::vector<std::pair<uint64_t, uint64_t>> written_ranges;
   void check_live() {
+    // Watched textures the title wrote.
+    written_ranges.clear();
+    mem::take_written(written_ranges);
+    for (const auto& [first, end] : written_ranges) {
+      for (Texture& t : textures) {
+        if (t.watched && std::any_of(t.watch_ranges.begin(), t.watch_ranges.end(),
+                                     [&](const auto& r) { return r.first < end && first < r.second; })) {
+          t.watched = false;
+          t.dirty = true;
+        }
+      }
+    }
     for (Texture& t : textures) {
-      if (t.dirty || !t.resource || t.quiet > kLiveRounds) continue;
+      if (t.dirty || t.watched || !t.resource || t.quiet > kLiveRounds) continue;
       if (checksum_of(t.address, t.size) != t.checksum) {
         t.dirty = true;
         t.quiet = 0;
@@ -805,10 +832,13 @@ void add_texture(Bindings* b, const D3D12_RESOURCE_DESC& resource, const D3D12_S
 
 }  // namespace
 
-void notify_title_write(uint64_t address, uint64_t size) {
+void notify_title_write(uint64_t address, uint64_t size, bool live) {
   std::lock_guard g(bindings().lock);
   for (Texture& t : bindings().textures) {
-    if (address < t.address + t.size && t.address < address + size) t.dirty = true;
+    if (address < t.address + t.size && t.address < address + size) {
+      t.dirty = true;
+      if (live) t.quiet = 0;
+    }
   }
 }
 

@@ -18,6 +18,7 @@
 #include "core/text.h"
 #include "runtime/d3d12x/commands.h"
 #include "runtime/d3d12x/d3d12x.h"
+#include "runtime/d3d12x/bindings.h"
 #include "runtime/d3d12x/gpu_memory.h"
 #include "runtime/d3d12x/object.h"
 #include "runtime/log.h"
@@ -187,6 +188,9 @@ HRESULT WINAPI queue_copy_page_mappings(Queue* self, UINT count, const PageBatch
         }
         map_gpu_pages(at, pages.data(), range.count, range.kind == 2 ? 0 : pool + uint64_t{range.start} * kPage,
                       range.kind == 0 ? kPage : 0);
+        // What textures there show changed: uploaded again, and checked at every submission
+        // for a while (the title fills newly mapped pages: a video's planes).
+        notify_title_write(at, uint64_t{range.count} * kPage, true);
       }
       at += uint64_t{range.count} * kPage;
     }

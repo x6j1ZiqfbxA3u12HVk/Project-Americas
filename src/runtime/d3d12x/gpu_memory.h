@@ -25,6 +25,8 @@
 #include <d3d12.h>
 
 #include <cstdint>
+#include <utility>
+#include <vector>
 
 namespace am::rt::d3d12x {
 
@@ -62,5 +64,9 @@ void map_gpu_pages(uint64_t address, const int64_t* pages, uint64_t count, uint6
 // placed, the pages it put there; elsewhere `address` itself. nullptr where the GPU sees
 // nothing. `*bytes`: how many bytes from there stay in a row.
 const void* gpu_bytes_at(uint64_t address, uint64_t* bytes);
+// Where the title's CPU writes the bytes the GPU sees at [address, address + size), as
+// [first, end) ranges: its views of the pages the GPU's own mapping placed, elsewhere the
+// addresses themselves. False where the GPU sees pages no view of the title's shows.
+bool gpu_write_ranges(uint64_t address, uint64_t size, std::vector<std::pair<uint64_t, uint64_t>>& out);
 
 }  // namespace am::rt::d3d12x

@@ -25,8 +25,9 @@ namespace am::rt::d3d12x {
 void bind_texture_view(const D3D12_RESOURCE_DESC& resource, const D3D12_SHADER_RESOURCE_VIEW_DESC& view, uint64_t address,
                        uint32_t words[8], ID3D12Resource* host = nullptr);
 // The title's memory in [address, address + size) was written: textures over it are uploaded
-// again at the next submission.
-void notify_title_write(uint64_t address, uint64_t size);
+// again at the next submission. `live`: they are also checked at every submission for a while
+// (pages the GPU's own mapping just placed there, which the title is about to fill).
+void notify_title_write(uint64_t address, uint64_t size, bool live = false);
 // Records the table's upkeep into `list`, before its draws.
 void flush_bindings(ID3D12GraphicsCommandList* list);
 // At a submission: the uploads of textures whose memory changed (live ones checked now), as a
