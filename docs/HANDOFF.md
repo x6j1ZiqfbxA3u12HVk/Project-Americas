@@ -1136,3 +1136,60 @@ pressure (analysis in `C:\Project Americas\crash`, WinDbg's cdb in the WinDbg pa
 * **Tonight's run recipe:** `AMERICAS_SCRIPT=@C:\Project Americas\scripts-run\to-stall.txt`
   reaches Confirm and waits 90 s (about 6 minutes in all); `to-load-long.txt` waits ~8
   minutes after it.
+
+## Faster cycles: the shader service, page-driven scripts (2026-11-26, afternoon)
+
+* **`am-shaders serve [jobs]`** replaces the long precompile while working: it maps the
+  game's programs by marker (16,890 in ~30 s, no translation up front), compiles what the
+  running game waits for first (new lines of `rt5\wanted-first.txt`, read every second),
+  then the rest of the game's pipelines' programs smallest first. Programs over 1 MiB of
+  HLSL compile with `-O0` (about half the time). Run it in the background with 6 jobs on
+  this 8-thread PC while the game runs:
+  `"C:\Project Americas\build\release\bin\am-shaders.exe" serve 6 > "C:\Project Americas\logs\serve.txt" 2>&1`.
+  The runtime looks for a missing program again every 2 s, so pages fill in while shown.
+  `am-shaders.exe` is locked while serve runs: rename it aside (`am-shaders-old16.exe` is
+  such a copy) before building.
+* **Page-driven script steps:** `A next [seconds]` taps, waits for the page to change (the
+  set of draws a frame makes, by pipeline and vertex count) and then to settle (that set
+  unchanged and no file or DirectStorage reads for 0.35 s). Menu taps settle in 0.5-1 s.
+  `scripts-run\to-load-fast.txt` reaches Confirm and the loading after it in about 2
+  minutes; `to-stall-fast.txt` waits there. Don't mix the settings (Tab) into a load
+  script: B did not leave the settings, and the taps after it wandered through them.
+* **Settings preview:** textures over a render target's memory in another format of the
+  same size (R32_UINT drawn, R9G9B9E5 read: ~30 of them, UI and HDR passes) are now copies
+  of the target, refreshed when the title sets new targets. The Control Scheme preview is
+  still empty (one row of static), so the preview needs more than that.
+* **The `+0x3e4551d` crash and the by-hash lookups:** `+0x3e454a0` looks a key up in a
+  streaming pool (`+0x3b530`: slot `key & 0x3fffff`, elements at pool+0x38, size at
+  +0x40, used bits at +0x60); the element's first qword is the loaded asset, a dictionary
+  (hashes at +0x20, count u16 at +0x28, pointers at +0x30). A crash read the hashes through
+  `-1` at asset `0x5f1710000`. With `AMERICAS_HW_WATCH=5f1724610,5f1710020` both fields were
+  written by our DirectStorage copy (file offsets `0x50000668`, `0x50048e90`) and then
+  relocated by the game (`+0x4da62bf`, `+0x4ec4efb`) to proper pointers; no later write in
+  that run, and that run did not crash. So the crashes come after a correct load and
+  relocation: look for the asset being freed or its memory reused while still registered.
+* **Loading still stops** after ~24,000 DirectStorage requests (1.25 GB) with no shader or
+  compute pipeline missing (dispatches "waiting 3" is a cumulative count of three early
+  ones).
+* **Why it stops (found):** one game thread spins forever in the title's page allocator,
+  and everything else waits. `hang.txt` now prints the registers of threads running
+  outside the system. The loop at `+0x4f8f120` unlinks a page entry from a free list: page
+  entries are 8 bytes in an array (`r14 = 0xd84479930` in every run), next index in bits
+  41-61 (`0x1fffff` ends a list), list heads per size class at `0x1471bfb08 + 0x74`. The
+  entry (`esi = 0x4716e`, another run `0x47166`) is not in the list its header names, the
+  walk reaches the end marker, and the loop has no check for it.
+  * `AMERICAS_HW_WATCH=d846b24a0` (entry `0x4716e`): 30 writes, **all by the title's own
+    allocator** (`+0x52389d4/fb/a2d`, `+0x555b311`, `+0x52387f8`, `+0xe88d7`), none by us.
+    The low 16 bits are a count with bit 15 a flag: `0x8000` (0) becomes `0xffff`, `0xfffe`,
+    `0xfffd`, `0xfffc`, `0xfffb`: **the page is released more times than it was taken.**
+    The releases (`+0xe88d7` <- `+0x4f8f3ed` <- `+0x41dbc7` <- `+0x43c4ede` <- `+0x122d9b`
+    <- `+0x4fd23ed` <- `+0x4fd1e88`) run on the streaming thread.
+  * Ruled out: DirectStorage writing the metadata (page-destination arrays such as
+    `0xd849b0568` hold valid page numbers; `write_pages` refuses anything else and 0
+    requests failed); physical-page aliasing (one shared section, views of it).
+  * **Next:** find what the title's acquire/release pairs on these pages hang on. Read
+    `+0x41dbc7`/`+0x43c4ede` (what decides to release) and `+0x555b311`/`+0x52387f8`
+    (what takes a page), and look for an API of ours whose answer makes the title release
+    twice: a completion reported twice, a status array or fence value written more than
+    once, a residency or tile-mapping call that reports a failure, a physical-page free or
+    query answered wrongly. The underflow is deterministic, so the same watch reproduces.

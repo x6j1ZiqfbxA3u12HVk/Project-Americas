@@ -659,6 +659,7 @@ void TitleProcess::dump_threads() {
     DWORD id;
     uint64_t frames[40];
     int count;
+    CONTEXT top;  // the registers where it stopped
   };
   std::vector<DWORD> ids;
   const DWORD self = GetCurrentThreadId();
@@ -684,6 +685,7 @@ void TitleProcess::dump_threads() {
       CONTEXT ctx{};
       ctx.ContextFlags = CONTEXT_FULL;
       if (GetThreadContext(t, &ctx)) {
+        c.top = ctx;
         for (; c.count < 40 && ctx.Rip; ++c.count) {
           c.frames[c.count] = ctx.Rip;
           DWORD64 image_base = 0;
@@ -711,6 +713,18 @@ void TitleProcess::dump_threads() {
     CloseHandle(t);
     text += "\nthread " + std::to_string(c.id) + (label.empty() ? "" : " \"" + label + "\"") + ":";
     for (int k = 0; k < c.count; ++k) text += "\n    " + describe_address(c.frames[k]);
+    // A thread running outside the system (not waiting): its registers too (a spinning loop's
+    // state names what it spins on).
+    if (c.count && describe_address(c.frames[0]).find("ntdll") == std::string::npos &&
+        describe_address(c.frames[0]).find("win32u") == std::string::npos) {
+      const CONTEXT& r = c.top;
+      const std::pair<const char*, uint64_t> regs[] = {{"rax", r.Rax}, {"rbx", r.Rbx}, {"rcx", r.Rcx}, {"rdx", r.Rdx},
+                                                       {"rsi", r.Rsi}, {"rdi", r.Rdi}, {"rbp", r.Rbp}, {"rsp", r.Rsp},
+                                                       {"r8", r.R8},   {"r9", r.R9},   {"r10", r.R10}, {"r11", r.R11},
+                                                       {"r12", r.R12}, {"r13", r.R13}, {"r14", r.R14}, {"r15", r.R15}};
+      text += "\n  registers:";
+      for (const auto& [reg, value] : regs) text += std::string(" ") + reg + " " + hex(value);
+    }
   }
   std::ofstream(options_.logs_dir / L"hang.txt", std::ios::binary) << text << '\n';
   logf("hang.txt: stacks of %zu threads", ids.size());
