@@ -4,6 +4,8 @@
 #include <tlhelp32.h>
 
 #include <algorithm>
+#include <csignal>
+#include <exception>
 #include <cstdio>
 #include <fstream>
 
@@ -18,6 +20,9 @@
 #include "runtime/memory/title_memory.h"
 
 namespace am::rt {
+
+void on_abort(int);  // the SIGABRT handler (TitleProcess::load)
+
 namespace {
 
 TitleProcess* g_process = nullptr;
@@ -103,6 +108,7 @@ bool TitleProcess::load(std::string& error) {
   policy_ = loader::ImportPolicy(title_dlls);
   build_command_line();
   SetUnhandledExceptionFilter(&top_level_filter);
+  std::signal(SIGABRT, &on_abort);
   install_cpu_emulation();
   set_title_code_test([](const void* address) { return g_process && g_process->module_containing(address) != nullptr; });
   if (!tls_.discover(error)) return false;
@@ -432,6 +438,49 @@ std::string TitleProcess::describe_address(uint64_t address) {
   return "0x" + hex(address);
 }
 
+// A thread's frames from `ctx` on, as "\n  stack:" and one line a frame.
+std::string TitleProcess::describe_stack(CONTEXT ctx) {
+  std::string text = "\n  stack:";
+  for (int frame = 0; frame < 32 && ctx.Rip; ++frame) {
+    text += "\n    " + describe_address(ctx.Rip);
+    DWORD64 image_base = 0;
+    PRUNTIME_FUNCTION fn = RtlLookupFunctionEntry(ctx.Rip, &image_base, nullptr);
+    if (fn) {
+      void* handler_data = nullptr;
+      DWORD64 establisher = 0;
+      RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, ctx.Rip, fn, &ctx, &handler_data, &establisher, nullptr);
+    } else {
+      if (IsBadReadPtr(reinterpret_cast<void*>(ctx.Rsp), 8)) break;
+      ctx.Rip = *reinterpret_cast<DWORD64*>(ctx.Rsp);
+      ctx.Rsp += 8;
+    }
+  }
+  return text;
+}
+
+// abort() in the host's C runtime (std::terminate on an escaped exception lands there too): the
+// exception's message, if there is one, and the aborting thread's stack, to the log and
+// crash.txt. The process then ends as abort() ends it.
+void on_abort(int) {
+  if (!g_process || InterlockedIncrement(&g_process->crashing_) != 1) return;
+  std::string text = "crash: abort() in the host's C runtime";
+  if (std::exception_ptr e = std::current_exception()) {
+    try {
+      std::rethrow_exception(e);
+    } catch (const std::exception& x) {
+      text += std::string(", an exception escaped: ") + x.what();
+    } catch (...) {
+      text += ", an exception of unknown type escaped";
+    }
+  }
+  CONTEXT ctx{};
+  RtlCaptureContext(&ctx);
+  text += g_process->describe_stack(ctx);
+  log_line(text);
+  std::ofstream(g_process->options_.logs_dir / L"crash.txt", std::ios::binary) << text << '\n';
+  g_process->write_report();
+}
+
 long TitleProcess::crash_filter(EXCEPTION_POINTERS* info) {
   if (InterlockedIncrement(&crashing_) == 1) {
     const EXCEPTION_RECORD* r = info->ExceptionRecord;
@@ -453,21 +502,7 @@ long TitleProcess::crash_filter(EXCEPTION_POINTERS* info) {
                   ctx.Rax, ctx.Rbx, ctx.Rcx, ctx.Rdx, ctx.Rsi, ctx.Rdi, ctx.Rbp, ctx.Rsp, ctx.R8, ctx.R9, ctx.R10,
                   ctx.R11, ctx.R12, ctx.R13, ctx.R14, ctx.R15);
     text += regs;
-    text += "\n  stack:";
-    for (int frame = 0; frame < 32 && ctx.Rip; ++frame) {
-      text += "\n    " + describe_address(ctx.Rip);
-      DWORD64 image_base = 0;
-      PRUNTIME_FUNCTION fn = RtlLookupFunctionEntry(ctx.Rip, &image_base, nullptr);
-      if (fn) {
-        void* handler_data = nullptr;
-        DWORD64 establisher = 0;
-        RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, ctx.Rip, fn, &ctx, &handler_data, &establisher, nullptr);
-      } else {
-        if (IsBadReadPtr(reinterpret_cast<void*>(ctx.Rsp), 8)) break;
-        ctx.Rip = *reinterpret_cast<DWORD64*>(ctx.Rsp);
-        ctx.Rsp += 8;
-      }
-    }
+    text += describe_stack(ctx);
     log_line(text);
     std::ofstream(options_.logs_dir / L"crash.txt", std::ios::binary) << text << '\n';
     write_report();

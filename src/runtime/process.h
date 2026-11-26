@@ -74,6 +74,8 @@ class TitleProcess {
 
   LPTOP_LEVEL_EXCEPTION_FILTER set_title_crash_filter(LPTOP_LEVEL_EXCEPTION_FILTER filter);
   long crash_filter(EXCEPTION_POINTERS* info);
+  friend void on_abort(int);
+  std::string describe_stack(CONTEXT ctx);
 
   // report.json: what the title called that we do not provide yet.
   void write_report() const;
