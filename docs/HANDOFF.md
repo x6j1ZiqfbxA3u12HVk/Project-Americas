@@ -1040,3 +1040,19 @@ bf15cb8; the glitchy patches fixed by flushing render targets when the title swi
 **Crashes:** the two PC bugchecks of the night were Windows' storage drivers under memory
 pressure (analysis in `C:\Project Americas\crash`, WinDbg's cdb in the WinDbg package's
 `amd64` folder). With tiling off, runs have been clean since.
+
+## Overnight, 2026-11-26 (the user is asleep)
+
+* **Standing instruction tonight:** keep working with all the usage there is. When the
+  5-hour window reaches 95%, shut the PC down, or schedule the shutdown for when the
+  background jobs end: `shutdown /s /t 60` after `am-shaders` exits.
+* **Shader cache, the answer to "why do we keep compiling":**
+  * Compiled programs were never recompiled. New ones kept arriving as the game reached new
+    screens (the compute set, new menus).
+  * The real gap was the other way: translator fixes did not reach programs compiled
+    before them.
+  * Now there is `dxil\by-source` (content keys) and `precompile refresh`, which recompiles
+    only programs whose translated source changed.
+  * `precompile all` (every program of the game) runs overnight:
+    `logs\precompile-all.txt`.
+* Menu path for the Legal Terms page (the user again): Enter, Down, Enter, Down, Enter.
