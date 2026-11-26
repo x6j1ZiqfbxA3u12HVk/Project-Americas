@@ -301,6 +301,41 @@ uint64_t watched_texture_init(uint8_t* texture, const uint8_t* desc, uint64_t a3
   return result;
 }
 
+// The title's watchdog thread (+0x2215a80) ends the run (+0x23cf620 writes to address 0) when
+// its main loop gives no heartbeat for 30 one-second ticks. On a PC the first run of a scene
+// compiles every new pipeline in the driver, on the title's own threads, and that alone passed
+// 30 s. The tick budget (nine `mov reg, 30` loads) becomes AMERICAS_TITLE_WATCHDOG_S seconds
+// (600 by default; 30 keeps the title's). Patched in memory only when every site holds the
+// expected bytes.
+void install_watchdog_patience(uint8_t* base, size_t size) {
+  char text[16] = {};
+  const uint32_t seconds =
+      GetEnvironmentVariableA("AMERICAS_TITLE_WATCHDOG_S", text, sizeof text) ? static_cast<uint32_t>(std::strtoul(text, nullptr, 10)) : 600u;
+  if (seconds <= 30 || size < 0x2215d80) return;  // not this title (the test fixture is small)
+  struct Site {
+    uint32_t rva;
+    uint8_t opcode;  // mov ebp / ebx / eax, imm32
+  };
+  static const Site kSites[] = {{0x2215acc, 0xBD}, {0x2215b3a, 0xBD}, {0x2215b62, 0xBD}, {0x2215bfd, 0xBD}, {0x2215c64, 0xBB},
+                                {0x2215cde, 0xBD}, {0x2215d06, 0xBD}, {0x2215d67, 0xBD}, {0x2215d78, 0xB8}};
+  for (const Site& s : kSites) {
+    const uint8_t expected[] = {s.opcode, 0x1E, 0, 0, 0};
+    if (std::memcmp(base + s.rva, expected, sizeof expected) != 0) {
+      logf("watchdog: the title's watchdog is not where this build expects it; left at 30 s");
+      return;
+    }
+  }
+  for (const Site& s : kSites) {
+    uint8_t* at = base + s.rva + 1;
+    DWORD old = 0;
+    if (!VirtualProtect(at, 4, PAGE_EXECUTE_READWRITE, &old)) return;
+    std::memcpy(at, &seconds, 4);
+    VirtualProtect(at, 4, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), at, 4);
+  }
+  logf("watchdog: the title's main-loop watchdog waits %u s instead of 30 (AMERICAS_TITLE_WATCHDOG_S)", seconds);
+}
+
 void install_page_release_clamp(uint8_t* base) {
   g_title_base = base;
   char size[32] = {};
@@ -581,7 +616,10 @@ bool TitleProcess::prepare(MappedImage& m, bool is_executable, std::string& erro
   if (!apply_cpu_compat(m, options_.cache_dir, options_.allow_missing_cpu_features, cpu, error)) return false;
   cpu_[&m] = cpu;
   if (!tls_.install(m, is_executable, error) || !finish_image(m, error)) return false;
-  if (is_executable) install_page_release_clamp(m.base);
+  if (is_executable) {
+    install_page_release_clamp(m.base);
+    install_watchdog_patience(m.base, m.size);
+  }
   return true;
 }
 
