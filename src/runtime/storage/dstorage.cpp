@@ -40,6 +40,7 @@
 #include "runtime/hle/registry.h"
 #include "runtime/log.h"
 #include "runtime/memory/title_memory.h"
+#include "runtime/script.h"
 
 namespace am::rt::storage {
 namespace {
@@ -281,6 +282,7 @@ void log_refused(const Request& r, const char* why) {
 }
 
 HRESULT execute(const Request& r) {
+  script_on_load();  // AMERICAS_SCRIPT's "next" waits for loading to stop
   if (r.options & (kTransformMask | kPageSource)) {
     log_refused(r, "transform not implemented yet");
     return E_NOTIMPL;

@@ -173,6 +173,7 @@ HRESULT WINAPI queue_present_x(Object* self, UINT plane_count, const void* plane
       const uint64_t frame = ++presented;
       const DXGI_FORMAT shown_as = present::swap_chain_format(image.format);
       uint32_t shot = 0;
+      script_on_frame();                                 // AMERICAS_SCRIPT's "next" watches frames
       const bool scripted = script_wants_capture(shot);  // AMERICAS_SCRIPT's "capture"
       const bool capture = (capture_wanted(frame) || scripted) &&
                            (shown_as == DXGI_FORMAT_R8G8B8A8_UNORM || shown_as == DXGI_FORMAT_B8G8R8A8_UNORM);

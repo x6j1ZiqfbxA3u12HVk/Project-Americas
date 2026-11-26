@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <fstream>
 #include <iterator>
+#include <deque>
 #include <map>
 #include <set>
 #include <span>
@@ -562,6 +563,234 @@ int precompile(const fs::path& pack_dir, const fs::path& runtime_dir, const fs::
   }
   std::printf("precompile: %zu compiled, %zu reused from earlier compiles of the same source, %zu there already, %zu failed (%s)\n",
               done.load(), reused.load(), skipped.load(), failed.load(), narrow((out_dir / L"failures.tsv").wstring()).c_str());
+  return 0;
+}
+
+// The shader service: compiles what the game waits for while it runs. Programs are found by
+// marker in the game's shader containers (and the stream pipelines' containers the runtime
+// saved), with no translation up front. Every second, wanted-first.txt (where the runtime lists
+// what draws and dispatches wait for) is read for new markers, and those are compiled first;
+// with none waiting, the rest of the game's pipelines' programs follow, smallest first. The
+// runtime looks for a missing program again every two seconds, so a page fills in while it
+// shows. Runs until stopped.
+int serve(const fs::path& pack_dir, const fs::path& runtime_dir, const fs::path& out_dir, unsigned jobs) {
+  SetPriorityClass(GetCurrentProcess(), BELOW_NORMAL_PRIORITY_CLASS);
+  std::error_code ec;
+  fs::create_directories(out_dir, ec);
+  const fs::path by_source = out_dir.parent_path() / L"by-source";
+  fs::create_directories(by_source, ec);
+  struct Location {
+    size_t file = 0, blob = 0, program = 0, code_size = 0;
+    shader::HwStage stage = shader::HwStage::Cs;
+  };
+  std::vector<fs::path> files;
+  std::map<std::string, Location> where;
+  std::mutex lock;
+  // Maps the programs of `batch` (files appended to `files` from `first`).
+  const auto map_files = [&](size_t first) {
+    std::vector<fs::path> batch;
+    {
+      std::lock_guard<std::mutex> g(lock);
+      batch.assign(files.begin() + static_cast<std::ptrdiff_t>(first), files.end());
+    }
+    std::atomic<size_t> next{0};
+    std::vector<std::thread> workers;
+    for (unsigned w = 0; w < std::max(1u, std::thread::hardware_concurrency()); ++w) {
+      workers.emplace_back([&] {
+        for (size_t k; (k = next.fetch_add(1)) < batch.size();) {
+          const size_t i = first + k;
+          std::string error;
+          const auto shader = load(batch[k], error);
+          if (!shader) continue;
+          for (size_t bi = 0; bi < shader->shader.blobs.size(); ++bi) {
+            const shader::NativeBlob& b = shader->shader.blobs[bi];
+            for (size_t pi = 0; pi < b.programs.size(); ++pi) {
+              const shader::NativeProgram& pr = b.programs[pi];
+              if (pr.stage != shader::HwStage::Vs && pr.stage != shader::HwStage::Ps && pr.stage != shader::HwStage::Cs) continue;
+              const std::string marker = marker_of(b.code(pr));
+              std::lock_guard<std::mutex> g(lock);
+              where.try_emplace(marker, Location{i, bi, pi, b.code(pr).size(), pr.stage});
+            }
+          }
+        }
+      });
+    }
+    for (std::thread& t : workers) t.join();
+  };
+  std::set<fs::path> seen_runtime;
+  const auto add_runtime_files = [&] {
+    std::vector<fs::path> fresh;
+    std::error_code dir_ec;
+    for (const auto& e : fs::directory_iterator(runtime_dir, dir_ec)) {
+      if (e.path().extension() == L".dxbc" && seen_runtime.insert(e.path()).second) fresh.push_back(e.path());
+    }
+    if (fresh.empty()) return size_t{0};
+    size_t first = 0;
+    {
+      std::lock_guard<std::mutex> g(lock);
+      first = files.size();
+      files.insert(files.end(), fresh.begin(), fresh.end());
+    }
+    map_files(first);
+    return fresh.size();
+  };
+  for (const fs::path& f : containers(pack_dir)) files.push_back(f);
+  const auto t0 = std::chrono::steady_clock::now();
+  map_files(0);
+  add_runtime_files();
+  // The rest: the game's pipelines' programs (cpipe-index.tsv, as the precompile wrote it).
+  std::vector<std::string> bulk;
+  {
+    std::set<std::string> listed;
+    std::ifstream in(out_dir / L"cpipe-index.tsv");
+    for (std::string line; std::getline(in, line);) {
+      const size_t tab = line.find('\t');
+      if (tab == std::string::npos) continue;
+      for (size_t at = tab + 1; at < line.size();) {
+        const size_t comma = std::min(line.find(',', at), line.size());
+        if (comma > at) listed.insert(line.substr(at, comma - at));
+        at = comma + 1;
+      }
+    }
+    for (const std::string& m : listed) {
+      if (where.count(m) && !fs::exists(out_dir / widen(m + ".dxil"), ec)) bulk.push_back(m);
+    }
+    std::sort(bulk.begin(), bulk.end(), [&](const std::string& a, const std::string& b) { return where[a].code_size > where[b].code_size; });
+  }
+  std::printf("serve: %zu programs mapped in %zu containers (%.0f s); %zu of the game's pipelines' programs not compiled yet; "
+              "%u at a time\n",
+              where.size(), files.size(), std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), bulk.size(), jobs);
+  std::fflush(stdout);
+
+  std::deque<std::string> urgent;  // what the game waits for, oldest first
+  std::set<std::string> taken;     // compiled, compiling, failed or unknown this session
+  std::ofstream failures(out_dir / L"failures.tsv", std::ios::app);
+  std::atomic<size_t> compiled{0}, reused{0};
+  // The watcher: new lines of wanted-first.txt.
+  std::thread([&] {
+    std::streamoff read = 0;
+    for (;;) {
+      std::ifstream in(out_dir / L"wanted-first.txt");
+      if (in) {
+        in.seekg(0, std::ios::end);
+        const std::streamoff size = in.tellg();
+        if (size < read) read = 0;  // a new file
+        in.seekg(read);
+        std::vector<std::string> fresh;
+        for (std::string m; std::getline(in, m);) {
+          if (!m.empty() && m.back() == '\r') m.pop_back();
+          if (!m.empty()) fresh.push_back(m);
+        }
+        read = size;
+        bool unknown = false;
+        for (const std::string& m : fresh) {
+          if (fs::exists(out_dir / widen(m + ".dxil"), ec)) continue;
+          std::lock_guard<std::mutex> g(lock);
+          if (!where.count(m)) unknown = true;
+          if (!taken.count(m)) urgent.push_back(m);
+        }
+        if (unknown) {
+          if (const size_t added = add_runtime_files()) {
+            std::lock_guard<std::mutex> g(lock);
+            for (const std::string& m : fresh) {
+              if (where.count(m) && !taken.count(m) && !fs::exists(out_dir / widen(m + ".dxil"), ec)) urgent.push_back(m);
+            }
+            std::printf("serve: %zu new stream containers mapped\n", added);
+          }
+        }
+      }
+      Sleep(1000);
+    }
+  }).detach();
+
+  const auto compile_one = [&](const std::string& marker, bool waited) {
+    Location at;
+    fs::path file;
+    {
+      std::lock_guard<std::mutex> g(lock);
+      auto it = where.find(marker);
+      if (it == where.end()) {
+        std::printf("serve: %s is in no container we have\n", marker.c_str());
+        std::fflush(stdout);
+        return;
+      }
+      at = it->second;
+      file = files[at.file];
+    }
+    std::string error;
+    const auto shader = load(file, error);
+    if (!shader) return;
+    const shader::NativeBlob& b = shader->shader.blobs[at.blob];
+    const shader::Translation t = shader::translate(input_of(shader->bytes, b, b.programs[at.program]), shader::Binding::Runtime);
+    const auto fail = [&](std::string why) {
+      for (char& ch : why) {
+        if (ch == '\n' || ch == '\t') ch = ' ';
+      }
+      std::lock_guard<std::mutex> g(lock);
+      failures << marker << '\t' << shader::hw_stage_name(at.stage) << '\t' << why << '\n';
+      failures.flush();
+      if (waited) std::printf("serve: %s %s refused: %s\n", shader::hw_stage_name(at.stage), marker.c_str(), why.substr(0, 120).c_str());
+    };
+    if (!t.ok) return fail(t.failure);
+    const std::string key = source_key(t);
+    const fs::path stored = by_source / widen(key + ".dxil");
+    if (fs::exists(stored, ec)) {
+      fs::copy_file(stored, out_dir / widen(marker + ".dxil"), fs::copy_options::overwrite_existing, ec);
+      std::ofstream(out_dir / widen(marker + ".src")) << key;
+      ++reused;
+      return;
+    }
+    const auto c0 = std::chrono::steady_clock::now();
+    // The largest programs (over 1 MiB of HLSL take DXC minutes) unoptimized: twice as fast to
+    // compile, and the driver optimizes the DXIL again when it makes the pipeline.
+    const bool huge = t.hlsl.size() > (1u << 20);
+    const host::CompileResult c = host::compile_hlsl(t.hlsl, t.entry, t.profile, huge ? std::vector<std::wstring>{L"-O0"} : std::vector<std::wstring>{});
+    const double took = std::chrono::duration<double>(std::chrono::steady_clock::now() - c0).count();
+    if (!c.ok) return fail("DXC: " + c.messages.substr(0, 200));
+    const auto write = [&](const fs::path& f) {
+      std::ofstream(f, std::ios::binary).write(reinterpret_cast<const char*>(c.dxil.data()), static_cast<std::streamsize>(c.dxil.size()));
+    };
+    write(by_source / widen(key + ".dxil"));
+    // The DXIL first, under a temporary name: the runtime never reads half a file.
+    write(out_dir / widen(marker + ".tmp"));
+    fs::rename(out_dir / widen(marker + ".tmp"), out_dir / widen(marker + ".dxil"), ec);
+    std::ofstream(out_dir / widen(marker + ".src")) << key;
+    ++compiled;
+    std::lock_guard<std::mutex> g(lock);
+    std::printf("  %s%s %s, %zu KiB of HLSL, %.1f s (%zu compiled, %zu reused)\n", waited ? "waited for: " : "",
+                shader::hw_stage_name(at.stage), marker.c_str(), t.hlsl.size() >> 10, took, compiled.load(), reused.load());
+    std::fflush(stdout);
+  };
+
+  std::vector<std::thread> workers;
+  for (unsigned w = 0; w < jobs; ++w) {
+    workers.emplace_back([&] {
+      for (;;) {
+        std::string marker;
+        bool waited = false;
+        {
+          std::lock_guard<std::mutex> g(lock);
+          while (!urgent.empty() && marker.empty()) {
+            std::string m = urgent.front();
+            urgent.pop_front();
+            if (taken.insert(m).second) marker = m, waited = true;
+          }
+          while (marker.empty() && !bulk.empty()) {
+            std::string m = bulk.back();
+            bulk.pop_back();
+            if (taken.insert(m).second) marker = m;
+          }
+        }
+        if (marker.empty()) {
+          Sleep(200);
+          continue;
+        }
+        if (fs::exists(out_dir / widen(marker + ".dxil"), ec)) continue;
+        compile_one(marker, waited);
+      }
+    });
+  }
+  for (std::thread& t : workers) t.join();
   return 0;
 }
 

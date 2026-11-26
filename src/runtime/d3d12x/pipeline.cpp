@@ -45,6 +45,9 @@
 namespace am::rt::d3d12x {
 namespace {
 
+// How long a pipeline whose programs were not precompiled waits before it looks again.
+constexpr uint64_t kMissingRetryMs = 2000;
+
 std::vector<uint8_t> geometry_shader(const std::vector<uint8_t>& vs, const std::vector<uint8_t>& ps, bool rect_list, bool& failed);
 
 struct Shader {
@@ -63,7 +66,10 @@ struct ConsolePipeline {
   bool has_blend_desc = false;  // a derived pipeline's blend state (slot 55), in place of `blend`
   D3D12_BLEND_DESC blend_desc{};
   std::mutex lock;
-  bool failed = false;  // its programs are not all precompiled: not tried again
+  bool failed = false;  // a stage or layout we cannot make: not tried again
+  // Its programs were not all precompiled when last tried: looked for again from this tick on
+  // (am-shaders serve compiles what draws wait for while the game runs).
+  uint64_t retry_at = 0;
   std::map<std::vector<uint32_t>, Microsoft::WRL::ComPtr<ID3D12PipelineState>> made;
 };
 
@@ -78,6 +84,7 @@ struct PipelineState : Object {
   std::string compute_marker;           // its program's
   std::vector<UserSlot> compute_layout;  // where its root parameters go (user-data dwords)
   std::atomic<bool> compute_tried{false};  // a job has run (made or refused)
+  std::atomic<uint64_t> compute_missing_at{0};  // its program was not precompiled at this tick
   std::atomic<bool> compute_urgent{false};  // a dispatch waited: moved to the front once
   uint32_t console_programs = 0;  // slot 57: GPU programs given by address
   std::string console_name;       // slot 57: the saved blocks' file, and the programs' markers
@@ -294,6 +301,7 @@ void make_host_compute(PipelineState* p, present::HostGpu* gpu, bool large_lane)
   std::vector<uint8_t> code;
   if (!load_precompiled(marker, code)) {  // a dispatch that waits for it lists it for the precompile
     ++g_compute_missing;
+    p->compute_missing_at = GetTickCount64();
     release(p);
     return;
   }
@@ -408,7 +416,15 @@ ID3D12PipelineState* host_compute_pipeline(const void* object, const void** root
   if (root_signature) *root_signature = p->root_signature;
   ID3D12PipelineState* host = p->host_compute.load(std::memory_order_acquire);
   if (!host && !p->compute_tried.load() && !p->compute_urgent.exchange(true)) queue_host_compute(p, true);  // a dispatch waits
-  if (!host && p->compute_tried.load()) note_wanted(p->compute_marker);  // tried, nothing made: not precompiled (or refused)
+  if (!host && p->compute_tried.load()) {
+    note_wanted(p->compute_marker);  // tried, nothing made: not precompiled (or refused)
+    // Not precompiled then: looked for again a while later (am-shaders serve may have made it).
+    uint64_t missing = p->compute_missing_at.load();
+    if (missing && GetTickCount64() >= missing + kMissingRetryMs && p->compute_missing_at.compare_exchange_strong(missing, 0)) {
+      p->compute_tried = false;
+      p->compute_urgent = false;
+    }
+  }
   return host;
 }
 
@@ -899,6 +915,7 @@ ID3D12PipelineState* console_host_pipeline(ConsolePipeline& c, const DXGI_FORMAT
                                            bool rect_list) {
   std::lock_guard g(c.lock);
   if (c.failed) return nullptr;
+  if (c.retry_at && GetTickCount64() < c.retry_at) return nullptr;
   std::vector<uint32_t> key(targets, targets + std::min<uint32_t>(count, 8));
   key.push_back(rect_list);
   key.push_back(depth);  // last: the depth view's format (the pipeline must match the bound views)
@@ -908,7 +925,7 @@ ID3D12PipelineState* console_host_pipeline(ConsolePipeline& c, const DXGI_FORMAT
     std::vector<uint8_t> code;
     if (!load_precompiled(m, code)) {
       for (const std::string& each : c.markers) note_wanted(each);  // a draw waits for them
-      c.failed = true;
+      c.retry_at = GetTickCount64() + kMissingRetryMs;
       return nullptr;
     }
     const int kind = dxil_kind(code);

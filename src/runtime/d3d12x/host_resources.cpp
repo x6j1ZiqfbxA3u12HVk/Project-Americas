@@ -192,6 +192,20 @@ D3D12_CPU_DESCRIPTOR_HANDLE host_dsv(ID3D12Resource* texture, uint32_t format) {
   return slot;
 }
 
+ID3D12Resource* host_texture_at(uint64_t address, D3D12_RESOURCE_DESC* desc) {
+  Host& h = host();
+  std::lock_guard g(h.lock);
+  for (const auto& [console, texture] : h.textures) {
+    uint64_t at = 0;
+    D3D12_RESOURCE_DESC d{};
+    if (texture && resource_memory(console, &d, &at) && at == address) {
+      if (desc) *desc = d;
+      return texture.Get();
+    }
+  }
+  return nullptr;
+}
+
 void forget_host_texture(const void* console_resource) {
   Host& h = host();
   std::lock_guard g(h.lock);

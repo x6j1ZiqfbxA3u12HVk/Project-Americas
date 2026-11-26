@@ -28,6 +28,9 @@ DXGI_FORMAT host_rtv_format(ID3D12Resource* texture, uint32_t format);
 DXGI_FORMAT host_dsv_format(ID3D12Resource* texture, uint32_t format);
 // Drops a console resource's host texture and its views (the console resource is going away).
 void forget_host_texture(const void* console_resource);
+// The host texture of a GPU-written console resource whose memory starts at `address` (its
+// description in `desc`), or nullptr.
+ID3D12Resource* host_texture_at(uint64_t address, D3D12_RESOURCE_DESC* desc);
 
 // host_pipeline.cpp: the 24-byte marker (hex) of a shader container's program of a stage (a
 // stream subobject type: 1 VS, 2 PS, 6 CS); its precompiled DXIL; a host graphics pipeline

@@ -17,6 +17,7 @@
 #include "runtime/memory/title_memory.h"
 #include "runtime/memory/write_watch.h"
 #include "runtime/process.h"
+#include "runtime/script.h"
 
 namespace am::rt::hle {
 namespace {
@@ -151,6 +152,7 @@ BOOL WINAPI my_ReadFile(HANDLE file, LPVOID buffer, DWORD size, LPDWORD read, LP
     return FALSE;
   }
   mem::release_for_host_write(buffer, size);  // the kernel's write would not fault: it would fail
+  rt::script_on_load();                       // AMERICAS_SCRIPT's "next" waits for loading to stop
   const BOOL ok = ReadFile(file, buffer, size, read, overlapped);
   if (!ok) {
     const DWORD error = GetLastError();

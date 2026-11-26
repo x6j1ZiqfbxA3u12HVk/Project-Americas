@@ -30,6 +30,11 @@ void bind_texture_view(const D3D12_RESOURCE_DESC& resource, const D3D12_SHADER_R
 void notify_title_write(uint64_t address, uint64_t size, bool live = false);
 // Records the table's upkeep into `list`, before its draws.
 void flush_bindings(ID3D12GraphicsCommandList* list);
+// Textures of another format over a render target's memory (the title views a target's bytes
+// as another format: R32_UINT drawn, R9G9B9E5 read) are copies of it. Whether `target` has
+// any; and recording the copies (`target` in COPY_SOURCE) after the title drew into it.
+bool target_has_copies(ID3D12Resource* target);
+void copy_target(ID3D12GraphicsCommandList* list, ID3D12Resource* target);
 // At a submission: the uploads of textures whose memory changed (live ones checked now), as a
 // closed list to run ahead of the title's; nullptr when there are none. bindings_submitted
 // follows with that list.

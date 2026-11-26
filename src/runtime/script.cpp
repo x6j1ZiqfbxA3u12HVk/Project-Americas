@@ -11,6 +11,7 @@
 #include <sstream>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "runtime/log.h"
@@ -34,11 +35,13 @@ uint32_t button_of(const std::string& word) {
 }
 
 struct Step {
-  enum Kind { Tap, Wait, Log, Draw, Capture, Trace, Quit } kind = Wait;
+  enum Kind { Tap, Wait, Log, Draw, Capture, Trace, Quit, Settle } kind = Wait;
   uint32_t button = 0;  // Tap
   int count = 1;        // Tap: how many times; with `until`, until the condition holds
   bool until = false;   // Tap until a Log or Draw condition
   bool until_draw = false;
+  bool next = false;  // Tap: wait for the page to change and settle after each tap
+  double most = 8;    // Tap with `next`, Settle: the longest wait, in seconds
   double seconds = 0;  // Wait
   std::string text;    // Log, Draw, and the condition of `until`
   std::string source;  // as written, for the log
@@ -80,9 +83,33 @@ bool parse(const std::string& line, Step& step) {
     step.kind = Step::Quit;
     return true;
   }
+  if (!_stricmp(word.c_str(), "settle")) {
+    step.kind = Step::Settle;
+    if (!rest.empty()) step.most = std::atof(rest.c_str());
+    return step.most > 0;
+  }
   step.kind = Step::Tap;
   step.button = button_of(word);
   if (!step.button) return false;
+  // "next" or "next <seconds>", last
+  {
+    std::istringstream words(rest);
+    std::vector<std::string> w;
+    for (std::string x; words >> x;) w.push_back(x);
+    size_t at = w.size();
+    if (at >= 1 && !_stricmp(w[at - 1].c_str(), "next")) {
+      at -= 1;
+    } else if (at >= 2 && !_stricmp(w[at - 2].c_str(), "next") && std::atof(w[at - 1].c_str()) > 0) {
+      step.most = std::atof(w[at - 1].c_str());
+      at -= 2;
+    }
+    if (at < w.size()) {
+      step.next = true;
+      rest.clear();
+      for (size_t k = 0; k < at; ++k) rest += (k ? " " : "") + w[k];
+      if (rest.empty()) return true;
+    }
+  }
   if (rest.size() > 1 && (rest[0] == 'x' || rest[0] == 'X') && std::isdigit(static_cast<unsigned char>(rest[1]))) {
     step.count = std::atoi(rest.c_str() + 1);
     return step.count > 0;
@@ -143,6 +170,50 @@ struct Script {
   std::atomic<int> capture{0};                              // frames to save: 1 asked
   std::atomic<uint32_t> captures{0};
 
+  // What a frame draws, while a step watches the page: the set of its pipelines, as one number.
+  std::atomic<bool> watching{false};
+  std::unordered_set<uint64_t> drawn;                               // this frame's draws (under `lock`)
+  std::atomic<uint64_t> signature{0}, signature_at{0}, frames{0};  // the last frame's, since when
+  std::atomic<uint64_t> loaded_at{0};                               // the last storage read
+
+  void on_draw(uint64_t draw) {
+    std::lock_guard g(lock);
+    drawn.insert(draw);
+  }
+  void on_frame() {
+    uint64_t sig = 0;
+    {
+      std::lock_guard g(lock);
+      for (const uint64_t d : drawn) {
+        const uint64_t h = d * 0x9E3779B97F4A7C15ull;
+        sig += h ^ (h >> 29);
+      }
+      drawn.clear();
+    }
+    if (sig != signature.exchange(sig)) signature_at = GetTickCount64();
+    ++frames;
+  }
+
+  // Waits for the page to settle: its frames' pipelines unchanged and no storage reads for a
+  // while. After a tap, first for the page to change (from `before`, the signature then).
+  void settle(size_t step, bool after_tap, uint64_t before, uint64_t tapped, double most) {
+    constexpr uint64_t kQuiet = 350, kChange = 2000;
+    const uint64_t kMost = static_cast<uint64_t>(most * 1000);
+    bool changed = !after_tap;
+    for (;;) {
+      Sleep(20);
+      const uint64_t now = GetTickCount64();
+      if (!changed && (signature.load() != before || loaded_at.load() > tapped)) changed = true;
+      if (!changed && now - tapped < kChange) continue;
+      const bool quiet = now - signature_at.load() >= kQuiet && now - loaded_at.load() >= kQuiet;
+      if (quiet || now - tapped >= kMost) {
+        logf("script: step %zu %s in %.2f s%s", step, quiet ? "settled" : "did not settle", (now - tapped) / 1000.0,
+             changed ? "" : " (the page did not change)");
+        return;
+      }
+    }
+  }
+
   void expect(const std::string& text, bool draw) {
     std::lock_guard g(lock);
     wanted = text;
@@ -179,8 +250,24 @@ struct Script {
           while (!met) Sleep(20);
           done_waiting();
           break;
+        case Step::Settle:
+          watching = true;
+          Sleep(100);
+          settle(i + 1, false, 0, GetTickCount64(), s.most);
+          watching = false;
+          break;
         case Step::Tap:
-          if (!s.until) {
+          if (s.next) {
+            watching = true;
+            const uint64_t f0 = frames.load();
+            while (frames.load() < f0 + 2) Sleep(10);  // a whole frame's set to compare with
+            for (int k = 0; k < s.count; ++k) {
+              const uint64_t before = signature.load(), tapped = GetTickCount64();
+              tap(s.button);
+              settle(i + 1, true, before, tapped, s.most);
+            }
+            watching = false;
+          } else if (!s.until) {
             for (int k = 0; k < s.count; ++k) {
               tap(s.button);
               if (k + 1 < s.count) Sleep(700);
@@ -238,8 +325,9 @@ void script_on_log(const std::string& line) {
   s.note(line, false);
 }
 
-void script_on_draw(const void* pipeline, const std::function<std::string()>& describe) {
+void script_on_draw(const void* pipeline, const std::function<std::string()>& describe, uint64_t shape) {
   Script& s = script();
+  if (s.watching) s.on_draw(reinterpret_cast<uint64_t>(pipeline) ^ (shape * 0xC2B2AE3D27D4EB4Full));
   if (!s.waiting_draws && !s.tracing) return;
   std::string text;
   {
@@ -257,6 +345,13 @@ void script_on_draw(const void* pipeline, const std::function<std::string()>& de
   }
   s.note(text, true);
 }
+
+void script_on_frame() {
+  Script& s = script();
+  if (s.watching) s.on_frame();
+}
+
+void script_on_load() { script().loaded_at.store(GetTickCount64(), std::memory_order_relaxed); }
 
 bool script_wants_capture(uint32_t& number) {
   Script& s = script();

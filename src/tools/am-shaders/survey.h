@@ -30,6 +30,9 @@ int image_survey(const std::filesystem::path& pack_dir);
 // those whose source changed (a translator fix) are compiled again. Compiled DXIL is also kept
 // by its source's content key (dxil\by-source): no source is ever compiled twice, under any
 // marker or translator version. Files from before content keys are adopted as they are.
+// The shader service: compiles what the running game waits for first, then the rest.
+int serve(const std::filesystem::path& pack_dir, const std::filesystem::path& runtime_dir, const std::filesystem::path& out_dir,
+          unsigned jobs);
 int precompile(const std::filesystem::path& pack_dir, const std::filesystem::path& runtime_dir,
                const std::filesystem::path& out_dir, bool all, const std::filesystem::path& hlsl_dir = {},
                bool refresh = false);

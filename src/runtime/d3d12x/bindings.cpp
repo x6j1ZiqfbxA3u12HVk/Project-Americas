@@ -11,7 +11,9 @@
 #include <vector>
 
 #include "core/text.h"
+#include "runtime/d3d12x/formats.h"
 #include "runtime/d3d12x/gpu_memory.h"
+#include "runtime/d3d12x/host.h"
 #include "runtime/d3d12x/layout.h"
 #include "runtime/log.h"
 #include "runtime/memory/write_watch.h"
@@ -213,6 +215,11 @@ struct Bindings {
   std::vector<shader::ImageBinding> images;
   std::vector<shader::SamplerBinding> sampler_bindings;
   std::vector<Texture> textures;
+  // Copies of render targets in another format (see target_has_copies).
+  struct TargetCopy {
+    ComPtr<ID3D12Resource> target, copy;
+  };
+  std::vector<TargetCopy> target_copies;
   bool table_dirty = true;
   ComPtr<ID3D12Resource> table, upload, readback, header_upload;
   uint64_t table_bytes = 0;
@@ -806,6 +813,50 @@ void add_texture(Bindings* b, const D3D12_RESOURCE_DESC& resource, const D3D12_S
     }
     return;
   }
+  // The memory of a render target, viewed in another format of the same size: a texture of that
+  // format, which the target is copied into after each pass that draws into it (the GPU never
+  // writes title memory, and viewing the target itself in that format is not allowed).
+  D3D12_RESOURCE_DESC target_desc{};
+  if (ID3D12Resource* target = host_texture_at(address, &target_desc)) {
+    const D3D12_RESOURCE_DESC td = target->GetDesc();
+    const FormatSize a = format_size(td.Format), c = format_size(resource.Format);
+    if (td.Width == resource.Width && td.Height == resource.Height && td.SampleDesc.Count == 1 && a.bytes && a.bytes == c.bytes &&
+        a.block == 1 && c.block == 1 && td.Format != resource.Format) {
+      D3D12_RESOURCE_DESC cd{};
+      cd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+      cd.Width = width;
+      cd.Height = height;
+      cd.DepthOrArraySize = 1;
+      cd.MipLevels = 1;
+      cd.Format = resource.Format;
+      cd.SampleDesc.Count = 1;
+      D3D12_HEAP_PROPERTIES chp{};
+      chp.Type = D3D12_HEAP_TYPE_DEFAULT;
+      ComPtr<ID3D12Resource> copy;
+      if (FAILED(b->device->CreateCommittedResource(&chp, D3D12_HEAP_FLAG_NONE, &cd, D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                    IID_PPV_ARGS(&copy)))) {
+        return;
+      }
+      copy->SetName(widen("copy of a target, format " + std::to_string(resource.Format) + " at 0x" + hex(address)).c_str());
+      D3D12_CPU_DESCRIPTOR_HANDLE slot{};
+      const uint32_t index = allocate_view_slot(&slot);
+      if (!index) return;
+      D3D12_SHADER_RESOURCE_VIEW_DESC v = view;
+      uint32_t image_flags = 0;
+      if (!host_view_desc(b->device.Get(), resource.Format, v, 1, image_flags)) return;
+      b->device->CreateShaderResourceView(copy.Get(), &v, slot);
+      shader::ImageBinding ib;
+      std::copy(words, words + 8, ib.words);
+      ib.srv = ib.alt = index;
+      ib.flags = image_flags;
+      b->images.push_back(ib);
+      b->target_copies.push_back({target, std::move(copy)});
+      b->table_dirty = true;
+      logf("gpu: texture %ux%u, format %u, at 0x%s: a copy of the render target there (format %u): view %u", width, height,
+           resource.Format, hex(address).c_str(), td.Format, index);
+      return;
+    }
+  }
   Texture t;
   t.address = address;
   t.size = layout.size;
@@ -856,6 +907,30 @@ void notify_title_write(uint64_t address, uint64_t size, bool live) {
       t.dirty = true;
       if (live) t.quiet = 0;
     }
+  }
+}
+
+bool target_has_copies(ID3D12Resource* target) {
+  std::lock_guard g(bindings().lock);
+  for (const auto& c : bindings().target_copies) {
+    if (c.target.Get() == target) return true;
+  }
+  return false;
+}
+
+void copy_target(ID3D12GraphicsCommandList* list, ID3D12Resource* target) {
+  std::lock_guard g(bindings().lock);
+  for (const auto& c : bindings().target_copies) {
+    if (c.target.Get() != target) continue;
+    D3D12_RESOURCE_BARRIER b{};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition = {c.copy.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST};
+    list->ResourceBarrier(1, &b);
+    D3D12_TEXTURE_COPY_LOCATION dst{c.copy.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+    D3D12_TEXTURE_COPY_LOCATION src{target, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+    list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
+    list->ResourceBarrier(1, &b);
   }
 }
 

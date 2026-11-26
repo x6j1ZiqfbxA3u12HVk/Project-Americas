@@ -66,8 +66,14 @@ CompileResult compile_hlsl(std::string_view source, std::string_view entry, std:
     return r;
   }
   const std::wstring wentry = widen(entry), wprofile = widen(profile);
-  std::vector<LPCWSTR> args = {L"-E", wentry.c_str(), L"-T", wprofile.c_str(), L"-HV", L"2021", L"-O3"};
-  for (const std::wstring& a : extra_args) args.push_back(a.c_str());
+  std::vector<LPCWSTR> args = {L"-E", wentry.c_str(), L"-T", wprofile.c_str(), L"-HV", L"2021"};
+  // -O3 unless the caller names an optimization level of its own.
+  bool level = false;
+  for (const std::wstring& a : extra_args) {
+    args.push_back(a.c_str());
+    level = level || (a.size() == 3 && a[0] == L'-' && a[1] == L'O');
+  }
+  if (!level) args.push_back(L"-O3");
   DxcBuffer buffer{source.data(), source.size(), DXC_CP_UTF8};
   ComPtr<IDxcResult> result;
   if (FAILED(compiler->Compile(&buffer, args.data(), static_cast<UINT32>(args.size()), nullptr, IID_PPV_ARGS(&result)))) {
