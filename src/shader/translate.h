@@ -27,7 +27,7 @@
 namespace am::shader {
 
 // Bumped whenever the output for some input changes: part of the cache key.
-constexpr uint32_t kTranslatorVersion = 4;
+constexpr uint32_t kTranslatorVersion = 5;
 
 enum class Binding : uint8_t { Test, Runtime };
 

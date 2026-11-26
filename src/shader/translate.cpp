@@ -51,6 +51,9 @@ struct Ctx {
   uint32_t max_vgpr = 0;
   bool dpp = false;  // this instruction's src0 is am_dpp, and am_dpp_on gates its writes
   bool uses_images = false;
+  // Pixel shader attributes read by the 16-bit interpolation instructions: declared
+  // nointerpolation and interpolated here, from each vertex's bits and SV_Barycentrics.
+  std::set<uint32_t> per_vertex_attrs;
   // Descriptor lookups still valid in this block, by first SGPR (T#s, S#s), and every one made.
   std::set<uint32_t> live_images, live_samplers, image_vars, sampler_vars;
   // Forgets the lookups whose registers [lo, hi] may have changed.
@@ -1310,12 +1313,20 @@ const std::unordered_map<std::string, Handler>& table() {
       else return c.fail("exp to target " + num(tgt));
       std::string body;
       for (uint32_t k = 0; k < 4; ++k) {
-        if (!((en >> k) & 1u)) continue;
+        if (!((en >> k) & 1u) && !(compr && stage == HwStage::Vs && k < 2)) continue;
         std::string value;
         if (compr && stage == HwStage::Ps) {
           const uint32_t r = src[k / 2];
           c.touch_v(r);
           value = "f16tof32(v[" + num(r) + "]" + (k % 2 ? " >> 16" : "") + ")";
+        } else if (compr) {
+          // A vertex shader's 16-bit parameters, two halves a register: VSRC0 holds channels
+          // 0 and 1, VSRC1 channels 2 and 3. The attribute's dwords x and y carry them as bits;
+          // the pixel shader's 16-bit interpolation unpacks them (v_interp_p1ll_f16).
+          if (k >= 2) continue;
+          if (!((en >> (2 * k)) & 3u)) continue;
+          c.touch_v(src[k]);
+          value = "asfloat(v[" + num(src[k]) + "])";
         } else {
           c.touch_v(src[k]);
           value = "asfloat(v[" + num(src[k]) + "])";
@@ -1332,10 +1343,40 @@ const std::unordered_map<std::string, Handler>& table() {
         const uint32_t attr = c.f(Field::ATTR), chan = c.f(Field::ATTRCHAN);
         if (attr >= c.input->inputs.size()) return c.fail("v_interp of attribute " + num(attr) + " beyond the signature");
         static const char* const kChan[] = {"x", "y", "z", "w"};
-        c.vwrite(c.f(Field::VDST), "asuint(am_in.i" + num(attr) + "." + kChan[chan & 3] + ")");
+        c.vwrite(c.f(Field::VDST), "asuint(AM_IN" + num(attr) + "." + kChan[chan & 3] + ")");
         return true;
       };
     }
+    // 16-bit attributes, two halves a dword: SRC0 selects attribute (bits 0-5), channel (6-7)
+    // and half (8). The hardware computes P0 + P10 * i (p1ll; p1lv takes P0 from SRC2) and then
+    // + P20 * j (p2, into a 16-bit result). Here p1 already gives the whole interpolation, from
+    // the three vertices' halves and SV_Barycentrics, and p2 passes its SRC2 on as f16.
+    t["v_interp_p1ll_f16"] = t["v_interp_p1lv_f16"] = [](Ctx& c) {
+      if (c.input->stage != HwStage::Ps) return c.fail("v_interp_p1 f16 outside a pixel shader");
+      const uint32_t sel = c.f(Field::SRC0), attr = sel & 63u, chan = (sel >> 6) & 3u, high = (sel >> 8) & 1u;
+      if (attr >= c.input->inputs.size()) return c.fail("v_interp of attribute " + num(attr) + " beyond the signature");
+      c.per_vertex_attrs.insert(attr);
+      static const char* const kChan[] = {"x", "y", "z", "w"};
+      const auto half = [&](int vtx) {
+        return "f16tof32((am_vtx" + num(attr) + "[" + std::to_string(vtx) + "]." + kChan[chan] + (high ? " >> 16u" : "") + ") & 0xFFFFu)";
+      };
+      std::string value;
+      if (std::string(c.in->info->name) == "v_interp_p1ll_f16") {
+        value = "am_bary.x * " + half(0) + " + am_bary.y * " + half(1) + " + am_bary.z * " + half(2);
+      } else {
+        value = fsrc16(c, 2) + " + am_bary.y * (" + half(1) + " - " + half(0) + ") + am_bary.z * (" + half(2) + " - " + half(0) + ")";
+      }
+      c.vwrite(vop_dst(c), "asuint(" + value + ")");
+      return true;
+    };
+    t["v_interp_p2_f16"] = [](Ctx& c) {
+      if (c.input->stage != HwStage::Ps) return c.fail("v_interp_p2 f16 outside a pixel shader");
+      const uint32_t sel = c.f(Field::SRC0), attr = sel & 63u;
+      if (attr >= c.input->inputs.size()) return c.fail("v_interp of attribute " + num(attr) + " beyond the signature");
+      c.per_vertex_attrs.insert(attr);
+      write16(c, f16_result(c, "asfloat(" + c.src(c.f(Field::SRC2)) + ")"));
+      return true;
+    };
     t["s_barrier"] = [](Ctx& c) {
       c.line("GroupMemoryBarrierWithGroupSync();");
       return true;
@@ -2621,9 +2662,28 @@ Translation finish_graphics(const TranslateInput& in, const Ctx& c, Translation 
   h += "\nstruct AmIn {\n";
   if (!vs) h += "  float4 am_pos : SV_Position;\n";
   for (size_t k = 0; k < in.inputs.size(); ++k) {
-    h += "  float4 i" + num(static_cast<uint32_t>(k)) + " : " + in.inputs[k].semantic + num(in.inputs[k].semantic_index) + ";\n";
+    const bool per_vertex = !vs && c.per_vertex_attrs.count(static_cast<uint32_t>(k));
+    h += std::string("  ") + (per_vertex ? "nointerpolation " : "") + "float4 i" + num(static_cast<uint32_t>(k)) + " : " +
+         in.inputs[k].semantic + num(in.inputs[k].semantic_index) + ";\n";
   }
-  h += "};\nstruct AmOut {\n";
+  // Last, so the attributes keep their registers.
+  if (!vs && !c.per_vertex_attrs.empty()) h += "  float3 am_bary_in : SV_Barycentrics;\n";
+  h += "};\n";
+  if (!vs) {
+    // An attribute's value: interpolated by the host, or here from its three vertices.
+    if (!c.per_vertex_attrs.empty()) h += "static float3 am_bary;\n";
+    for (size_t k = 0; k < in.inputs.size(); ++k) {
+      const std::string n = num(static_cast<uint32_t>(k));
+      if (c.per_vertex_attrs.count(static_cast<uint32_t>(k))) {
+        h += "static uint4 am_vtx" + n + "[3];\n";
+        h += "#define AM_IN" + n + " (am_bary.x * asfloat(am_vtx" + n + "[0]) + am_bary.y * asfloat(am_vtx" + n +
+             "[1]) + am_bary.z * asfloat(am_vtx" + n + "[2]))\n";
+      } else {
+        h += "#define AM_IN" + n + " am_in.i" + n + "\n";
+      }
+    }
+  }
+  h += "struct AmOut {\n";
   if (vs) h += "  float4 pos : SV_Position;\n";
   for (size_t k = 0; k < in.outputs.size(); ++k) {
     h += "  float4 o" + num(static_cast<uint32_t>(k)) + " : " + in.outputs[k].semantic + num(in.outputs[k].semantic_index) + ";\n";
@@ -2667,7 +2727,15 @@ Translation finish_graphics(const TranslateInput& in, const Ctx& c, Translation 
     h += "AmOut main(AmIn am_in, uint am_vid : SV_VertexID, uint am_iid : SV_InstanceID) {\n";
     h += "  AmOut o = (AmOut)0;\n  am_body(am_in, am_vid, am_iid, o);\n  return o;\n}\n";
   } else {
-    h += "AmOut main(AmIn am_in) {\n  AmOut o = (AmOut)0;\n  am_body(am_in, o);\n  return o;\n}\n";
+    std::string fetch;
+    if (!c.per_vertex_attrs.empty()) fetch += "  am_bary = am_in.am_bary_in;\n";
+    for (uint32_t k : c.per_vertex_attrs) {
+      for (int vtx = 0; vtx < 3; ++vtx) {
+        fetch += "  am_vtx" + num(k) + "[" + std::to_string(vtx) + "] = asuint(GetAttributeAtVertex(am_in.i" + num(k) + ", " +
+                 std::to_string(vtx) + "));\n";
+      }
+    }
+    h += "AmOut main(AmIn am_in) {\n  AmOut o = (AmOut)0;\n" + fetch + "  am_body(am_in, o);\n  return o;\n}\n";
   }
   tr.hlsl = std::move(h);
   tr.ok = true;
