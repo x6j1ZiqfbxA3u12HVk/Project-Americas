@@ -97,6 +97,7 @@ struct PipelineState : Object {
   std::string compute_marker;           // its program's
   std::vector<UserSlot> compute_layout;  // where its root parameters go (user-data dwords)
   std::atomic<bool> compute_tried{false};  // a job has run (made or refused)
+  std::atomic<bool> compute_done{false};   // that job has finished: made, refused or not precompiled
   std::atomic<uint64_t> compute_missing_at{0};  // its program was not precompiled at this tick
   std::atomic<bool> compute_urgent{false};  // a dispatch waited: moved to the front once
   uint32_t console_programs = 0;  // slot 57: GPU programs given by address
@@ -316,6 +317,7 @@ void make_host_compute(PipelineState* p, present::HostGpu* gpu, bool large_lane)
     note_wanted(marker);  // for the shader service, before any dispatch waits for it
     ++g_compute_missing;
     p->compute_missing_at = GetTickCount64();
+    p->compute_done = true;
     release(p);
     return;
   }
@@ -342,6 +344,7 @@ void make_host_compute(PipelineState* p, present::HostGpu* gpu, bool large_lane)
     p->host = m->pso;
     p->host_compute.store(p->host.Get(), std::memory_order_release);
   }
+  p->compute_done = true;
   release(p);
 }
 
@@ -488,9 +491,32 @@ ID3D12PipelineState* host_compute_pipeline(const void* object, const void** root
     // Not precompiled then: looked for again a while later (am-shaders serve may have made it).
     uint64_t missing = p->compute_missing_at.load();
     if (missing && GetTickCount64() >= missing + kMissingRetryMs && p->compute_missing_at.compare_exchange_strong(missing, 0)) {
+      p->compute_done = false;
       p->compute_tried = false;
       p->compute_urgent = false;
     }
+  }
+  return host;
+}
+
+ID3D12PipelineState* host_compute_pipeline_waiting(const void* object, const void** root_signature, uint32_t max_ms) {
+  ID3D12PipelineState* host = host_compute_pipeline(object, root_signature);
+  if (host) return host;
+  Object* o = object_of_kind(object, pipeline_kind());
+  if (!o) return nullptr;
+  auto* p = static_cast<PipelineState*>(o);
+  if (!p->compute) return nullptr;
+  const ULONGLONG start = GetTickCount64();
+  // Queued (urgently, by host_compute_pipeline) or being made: wait for the job to finish.
+  while (!(host = p->host_compute.load(std::memory_order_acquire)) && !p->compute_done.load() &&
+         GetTickCount64() < start + max_ms) {
+    Sleep(2);
+  }
+  const ULONGLONG took = GetTickCount64() - start;
+  static std::atomic<int> told{0};
+  if (took >= 500 && told.fetch_add(1, std::memory_order_relaxed) < 24) {
+    logf("gpu: a dispatch waited %llu ms for its host pipeline (%s)", static_cast<unsigned long long>(took),
+         host ? "made" : p->compute_done.load() ? "nothing made" : "still not made: skipped");
   }
   return host;
 }

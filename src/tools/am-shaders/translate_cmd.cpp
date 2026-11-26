@@ -707,11 +707,13 @@ int serve(const fs::path& pack_dir, const fs::path& runtime_dir, const fs::path&
   bool stopping = false;                   // asked to stop: workers take nothing new
   int huge_busy = 0;                       // compiles of over 1 MiB of HLSL running (under `lock`)
   std::vector<std::pair<std::string, bool>> deferred_huge;  // large ones set aside (marker, waited)
-  const int huge_slots = [] {
+  // Room for another large compile (under `lock`): none running, or 4.5 GB of RAM free.
+  const auto huge_room = [&] {
+    if (huge_busy == 0) return true;
     MEMORYSTATUSEX m{sizeof m};
     GlobalMemoryStatusEx(&m);
-    return std::max(1, static_cast<int>((m.ullTotalPhys >> 30) / 12));
-  }();
+    return m.ullAvailPhys > (9ull << 29);
+  };
   bool idle_told = false;
   // The watcher: new lines of wanted-first.txt.
   std::thread([&] {
@@ -799,12 +801,12 @@ int serve(const fs::path& pack_dir, const fs::path& runtime_dir, const fs::path&
     // The largest programs (over 1 MiB of HLSL take DXC minutes) unoptimized: twice as fast to
     // compile, and the driver optimizes the DXIL again when it makes the pipeline.
     const bool huge = t.hlsl.size() > (1u << 20);
-    // DXC takes about 3 GB for the largest: only `huge_slots` of them at a time (one per 12 GB of
-    // RAM), so the service stays small next to a game run. One that finds the slots taken is set
-    // aside and this worker takes the next program: every thread keeps compiling.
+    // DXC takes 3-4 GB for the largest: one more starts only while there is room for it (one
+    // always may), so the service fits next to a game run and uses the cores when there is none.
+    // One that finds no room is set aside and this worker takes the next program.
     if (huge) {
       std::lock_guard<std::mutex> g(lock);
-      if (huge_busy >= huge_slots) {
+      if (!huge_room()) {
         deferred_huge.emplace_back(marker, waited);
         return;
       }
@@ -843,7 +845,7 @@ int serve(const fs::path& pack_dir, const fs::path& runtime_dir, const fs::path&
           std::lock_guard<std::mutex> g(lock);
           if (stopping) return;  // asked to stop: no new work
           // A large program set aside, once a large-compile slot is free.
-          if (huge_busy < huge_slots && !deferred_huge.empty()) {
+          if (!deferred_huge.empty() && huge_room()) {
             marker = deferred_huge.front().first;
             waited = deferred_huge.front().second;
             deferred_huge.erase(deferred_huge.begin());

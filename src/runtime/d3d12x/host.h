@@ -53,6 +53,11 @@ ID3D12PipelineState* host_pipeline(const void* console_pipeline, const void** ro
 // A console compute pipeline's host pipeline (nullptr when it is not a compute pipeline or its
 // program is not precompiled) and its console root signature object.
 ID3D12PipelineState* host_compute_pipeline(const void* console_pipeline, const void** root_signature);
+// The same, but when the program is precompiled and only its host pipeline is still being made
+// (the driver takes seconds, for the largest minutes), waits for it up to `max_ms`: a dispatch
+// skipped would drop the memory writes the title then waits for. A program not precompiled
+// (or refused) returns nullptr at once.
+ID3D12PipelineState* host_compute_pipeline_waiting(const void* console_pipeline, const void** root_signature, uint32_t max_ms);
 // Where a console compute pipeline's root parameters arrive, from its program's metadata: per
 // root parameter the user-data dword it starts at (s<user> for compute), its root type (0
 // constants, 1 root descriptor, 3 table, 5 / 6 heap addresses) and descriptor dwords. nullptr

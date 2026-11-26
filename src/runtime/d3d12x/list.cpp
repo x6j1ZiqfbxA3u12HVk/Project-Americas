@@ -377,7 +377,7 @@ void dispatch(HostList& h, ID3D12GraphicsCommandList* list, const Command& c) {
     return;
   }
   const void* rs_object = nullptr;
-  ID3D12PipelineState* pso = host_compute_pipeline(h.pipeline, &rs_object);
+  ID3D12PipelineState* pso = host_compute_pipeline_waiting(h.pipeline, &rs_object, 120000);
   const RootSignatureDesc* rs = root_signature_desc(h.compute_root_signature ? h.compute_root_signature : rs_object);
   if (!pso || !rs) {
     ++g_dispatches_skipped;
