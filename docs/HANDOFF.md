@@ -1422,3 +1422,36 @@ pressure (analysis in `C:\Project Americas\crash`, WinDbg's cdb in the WinDbg pa
   refused (in order of count): `image_bvh(64)_intersect_ray`, `v_interp of attribute N beyond the
   signature` (pixel shaders reading inputs the PC signature does not list), `image_gather4_l`
   (D3D has no gather at a given level), real indirect jumps.
+
+## Loading: what the runs at 21:00-22:15 showed (2026-11-26, late night)
+
+* **The title's watchdog** (+0x2215a80, a thread of its own) ends the run (+0x23cf620 writes to
+  address 0) after 30 one-second ticks without a main-loop heartbeat, or when a tracked job runs
+  past its limit. The budget is now 600 s, patched in memory (`AMERICAS_TITLE_WATCHDOG_S`).
+  With it, the run to `to-past-stall.txt` lasted its full 20 minutes: 110,000 DirectStorage
+  requests (7.6 GB, the most so far), no crash.
+* **On screen:** the loading screen's background and its spinner (bottom right); no artwork.
+  Frames crawl during loading: 20 frames in a minute between captures 3 and 4. At the end
+  (hang.txt at the timeout) **no thread was running**: the storage workers were idle, the main
+  thread waits on a semaphore (+0x23cf6a0 calls +0x23ceeb0 -> +0x569f0, INFINITE; that is its
+  normal state: it hands the frame loop to other threads). So loading stalls; it is not
+  CPU-bound.
+* **DirectStorage is not the bottleneck:** 7,000, 25,000 and 13,000 requests in the three
+  minutes between captures (up to 1.4 GB a minute), then about 0.25 GB a minute, with its
+  four workers idle at the end. The title asks at the pace of its loading loop.
+* **The ray-tracing stand-in probably hangs the GPU.** DXC refused two raytracing programs with
+  "Loop must have break": with the stand-in's constant answers their traversal loop can never
+  end. Others compiled, and their loops may only end on data the stand-in never gives. The first
+  run after the stand-in lost the device (`0x887a0007`, DXGI_ERROR_DEVICE_RESET), and later runs
+  had "lists still running after 2 s". Next: read one traversal program (am-shaders disasm
+  <marker>) to see what ends its loop, and give answers that end it; or a real intersection.
+* **Pipelines made at draw and dispatch time block the title's recording threads** (the driver
+  compiles every new pipeline the first time; hang.txt showed it inside amdxc64 under a draw).
+  Dispatches now wait at most 5 s a pipeline; graphics pipelines are still made inline.
+* **Service hand-over is too polite:** a replaced service finishing its compiles can take an
+  hour on the largest (6 MB of HLSL took 887 s); the replacement waits idle meanwhile. Better:
+  the new one starts at once and skips what the old one is compiling.
+* Smaller items seen in the console during loading, not done yet: device slot 71 (prebuild
+  sizes), command list slots 85/86 (BVH build and copy) and 101, XG texture computer slot 9,
+  "a shader used a texture we did not make" (all-zero T#s), the 2.1 GiB allocation at
+  0xdc9600000 that cannot be opened for the GPU.
