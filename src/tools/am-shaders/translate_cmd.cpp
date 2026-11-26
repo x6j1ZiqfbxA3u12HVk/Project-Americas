@@ -689,7 +689,10 @@ int serve(const fs::path& pack_dir, const fs::path& runtime_dir, const fs::path&
   std::deque<std::string> urgent;  // what the game waits for, oldest first
   std::set<std::string> taken;     // compiled, compiling, failed or unknown this session
   std::ofstream failures(out_dir / L"failures.tsv", std::ios::app);
-  std::atomic<size_t> compiled{0}, reused{0};
+  std::atomic<size_t> compiled{0}, reused{0}, refused{0};
+  std::map<std::string, size_t> refusals;  // by reason (its first 60 characters)
+  int busy = 0;                            // workers compiling (under `lock`)
+  bool idle_told = false;
   // The watcher: new lines of wanted-first.txt.
   std::thread([&] {
     std::streamoff read = 0;
@@ -742,10 +745,6 @@ int serve(const fs::path& pack_dir, const fs::path& runtime_dir, const fs::path&
       file = files[at.file];
     }
     std::string error;
-    const auto shader = load(file, error);
-    if (!shader) return;
-    const shader::NativeBlob& b = shader->shader.blobs[at.blob];
-    const shader::Translation t = shader::translate(input_of(shader->bytes, b, b.programs[at.program]), shader::Binding::Runtime);
     const auto fail = [&](std::string why) {
       for (char& ch : why) {
         if (ch == '\n' || ch == '\t') ch = ' ';
@@ -753,8 +752,16 @@ int serve(const fs::path& pack_dir, const fs::path& runtime_dir, const fs::path&
       std::lock_guard<std::mutex> g(lock);
       failures << marker << '\t' << shader::hw_stage_name(at.stage) << '\t' << why << '\n';
       failures.flush();
-      if (waited) std::printf("serve: %s %s refused: %s\n", shader::hw_stage_name(at.stage), marker.c_str(), why.substr(0, 120).c_str());
+      ++refused;
+      ++refusals[why.substr(0, 60)];
+      std::printf("  %srefused: %s %s: %s\n", waited ? "waited for, " : "", shader::hw_stage_name(at.stage), marker.c_str(),
+                  why.substr(0, 120).c_str());
+      std::fflush(stdout);
     };
+    const auto shader = load(file, error);
+    if (!shader) return fail("cannot read its container: " + error);
+    const shader::NativeBlob& b = shader->shader.blobs[at.blob];
+    const shader::Translation t = shader::translate(input_of(shader->bytes, b, b.programs[at.program]), shader::Binding::Runtime);
     if (!t.ok) return fail(t.failure);
     const std::string key = source_key(t);
     const fs::path stored = by_source / widen(key + ".dxil");
@@ -805,13 +812,28 @@ int serve(const fs::path& pack_dir, const fs::path& runtime_dir, const fs::path&
             bulk.pop_back();
             if (taken.insert(m).second) marker = m;
           }
+          if (!marker.empty()) {
+            ++busy;
+            idle_told = false;
+          } else if (busy == 0 && !idle_told) {
+            // Nothing left: say so, and why the rest is not compiled.
+            idle_told = true;
+            std::printf("serve: idle, waiting for the game (%zu compiled, %zu reused, %zu refused by the translator)\n",
+                        compiled.load(), reused.load(), refused.load());
+            std::vector<std::pair<size_t, std::string>> top;
+            for (const auto& [why, n] : refusals) top.emplace_back(n, why);
+            std::sort(top.rbegin(), top.rend());
+            for (size_t k = 0; k < top.size() && k < 20; ++k) std::printf("  %5zu  %s\n", top[k].first, top[k].second.c_str());
+            std::fflush(stdout);
+          }
         }
         if (marker.empty()) {
           Sleep(200);
           continue;
         }
-        if (fs::exists(out_dir / widen(marker + ".dxil"), ec)) continue;
-        compile_one(marker, waited);
+        if (!fs::exists(out_dir / widen(marker + ".dxil"), ec)) compile_one(marker, waited);
+        std::lock_guard<std::mutex> g(lock);
+        --busy;
       }
     }).detach();
   }

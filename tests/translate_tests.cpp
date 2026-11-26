@@ -1007,3 +1007,94 @@ TEST_CASE(translate_relative_vgpr_moves) {
   for (int l = 0; l < 64 && ok; ++l) ok = r.v(l, 8) == 33 && r.v(l, 3) == 22;
   CHECK(ok);
 }
+
+// Subtractions with borrow in and out, 64-bit floats, f16 truncation (the high half stays).
+TEST_CASE(translate_borrow_f64_and_f16_trunc) {
+  const Result r = run({
+      0x7E020285,              // v_mov_b32_e32 v1, 5
+      0x7E040287,              // v_mov_b32_e32 v2, 7
+      0xBEEA04C1,              // s_mov_b64 vcc, -1
+      0x52060501,              // v_sub_co_ci_u32_e32 v3, vcc, v1, v2, vcc      5 - 7 - 1, borrow
+      0xBE84046A,              // s_mov_b64 s[4:5], vcc
+      0x54080501,              // v_subrev_co_ci_u32_e32 v4, vcc, v1, v2, vcc   7 - 5 - 1, no borrow
+      0xBE86046A,              // s_mov_b64 s[6:7], vcc
+      0x7E0C0280,              // v_mov_b32_e32 v6, 0
+      0x7E0E02FF, 0x3FF80000,  // v_mov_b32_e32 v7, 0x3ff80000                  v[6:7] = 1.5
+      0xD5640008, 0x0201E506,  // v_add_f64 v[8:9], v[6:7], 1.0
+      0xD54C000A, 0x03C60D06,  // v_fma_f64 v[10:11], v[6:7], v[6:7], -0.5
+      0x7E0A02FF, 0xABCD4100,  // v_mov_b32_e32 v5, 0xabcd4100                  (low half 2.5)
+      0x7E0ABB05,              // v_trunc_f16_e32 v5, v5
+      0xBF810000,              // s_endpgm
+  });
+  if (!r.ran) return;
+  CHECK(r.s(4) == 0xFFFFFFFFu && r.s(5) == 0xFFFFFFFFu);
+  CHECK(r.s(6) == 0 && r.s(7) == 0);
+  bool ok = true;
+  for (uint32_t l = 0; l < 64 && ok; ++l) {
+    ok = r.v(l, 3) == 0xFFFFFFFDu && r.v(l, 4) == 1 && r.v(l, 8) == 0 && r.v(l, 9) == 0x40040000u && r.v(l, 10) == 0 &&
+         r.v(l, 11) == 0x3FFC0000u && r.v(l, 5) == 0xABCD4000u;
+    if (!ok) {
+      std::printf("    lane %u: v3 %08x v4 %08x v[8:9] %08x %08x v[10:11] %08x %08x v5 %08x\n", l, r.v(l, 3), r.v(l, 4), r.v(l, 8),
+                  r.v(l, 9), r.v(l, 10), r.v(l, 11), r.v(l, 5));
+    }
+  }
+  CHECK(ok);
+}
+
+// Narrow LDS reads (zero- and sign-extended, d16_hi), signed LDS min / max, 16-bit buffer stores.
+TEST_CASE(translate_narrow_lds_signed_lds_atomics_and_short_stores) {
+  const uint64_t base = 0x500000000ull;
+  std::vector<uint32_t> memory(256, 0);
+  const uint64_t buf = base + 0x100;
+  memory[0] = static_cast<uint32_t>(buf);
+  memory[1] = static_cast<uint32_t>(buf >> 32) & 0xFFFF;
+  memory[2] = 256;
+  memory[3] = (4 | 5 << 3 | 6 << 6 | 7 << 9) | 56u << 12;
+  const Result r = run(
+      {
+          0xF4080100, 0xFA000000,  // s_load_dwordx4 s[4:7], s[0:1], 0x0
+          0x7E020280,              // v_mov_b32_e32 v1, 0
+          0x7E0402FF, 0x8001FFFE,  // v_mov_b32_e32 v2, 0x8001fffe
+          0xD8340000, 0x00000201,  // ds_write_b32 v1, v2
+          0x7E100284,              // v_mov_b32_e32 v8, 4
+          0xD8340000, 0x00000108,  // ds_write_b32 v8, v1
+          0xD8340004, 0x00000108,  // ds_write_b32 v8, v1 offset:4
+          0xBF8CC07F,              // s_waitcnt lgkmcnt(0)
+          0xD8F00002, 0x03000001,  // ds_read_u16 v3, v1 offset:2
+          0xD8EC0002, 0x04000001,  // ds_read_i16 v4, v1 offset:2
+          0xD8E80001, 0x05000001,  // ds_read_u8 v5, v1 offset:1
+          0xD8E40000, 0x06000001,  // ds_read_i8 v6, v1
+          0x7E0E02FF, 0x11112222,  // v_mov_b32_e32 v7, 0x11112222
+          0xDA9C0000, 0x07000001,  // ds_read_u16_d16_hi v7, v1
+          0x4E1200A0,              // v_subrev_nc_u32_e32 v9, 32, v0               lane - 32
+          0xBF8CC07F,              // s_waitcnt lgkmcnt(0)
+          0xD8180000, 0x00000908,  // ds_max_i32 v8, v9
+          0xD8140004, 0x00000908,  // ds_min_i32 v8, v9 offset:4
+          0xBF8CC07F,              // s_waitcnt lgkmcnt(0)
+          0xD8D80000, 0x0A000008,  // ds_read_b32 v10, v8
+          0xD8D80004, 0x0B000008,  // ds_read_b32 v11, v8 offset:4
+          0x34020081,              // v_lshlrev_b32_e32 v1, 1, v0
+          0x4A0400FF, 0x00000100,  // v_add_nc_u32_e32 v2, 0x100, v0
+          0xE0681000, 0x80010201,  // buffer_store_short v2, v1, s[4:7], 0 offen
+          0xBF8C0070,              // s_waitcnt vmcnt(0) lgkmcnt(0)
+          0xBF810000,              // s_endpgm
+      },
+      {static_cast<uint32_t>(base), static_cast<uint32_t>(base >> 32)}, memory, base);
+  if (!r.ran) return;
+  bool ok = true;
+  for (uint32_t l = 0; l < 64 && ok; ++l) {
+    ok = r.v(l, 3) == 0x8001u && r.v(l, 4) == 0xFFFF8001u && r.v(l, 5) == 0xFFu && r.v(l, 6) == 0xFFFFFFFEu &&
+         r.v(l, 7) == 0xFFFE2222u && r.v(l, 10) == 31u && r.v(l, 11) == 0xFFFFFFE0u;
+    if (!ok) {
+      std::printf("    lane %u: v3 %08x v4 %08x v5 %08x v6 %08x v7 %08x v10 %08x v11 %08x\n", l, r.v(l, 3), r.v(l, 4), r.v(l, 5),
+                  r.v(l, 6), r.v(l, 7), r.v(l, 10), r.v(l, 11));
+    }
+  }
+  CHECK(ok);
+  bool stored = r.memory.size() >= 0x60;
+  for (uint32_t k = 0; k < 32 && stored; ++k) {
+    stored = r.memory[0x40 + k] == ((0x100u + 2 * k) | (0x101u + 2 * k) << 16);
+    if (!stored) std::printf("    word %u: %08x\n", k, r.memory[0x40 + k]);
+  }
+  CHECK(stored);
+}

@@ -358,6 +358,7 @@ enum class ImgKind : uint8_t { Sample, Gather, Load, Store, Atomic, Info, Lod };
 struct ImgOp {
   ImgKind kind;
   bool offset = false, bias = false, compare = false, grads = false, lod = false, implicit = false;
+  bool clamp = false;  // _cl: a level clamp after the coordinates
   uint32_t atomic = 0;
 };
 
@@ -416,7 +417,7 @@ bool image(Ctx& c, const ImgOp& op) {
       align();
     }
     for (int j = 0; j < kCoords[dim]; ++j) co[j] = addr();
-    if (op.lod) lod = addr();
+    if (op.lod || op.clamp) lod = addr();
   }
   if (bad) return c.fail(name + " (address)");
   c.uses_images = true;
@@ -493,7 +494,7 @@ bool image(Ctx& c, const ImgOp& op) {
       const std::string gsel = dim == 3 ? "cc.xyz" : dim == 0 || dim == 4 ? "cc.x" : dim == 2 ? "cc" : "cc.xy";
       const std::string gtype = dim == 3 || dim == 2 ? "float3" : dim == 0 || dim == 4 ? "float" : "float2";
       if (op.compare) {
-        if (!op.lod && op.implicit) return c.fail(name);
+        if (op.clamp || (!op.lod && op.implicit)) return c.fail(name);
         if (dim == 2) return c.fail(name + " (3D compare)");
         c.line("  float4 rf = am_cmp_lz_" + suffix + "(im, sm, " + pos + ", " + fl(cmp) + ").xxxx;");
       } else if (op.implicit || op.grads) {
@@ -517,7 +518,7 @@ bool image(Ctx& c, const ImgOp& op) {
             c.line("  " + gtype + " dx = " + dx + ", dy = " + dy + ";");
           }
         }
-        c.line("  float4 rf = am_grad_" + suffix + "(im, sm, " + pos + ", dx, dy);");
+        c.line("  float4 rf = am_grad_" + suffix + "(im, sm, " + pos + ", dx, dy" + (op.clamp ? ", " + fl(lod) : std::string()) + ");");
       } else {
         c.line("  float4 rf = am_sample_" + suffix + "(im, sm, " + pos + ", " + (op.lod ? fl(lod) : std::string("0.0f")) + ");");
       }
@@ -886,6 +887,13 @@ const std::unordered_map<std::string, Handler>& table() {
     float16(t, "v_rsq_f16", "rsqrt(A)");
     float16(t, "v_floor_f16", "floor(A)");
     float16(t, "v_fract_f16", "frac(A)");
+    float16(t, "v_trunc_f16", "trunc(A)");
+    float16(t, "v_ceil_f16", "ceil(A)");
+    float16(t, "v_rndne_f16", "round(A)");
+    float16(t, "v_exp_f16", "exp2(A)");
+    float16(t, "v_log_f16", "log2(A)");
+    float16(t, "v_sin_f16", "sin(A * 6.2831853f)");
+    float16(t, "v_cos_f16", "cos(A * 6.2831853f)");
     t["v_fmac_f16"] = [](Ctx& c) {
       if (!form16(c)) return false;
       write16(c, f16_result(c, "mad(" + fsrc16(c, 0) + ", " + fsrc16(c, 1) + ", f16tof32(" + c.vdst(vop_dst(c)) + " & 0xFFFFu))"));
@@ -1094,19 +1102,72 @@ const std::unordered_map<std::string, Handler>& table() {
       c.line("}");
       return true;
     };
-    t["v_add_co_ci_u32"] = [](Ctx& c) {
-      if (!plain_form(c)) return false;
-      const bool vop3 = is_vop3(*c.in);
-      const uint32_t in = vop3 ? c.f(Field::SRC2) : 106, out = vop3 ? c.f(Field::SDST) : 106;
-      c.line("{ uint a = " + vsrc(c, 0) + ", b = " + vsrc(c, 1) + "; uint ci = am_lane_bit(s[" + num(in) + "], " +
-             (c.wave64 ? "s[" + num(in + 1) + "]" : std::string("0u")) + ") ? 1u : 0u;");
-      c.line("  uint r = a + b + ci; bool cy = (uint64_t(a) + b + ci) > 0xFFFFFFFFull;");
-      c.line("  uint4 m = WaveActiveBallot(cy && AM_ACT != 0u);");
-      c.line("  if (AM_ACT) " + c.vdst(vop_dst(c)) + " = r;");
-      if (out != 125) c.line("  s[" + num(out) + "] = m.x;" + (c.wave64 ? " s[" + num(out + 1) + "] = m.y;" : std::string()));
-      c.line("}");
-      return true;
-    };
+    // With carry in (VCC, or VOP3's SRC2) and out (VCC, or SDST): a + b + ci; the subtractions
+    // a - b - ci (subrev: b - a - ci) with the borrow as the carry out.
+    for (const int mode : {0, 1, 2}) {
+      static const char* const kNames[] = {"v_add_co_ci_u32", "v_sub_co_ci_u32", "v_subrev_co_ci_u32"};
+      t[kNames[mode]] = [mode](Ctx& c) {
+        if (!plain_form(c)) return false;
+        const bool vop3 = is_vop3(*c.in);
+        const uint32_t in = vop3 ? c.f(Field::SRC2) : 106, out = vop3 ? c.f(Field::SDST) : 106;
+        c.line("{ uint a = " + vsrc(c, mode == 2 ? 1 : 0) + ", b = " + vsrc(c, mode == 2 ? 0 : 1) + "; uint ci = am_lane_bit(s[" +
+               num(in) + "], " + (c.wave64 ? "s[" + num(in + 1) + "]" : std::string("0u")) + ") ? 1u : 0u;");
+        if (mode == 0) c.line("  uint r = a + b + ci; bool cy = (uint64_t(a) + b + ci) > 0xFFFFFFFFull;");
+        else c.line("  uint r = a - b - ci; bool cy = (uint64_t(b) + ci) > uint64_t(a);");
+        c.line("  uint4 m = WaveActiveBallot(cy && AM_ACT != 0u);");
+        c.line("  if (AM_ACT) " + c.vdst(vop_dst(c)) + " = r;");
+        if (out != 125) c.line("  s[" + num(out) + "] = m.x;" + (c.wave64 ? " s[" + num(out + 1) + "] = m.y;" : std::string()));
+        c.line("}");
+        return true;
+      };
+    }
+    // -- 64-bit floats (VOP3): sources are register pairs or constants (the f64 inline values; a
+    // literal is the high dword) --
+    {
+      struct F64 {
+        const char* name;
+        const char* body;
+        int sources;
+      };
+      static const F64 kF64[] = {{"v_add_f64", "(A + B)", 2}, {"v_mul_f64", "(A * B)", 2}, {"v_fma_f64", "fma(A, B, C)", 3},
+                                 {"v_max_f64", "max(A, B)", 2}, {"v_min_f64", "min(A, B)", 2}};
+      for (const F64& op : kF64) {
+        t[op.name] = [op](Ctx& c) {
+          if (!is_vop3(*c.in) || c.in->form != rd::Form::Plain) return c.fail(std::string(op.name) + " form");
+          const rd::Field fields[] = {Field::SRC0, Field::SRC1, Field::SRC2};
+          std::string x[3];
+          for (int k = 0; k < op.sources; ++k) {
+            const uint32_t code = c.f(fields[k]);
+            std::string v;
+            if (code >= 240 && code <= 248) {
+              static const char* const kConst[] = {"0.5", "-0.5", "1.0", "-1.0", "2.0", "-2.0", "4.0", "-4.0", "0.15915494309189535"};
+              v = "double(" + std::string(kConst[code - 240]) + "L)";
+            } else if (code == 255) {
+              v = "asdouble(0u, " + hex32(c.in->literal()) + ")";
+            } else {
+              const std::string u = c.src64(code);
+              v = "asdouble(uint(" + u + "), uint(" + u + " >> 32))";
+            }
+            if ((c.f(Field::ABS) >> k) & 1) v = "abs(" + v + ")";
+            if ((c.f(Field::NEG) >> k) & 1) v = "(-" + v + ")";
+            x[k] = v;
+          }
+          std::string r = fill(op.body, x[0], x[1], x[2]);
+          switch (c.f(Field::OMOD)) {
+            case 1: r = "(" + r + ") * 2.0L"; break;
+            case 2: r = "(" + r + ") * 4.0L"; break;
+            case 3: r = "(" + r + ") * 0.5L"; break;
+            default: break;
+          }
+          if (c.f(Field::CLAMP)) r = "clamp(" + r + ", 0.0L, 1.0L)";
+          const uint32_t d = vop_dst(c);
+          c.touch_v(d + 1);
+          c.line("{ double r = " + r + "; uint lo, hi; asuint(r, lo, hi);");
+          c.line("  if (AM_ACT) { v[" + num(d) + "] = lo; v[" + num(d + 1) + "] = hi; } }");
+          return true;
+        };
+      }
+    }
 
     // -- compares --
     struct Cmp {
@@ -1640,6 +1701,20 @@ const std::unordered_map<std::string, Handler>& table() {
         };
       }
     }
+    // Sub-dword buffer stores: the bytes into their place in the dword (atomically: lanes may
+    // write other bytes of the same dword).
+    for (const auto& [name, mask] : {std::pair{"buffer_store_byte", "0xFFu"}, {"buffer_store_short", "0xFFFFu"}}) {
+      const std::string m = mask;
+      t[name] = [m](Ctx& c) {
+        if (!buffer_address(c)) return false;
+        const uint32_t vd = c.f(Field::VDATA);
+        c.touch_v(vd);
+        c.line("  if (0u < lim) { uint sh = uint(p & 3u) * 8u; am_store_masked(p & ~uint64_t(3), (v[" + num(vd) + "] & " + m +
+               ") << sh, " + m + " << sh); }");
+        c.line("}");
+        return true;
+      };
+    }
     // -- atomics: 32-bit; GLC returns the value before. The ops' numbers are am_atomic's: 0-10 the
     // integer ones below, 11 and 12 the float min and max (global only so far). --
     {
@@ -1696,6 +1771,14 @@ const std::unordered_map<std::string, Handler>& table() {
       o = ImgOp{ImgKind::Sample};
       o.grads = true;
       add("image_sample_d", o);
+      o.clamp = true;
+      add("image_sample_d_cl", o);
+      o = ImgOp{ImgKind::Sample};
+      o.implicit = true;
+      o.clamp = true;
+      add("image_sample_cl", o);
+      o.bias = true;
+      add("image_sample_b_cl", o);
       o = ImgOp{ImgKind::Sample};
       o.compare = true;
       add("image_sample_c_lz", o);
@@ -1756,6 +1839,71 @@ const std::unordered_map<std::string, Handler>& table() {
              "InterlockedOr(am_lds[a >> 2], (v[" + num(c.f(Field::DATA0)) + "] & 0xFFFFu) << sh, o); }");
       return true;
     };
+    // Narrow LDS reads: the bytes of their dword, zero- or sign-extended; the d16 forms put 16
+    // bits into the low (or, _hi, the high) half and keep the other half.
+    {
+      struct NarrowRead {
+        const char* name;
+        const char* expr;  // of x, the bytes in the low bits
+        int half;          // 0: the whole register, 1: its low half, 2: its high half
+      };
+      static const NarrowRead kReads[] = {{"ds_read_u8", "(x & 0xFFu)", 0},           {"ds_read_i8", "uint(int(x << 24) >> 24)", 0},
+                                          {"ds_read_u16", "(x & 0xFFFFu)", 0},         {"ds_read_i16", "uint(int(x << 16) >> 16)", 0},
+                                          {"ds_read_u16_d16", "(x & 0xFFFFu)", 1},     {"ds_read_u16_d16_hi", "(x & 0xFFFFu)", 2},
+                                          {"ds_read_u8_d16", "(x & 0xFFu)", 1},        {"ds_read_u8_d16_hi", "(x & 0xFFu)", 2},
+                                          {"ds_read_i8_d16", "(uint(int(x << 24) >> 24) & 0xFFFFu)", 1},
+                                          {"ds_read_i8_d16_hi", "(uint(int(x << 24) >> 24) & 0xFFFFu)", 2}};
+      for (const NarrowRead& r : kReads) {
+        t[r.name] = [r](Ctx& c) {
+          c.uses_lds = true;
+          const uint32_t a = c.f(Field::ADDR), d = c.f(Field::VDST);
+          c.touch_v(a);
+          const std::string dst = c.vdst(d);
+          c.line("if (AM_ACT) { uint b = v[" + num(a) + "] + " + num(c.f(Field::OFFSET0) | c.f(Field::OFFSET1) << 8) +
+                 "u; uint x = am_lds[b >> 2] >> ((b & 3u) * 8u); uint y = " + r.expr + ";");
+          if (r.half == 0) c.line("  " + dst + " = y; }");
+          else if (r.half == 1) c.line("  " + dst + " = (" + dst + " & 0xFFFF0000u) | y; }");
+          else c.line("  " + dst + " = (" + dst + " & 0xFFFFu) | (y << 16); }");
+          return true;
+        };
+      }
+      struct NarrowWrite {
+        const char* name;
+        uint32_t mask, shift;  // the bits of DATA0 written: (DATA0 >> shift) & mask
+      };
+      static const NarrowWrite kWrites[] = {{"ds_write_b8", 0xFF, 0}, {"ds_write_b8_d16_hi", 0xFF, 16}, {"ds_write_b16_d16_hi", 0xFFFF, 16}};
+      for (const NarrowWrite& w : kWrites) {
+        t[w.name] = [w](Ctx& c) {
+          c.uses_lds = true;
+          c.touch_v(c.f(Field::ADDR));
+          c.touch_v(c.f(Field::DATA0));
+          const std::string m = hex32(w.mask);
+          c.line("if (AM_ACT) { uint a = v[" + num(c.f(Field::ADDR)) + "] + " + num(c.f(Field::OFFSET0) | c.f(Field::OFFSET1) << 8) +
+                 "u; uint sh = (a & 3u) * 8u; uint o; InterlockedAnd(am_lds[a >> 2], ~(" + m + " << sh), o); "
+                 "InterlockedOr(am_lds[a >> 2], ((v[" + num(c.f(Field::DATA0)) + "] >> " + num(w.shift) + "u) & " + m + ") << sh, o); }");
+          return true;
+        };
+      }
+      // Signed min / max on the unsigned LDS words: a compare-and-swap loop.
+      for (const bool is_max : {false, true}) {
+        for (const bool rtn : {false, true}) {
+          const std::string name = std::string("ds_") + (is_max ? "max" : "min") + (rtn ? "_rtn" : "") + "_i32";
+          t[name] = [is_max, rtn](Ctx& c) {
+            c.uses_lds = true;
+            const uint32_t a = c.f(Field::ADDR), d0 = c.f(Field::DATA0);
+            c.touch_v(a);
+            c.touch_v(d0);
+            c.line("if (AM_ACT) { uint b = (v[" + num(a) + "] + " + num(c.f(Field::OFFSET0) | c.f(Field::OFFSET1) << 8) +
+                   "u) >> 2; uint o = am_lds[b];");
+            c.line(std::string("  for (uint k = 0u; k < 1024u; ++k) { uint n = asuint(") + (is_max ? "max" : "min") + "(asint(o), asint(v[" +
+                   num(d0) + "]))); uint q; InterlockedCompareExchange(am_lds[b], o, n, q); if (q == o) break; o = q; }");
+            if (rtn) c.line("  " + c.vdst(c.f(Field::VDST)) + " = o;");
+            c.line("}");
+            return true;
+          };
+        }
+      }
+    }
     // Compare and store: the dword becomes DATA1 where it equals DATA0; the value before returns.
     t["ds_cmpst_rtn_b32"] = [](Ctx& c) {
       c.uses_lds = true;
@@ -2262,28 +2410,29 @@ float2 am_lod_cube(AmImage im, AmSampler sm, float3 dx, float3 dy) {
 }
 )";
 const char* kImageHelpers2 = R"(// Sampling with gradients (given, or taken across the console's quads of lanes).
-float4 am_grad_1d(AmImage im, AmSampler sm, float2 c, float dx, float dy) {
+// `cl`: the _cl forms' clamp, the least (finest) level a sample reads; 0 clamps nothing.
+float4 am_grad_1d(AmImage im, AmSampler sm, float2 c, float dx, float dy, float cl = 0.0f) {
   if (!AM_SAMPLED(im, sm)) return 0.0f;
   SamplerState s = SamplerDescriptorHeap[sm.index];
-  if (AM_ARR(im)) { Texture1DArray<float4> t = ResourceDescriptorHeap[im.srv]; return t.SampleGrad(s, c, dx, dy); }
-  Texture1D<float4> t1 = ResourceDescriptorHeap[im.srv]; return t1.SampleGrad(s, c.x, dx, dy);
+  if (AM_ARR(im)) { Texture1DArray<float4> t = ResourceDescriptorHeap[im.srv]; return t.SampleGrad(s, c, dx, dy, 0, cl); }
+  Texture1D<float4> t1 = ResourceDescriptorHeap[im.srv]; return t1.SampleGrad(s, c.x, dx, dy, 0, cl);
 }
-float4 am_grad_2d(AmImage im, AmSampler sm, float3 c, float2 dx, float2 dy) {
+float4 am_grad_2d(AmImage im, AmSampler sm, float3 c, float2 dx, float2 dy, float cl = 0.0f) {
   if (!AM_SAMPLED(im, sm)) return 0.0f;
   SamplerState s = SamplerDescriptorHeap[sm.index];
-  if (AM_ARR(im)) { Texture2DArray<float4> t = ResourceDescriptorHeap[im.srv]; return t.SampleGrad(s, c, dx, dy); }
-  Texture2D<float4> t1 = ResourceDescriptorHeap[im.srv]; return t1.SampleGrad(s, c.xy, dx, dy);
+  if (AM_ARR(im)) { Texture2DArray<float4> t = ResourceDescriptorHeap[im.srv]; return t.SampleGrad(s, c, dx, dy, int2(0, 0), cl); }
+  Texture2D<float4> t1 = ResourceDescriptorHeap[im.srv]; return t1.SampleGrad(s, c.xy, dx, dy, int2(0, 0), cl);
 }
-float4 am_grad_3d(AmImage im, AmSampler sm, float3 c, float3 dx, float3 dy) {
+float4 am_grad_3d(AmImage im, AmSampler sm, float3 c, float3 dx, float3 dy, float cl = 0.0f) {
   if (!AM_SAMPLED(im, sm)) return 0.0f;
   SamplerState s = SamplerDescriptorHeap[sm.index];
-  Texture3D<float4> t = ResourceDescriptorHeap[im.srv]; return t.SampleGrad(s, c, dx, dy);
+  Texture3D<float4> t = ResourceDescriptorHeap[im.srv]; return t.SampleGrad(s, c, dx, dy, int3(0, 0, 0), cl);
 }
-float4 am_grad_cube(AmImage im, AmSampler sm, float4 c, float3 dx, float3 dy) {
+float4 am_grad_cube(AmImage im, AmSampler sm, float4 c, float3 dx, float3 dy, float cl = 0.0f) {
   if (!AM_SAMPLED(im, sm)) return 0.0f;
   SamplerState s = SamplerDescriptorHeap[sm.index];
-  if (AM_ARR(im)) { TextureCubeArray<float4> t = ResourceDescriptorHeap[im.srv]; return t.SampleGrad(s, c, dx, dy); }
-  TextureCube<float4> t1 = ResourceDescriptorHeap[im.srv]; return t1.SampleGrad(s, c.xyz, dx, dy);
+  if (AM_ARR(im)) { TextureCubeArray<float4> t = ResourceDescriptorHeap[im.srv]; return t.SampleGrad(s, c, dx, dy, cl); }
+  TextureCube<float4> t1 = ResourceDescriptorHeap[im.srv]; return t1.SampleGrad(s, c.xyz, dx, dy, cl);
 }
 // Depth compares at level 0, with the S#'s comparison.
 float am_cmp_lz_1d(AmImage im, AmSampler sm, float2 c, float ref) {

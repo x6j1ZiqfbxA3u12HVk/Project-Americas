@@ -1333,13 +1333,13 @@ pressure (analysis in `C:\Project Americas\crash`, WinDbg's cdb in the WinDbg pa
   session, and ended with it (no crash: Windows' event log shows none after 18:00). Nothing
   started it again.
 * **Now a game run starts it** (`runtime/shader_service.cpp`), when the title creates its D3D12
-  device: from a copy in `cache\shaders\servicem-shaders-<size>-<time>.exe` (so builds can
+  device: from a copy in `cache\shaders\service\am-shaders-<size>-<time>.exe` (so builds can
   replace `am-shaders.exe` freely; no more renaming aside), below normal priority, outside the
   run's job (`CREATE_BREAKAWAY_FROM_JOB`; inside it, with a log line saying so, when a job refuses),
   output appended to `logs\serve.txt`. It keeps running after the game ends.
-* One service at a time (`Local\AmericasShaderService` mutex); `cache\shaders\serviceunning.txt`
+* One service at a time (`Local\AmericasShaderService` mutex); `cache\shaders\service\running.txt`
   names the executable it runs from. When a run finds that build differs from
-  `binm-shaders.exe` (a new translator), it sets `Local\AmericasShaderServiceStop`; the old
+  `bin\am-shaders.exe` (a new translator), it sets `Local\AmericasShaderServiceStop`; the old
   service ends at once (files are written under temporary names, so a stop mid-write leaves
   nothing half-written) and the new one starts.
 * Jobs: about half the host's threads (3 here); `americas.ini` `shader_jobs = N`,

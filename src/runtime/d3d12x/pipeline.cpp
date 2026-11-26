@@ -73,8 +73,21 @@ struct ConsolePipeline {
   std::map<std::vector<uint32_t>, Microsoft::WRL::ComPtr<ID3D12PipelineState>> made;
 };
 
+// A stream pipeline's host description, kept while its shaders are not all precompiled: draws
+// look for them again every kMissingRetryMs (am-shaders serve compiles them meanwhile).
+struct StreamHost {
+  D3D12_GRAPHICS_PIPELINE_STATE_DESC desc{};  // VS, PS, GS and the input layout filled in when made
+  std::vector<D3D12_INPUT_ELEMENT_DESC> elements;
+  std::vector<std::string> names;
+  bool rect_list = false;
+  std::mutex lock;
+  uint64_t retry_at = 0;
+  bool done = false;  // made, or never can be (a stage we do not translate, stages that do not link)
+};
+
 struct PipelineState : Object {
   const char* made_by = "";
+  std::unique_ptr<StreamHost> stream;  // stream pipelines (slot 86) until their host pipeline is made
   Object* root_signature = nullptr;  // referenced
   std::vector<Shader> shaders;
   uint64_t extra[2] = {};
@@ -390,6 +403,54 @@ std::string describe_pipeline(const void* object) {
   return text;
 }
 
+// A stream pipeline's host pipeline from its kept description (p->stream->lock held). A shader
+// not precompiled yet is listed for the shader service, and draws try again a while later.
+void make_stream_host(PipelineState* p) {
+  StreamHost& s = *p->stream;
+  if (s.done || GetTickCount64() < s.retry_at) return;
+  D3D12_GRAPHICS_PIPELINE_STATE_DESC host = s.desc;
+  std::vector<std::vector<uint8_t>> dxil;
+  bool all = !p->shaders.empty(), missing = false;
+  for (const Shader& sh : p->shaders) {
+    if (sh.stage != D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS && sh.stage != D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS) {
+      all = false;
+      break;
+    }
+    const std::string marker = program_marker(sh.bytecode, sh.stage);
+    std::vector<uint8_t> code;
+    if (!load_precompiled(marker, code)) {
+      note_wanted(marker);  // every missing one, so the service compiles them together
+      missing = true;
+      continue;
+    }
+    dxil.push_back(std::move(code));
+    (sh.stage == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS ? host.VS : host.PS) = {dxil.back().data(), dxil.back().size()};
+  }
+  if (all && missing) {
+    s.retry_at = GetTickCount64() + kMissingRetryMs;
+    return;
+  }
+  s.done = true;
+  if (!all) return;
+  std::vector<uint8_t> gs;
+  if (host.VS.pShaderBytecode) {
+    // A rect list, or stages that do not link, get a geometry shader (geometry_shader).
+    bool failed = false;
+    const auto bytes = [](const D3D12_SHADER_BYTECODE& b) {
+      const auto* q = static_cast<const uint8_t*>(b.pShaderBytecode);
+      return q ? std::vector<uint8_t>(q, q + b.BytecodeLength) : std::vector<uint8_t>{};
+    };
+    gs = geometry_shader(bytes(host.VS), bytes(host.PS), s.rect_list, failed);
+    if (!gs.empty()) host.GS = {gs.data(), gs.size()};
+    if (failed) return;
+  }
+  for (size_t k = 0; k < s.elements.size(); ++k) s.elements[k].SemanticName = s.names[k].c_str();
+  host.InputLayout = {s.elements.empty() ? nullptr : s.elements.data(), static_cast<UINT>(s.elements.size())};
+  // The host's typeless or sRGB render-target formats come from the title's view at draw time;
+  // the pipeline takes the description's.
+  p->host.Attach(make_host_graphics_pipeline(host, "a stream pipeline"));
+}
+
 ID3D12PipelineState* host_pipeline(const void* object, const void** root_signature, const DXGI_FORMAT* targets,
                                    uint32_t target_count, DXGI_FORMAT depth, bool rect_list) {
   Object* o = object_of_kind(object, pipeline_kind());
@@ -397,6 +458,11 @@ ID3D12PipelineState* host_pipeline(const void* object, const void** root_signatu
   auto* p = static_cast<PipelineState*>(o);
   if (root_signature) *root_signature = p->root_signature;
   if (p->compute) return nullptr;  // compute pipelines: host_compute_pipeline
+  if (p->stream) {
+    std::lock_guard g(p->stream->lock);
+    make_stream_host(p);
+    return p->host.Get();
+  }
   if (p->host) return p->host.Get();
   return p->console ? console_host_pipeline(*p->console, targets, target_count, depth, rect_list) : nullptr;
 }
@@ -532,21 +598,6 @@ HRESULT create_pipeline_from_stream(const D3D12_PIPELINE_STATE_STREAM_DESC* desc
     }
     at += size;
   }
-  // The host pipeline, when every shader has been compiled ahead of time.
-  std::vector<std::vector<uint8_t>> dxil;
-  bool all = !p->shaders.empty();
-  for (const Shader& sh : p->shaders) {
-    std::vector<uint8_t> code;
-    if (sh.stage != D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS && sh.stage != D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS) all = false;
-    if (!all || !load_precompiled(program_marker(sh.bytecode, sh.stage), code)) {
-      all = false;
-      break;
-    }
-    (sh.stage == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS ? host.VS : host.PS) = {nullptr, 0};
-    dxil.push_back(std::move(code));
-    D3D12_SHADER_BYTECODE& b = sh.stage == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS ? host.VS : host.PS;
-    b = {dxil.back().data(), dxil.back().size()};
-  }
   // The console's rect-list topology type (19; draws use topology 17): triangles, each made a
   // rectangle by a geometry shader.
   constexpr uint32_t kRectListType = 19;
@@ -558,24 +609,15 @@ HRESULT create_pipeline_from_stream(const D3D12_PIPELINE_STATE_STREAM_DESC* desc
       logf("d3d12x: a stream pipeline's topology type %u", static_cast<unsigned>(host.PrimitiveTopologyType));
     }
   }
-  std::vector<uint8_t> gs;
-  if (all && host.VS.pShaderBytecode) {
-    // A rect list, or stages that do not link, get a geometry shader (geometry_shader).
-    bool failed = false;
-    const auto bytes = [](const D3D12_SHADER_BYTECODE& b) {
-      const auto* q = static_cast<const uint8_t*>(b.pShaderBytecode);
-      return q ? std::vector<uint8_t>(q, q + b.BytecodeLength) : std::vector<uint8_t>{};
-    };
-    gs = geometry_shader(bytes(host.VS), bytes(host.PS), rect_list, failed);
-    if (!gs.empty()) host.GS = {gs.data(), gs.size()};
-    if (failed) all = false;
-  }
-  if (all) {
-    for (size_t k = 0; k < elements.size(); ++k) elements[k].SemanticName = names[k].c_str();
-    host.InputLayout = {elements.empty() ? nullptr : elements.data(), static_cast<UINT>(elements.size())};
-    // The host's typeless or sRGB render-target formats come from the title's view at draw time;
-    // the pipeline takes the description's.
-    p->host.Attach(make_host_graphics_pipeline(host, "a stream pipeline"));
+  // The host pipeline, when every shader has been compiled ahead of time; else draws try again.
+  p->stream = std::make_unique<StreamHost>();
+  p->stream->desc = host;
+  p->stream->elements = std::move(elements);
+  p->stream->names = std::move(names);
+  p->stream->rect_list = rect_list;
+  {
+    std::lock_guard g(p->stream->lock);
+    make_stream_host(p);
   }
   static std::atomic<int> logged{0};
   if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
@@ -1090,7 +1132,19 @@ HRESULT create_derived_pipeline(const void* base, UINT count, const void* desc, 
   p->shaders = b->shaders;
   p->console_programs = b->console_programs;
   p->console_name = b->console_name;
-  p->host = b->host;  // a stream pipeline's: its blend state stays the base's for now
+  if (b->stream) {
+    // A stream pipeline's description, made into a host pipeline of its own (with the replaced
+    // blend state) once its shaders are there.
+    StreamHost& bs = *b->stream;
+    std::lock_guard g(bs.lock);
+    p->stream = std::make_unique<StreamHost>();
+    p->stream->desc = bs.desc;
+    p->stream->elements = bs.elements;
+    p->stream->names = bs.names;
+    p->stream->rect_list = bs.rect_list;
+  } else {
+    p->host = b->host;
+  }
   if (b->console) {
     p->console = std::make_unique<ConsolePipeline>();
     p->console->markers = b->console->markers;
@@ -1110,10 +1164,15 @@ HRESULT create_derived_pipeline(const void* base, UINT count, const void* desc, 
     p->console->has_blend_desc = true;
     p->console->blend_desc = blend;
   }
+  if (p->stream) {
+    if (is_blend) p->stream->desc.BlendState = blend;
+    std::lock_guard g(p->stream->lock);
+    make_stream_host(p);
+  }
   static std::atomic<int> logged{0};
   if (logged.fetch_add(1, std::memory_order_relaxed) < 8 || (!is_blend && logged.load() < 64)) {
     logf("d3d12x: slot 55: %s derived (%u descriptions, the first of type %u)%s = %p", b->made_by, count, type,
-         p->console || p->host ? "" : " (the base has no host pipeline)", static_cast<void*>(p));
+         p->console || p->host || p->stream ? "" : " (the base has no host pipeline)", static_cast<void*>(p));
   }
   *out = p;
   return S_OK;
