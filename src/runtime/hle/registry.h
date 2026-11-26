@@ -34,6 +34,7 @@ void add_network(std::vector<Function>& out);
 void add_memory(std::vector<Function>& out);
 void add_graphics(std::vector<Function>& out);
 void add_audio(std::vector<Function>& out);          // AcpHal.dll
+void add_malloc_trace(std::vector<Function>& out);   // AMERICAS_TRACE_MALLOC: the CRT heap, traced
 void add_audio_streams(std::vector<Function>& out);  // xapu.dll, chad.dll
 
 }  // namespace am::rt::hle

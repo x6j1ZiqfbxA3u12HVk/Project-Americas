@@ -21,6 +21,7 @@ add_library(am_runtime STATIC
   memory/title_memory.cpp
   memory/write_watch.cpp
   hle/audio.cpp
+  hle/malloc_trace.cpp
   hle/audio_streams.cpp
   hle/d3d12x.cpp
   d3d12x/bindings.cpp

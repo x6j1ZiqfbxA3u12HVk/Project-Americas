@@ -341,10 +341,15 @@ void queue_host_compute(PipelineState* p, bool front) {
   }, front);
 }
 
+// A compute pipeline is made when a dispatch first asks for it (host_compute_pipeline), not
+// when the title creates it: the title creates thousands at boot, and the driver's compiler
+// kept ~15 GB of commit after making them all, which starved the run of memory past Confirm.
+// AMERICAS_EAGER_COMPUTE=1 makes them all at creation again.
 void start_host_compute(PipelineState* p, const std::string& marker) {
   p->compute = true;
   p->compute_marker = marker;
-  queue_host_compute(p, false);
+  static const bool eager = GetEnvironmentVariableA("AMERICAS_EAGER_COMPUTE", nullptr, 0) != 0;
+  if (eager) queue_host_compute(p, false);
 }
 
 void log_first_bytes(const char* how, const void* desc, const PipelineState* p) {

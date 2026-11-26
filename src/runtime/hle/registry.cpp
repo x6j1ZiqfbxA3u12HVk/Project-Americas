@@ -6,6 +6,7 @@
 namespace am::rt::hle {
 
 Registry::Registry() {
+  add_malloc_trace(functions_);  // first: found before any other entry for these names
   add_identity(functions_);
   add_system(functions_);
   add_network(functions_);

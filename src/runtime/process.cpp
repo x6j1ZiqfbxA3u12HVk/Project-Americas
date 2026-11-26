@@ -385,6 +385,8 @@ void* TitleProcess::resolve_import(std::string_view dll_view, std::string_view f
       if (const hle::Function* f = registry_.find_wrapper(fn)) return f->address;
       return stubs_.stub(dll, label, "needs console behaviour we do not provide yet; refused");
     case loader::Route::Host:
+      // Diagnosis hooks over host functions (AMERICAS_TRACE_MALLOC) are registered by module.
+      if (const hle::Function* f = fn.empty() ? nullptr : registry_.find(dll, fn)) return f->address;
       if (HMODULE h = host_module(dll)) {
         const FARPROC p = (by_ordinal && fn.empty()) ? GetProcAddress(h, MAKEINTRESOURCEA(ordinal))
                                                      : GetProcAddress(h, fn.c_str());
