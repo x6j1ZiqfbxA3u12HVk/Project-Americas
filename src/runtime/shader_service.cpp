@@ -165,7 +165,10 @@ void start_now() {
     }
   }
   const unsigned threads = std::max(1u, std::thread::hardware_concurrency());
-  const unsigned jobs = g_jobs ? g_jobs : std::max(1u, threads / 2 - (threads >= 4 ? 1 : 0));
+  // One compile per thread but one (DXC uses one thread a compile; the service runs below
+  // normal priority, so the game's threads come first). Large compiles are limited by memory
+  // in the service itself.
+  const unsigned jobs = g_jobs ? g_jobs : std::max(1u, threads - 1);
   std::string how;
   if (launch(copy, dir, jobs, how)) {
     logf("shader service: started, %u jobs, %s; its log is %s", jobs, how.c_str(), narrow((g_logs / L"serve.txt").wstring()).c_str());

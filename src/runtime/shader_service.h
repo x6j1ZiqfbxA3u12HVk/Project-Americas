@@ -12,7 +12,7 @@ namespace am::rt {
 // and keeps running after the game ends.
 //
 // `enabled` false (americas.ini `shader_service = off`, or --no-shader-service) never starts
-// one; `jobs` 0 picks about half the host's threads.
+// one; `jobs` 0 picks one per host thread but one.
 void configure_shader_service(bool enabled, unsigned jobs, const std::filesystem::path& cache_dir,
                               const std::filesystem::path& logs_dir);
 // Starts the service if configured and needed, on a thread of its own; only the first call acts.

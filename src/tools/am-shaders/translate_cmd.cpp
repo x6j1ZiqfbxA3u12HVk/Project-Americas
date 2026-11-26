@@ -706,7 +706,7 @@ int serve(const fs::path& pack_dir, const fs::path& runtime_dir, const fs::path&
   int busy = 0;                            // workers compiling (under `lock`)
   bool stopping = false;                   // asked to stop: workers take nothing new
   int huge_busy = 0;                       // compiles of over 1 MiB of HLSL running (under `lock`)
-  std::condition_variable huge_free;
+  std::vector<std::pair<std::string, bool>> deferred_huge;  // large ones set aside (marker, waited)
   const int huge_slots = [] {
     MEMORYSTATUSEX m{sizeof m};
     GlobalMemoryStatusEx(&m);
@@ -800,17 +800,20 @@ int serve(const fs::path& pack_dir, const fs::path& runtime_dir, const fs::path&
     // compile, and the driver optimizes the DXIL again when it makes the pipeline.
     const bool huge = t.hlsl.size() > (1u << 20);
     // DXC takes about 3 GB for the largest: only `huge_slots` of them at a time (one per 12 GB of
-    // RAM), so the service stays small next to a game run; small programs go on meanwhile.
+    // RAM), so the service stays small next to a game run. One that finds the slots taken is set
+    // aside and this worker takes the next program: every thread keeps compiling.
     if (huge) {
-      std::unique_lock<std::mutex> g(lock);
-      huge_free.wait(g, [&] { return huge_busy < huge_slots; });
+      std::lock_guard<std::mutex> g(lock);
+      if (huge_busy >= huge_slots) {
+        deferred_huge.emplace_back(marker, waited);
+        return;
+      }
       ++huge_busy;
     }
     const host::CompileResult c = host::compile_hlsl(t.hlsl, t.entry, t.profile, huge ? std::vector<std::wstring>{L"-O0"} : std::vector<std::wstring>{});
     if (huge) {
       std::lock_guard<std::mutex> g(lock);
       --huge_busy;
-      huge_free.notify_one();
     }
     const double took = std::chrono::duration<double>(std::chrono::steady_clock::now() - c0).count();
     if (!c.ok) return fail("DXC: " + c.messages.substr(0, 200));
@@ -839,6 +842,12 @@ int serve(const fs::path& pack_dir, const fs::path& runtime_dir, const fs::path&
         {
           std::lock_guard<std::mutex> g(lock);
           if (stopping) return;  // asked to stop: no new work
+          // A large program set aside, once a large-compile slot is free.
+          if (huge_busy < huge_slots && !deferred_huge.empty()) {
+            marker = deferred_huge.front().first;
+            waited = deferred_huge.front().second;
+            deferred_huge.erase(deferred_huge.begin());
+          }
           while (!urgent.empty() && marker.empty()) {
             std::string m = urgent.front();
             urgent.pop_front();
@@ -852,7 +861,7 @@ int serve(const fs::path& pack_dir, const fs::path& runtime_dir, const fs::path&
           if (!marker.empty()) {
             ++busy;
             idle_told = false;
-          } else if (busy == 0 && !idle_told) {
+          } else if (busy == 0 && deferred_huge.empty() && !idle_told) {
             // Nothing left: say so, and why the rest is not compiled.
             idle_told = true;
             std::printf("serve: idle, waiting for the game (%zu compiled, %zu reused, %zu refused by the translator)\n",

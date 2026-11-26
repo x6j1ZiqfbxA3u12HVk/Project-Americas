@@ -1342,7 +1342,7 @@ pressure (analysis in `C:\Project Americas\crash`, WinDbg's cdb in the WinDbg pa
   `bin\am-shaders.exe` (a new translator), it sets `Local\AmericasShaderServiceStop`; the old
   service ends at once (files are written under temporary names, so a stop mid-write leaves
   nothing half-written) and the new one starts.
-* Jobs: about half the host's threads (3 here); `americas.ini` `shader_jobs = N`,
+* Jobs: one per CPU thread but one (7 here; the largest compiles one per 12 GB of RAM); `americas.ini` `shader_jobs = N`,
   `shader_service = off`, or `--no-shader-service` on the command line.
 * Started by hand it still works as before (`am-shaders serve 3`); a second one exits at once.
 * **"No compiling going on", the second time:** the service was running but idle. Every
