@@ -1296,3 +1296,17 @@ pressure (analysis in `C:\Project Americas\crash`, WinDbg's cdb in the WinDbg pa
   draw is issued at all; the title's loading-screen art may wait on the same stuck work.
 * **am-shaders died on the largest programs with a stack overflow (0xC00000FD)**, not memory:
   DXC recurses deeply on 2 MB of HLSL. It now links with a 256 MiB stack reservation.
+* **The three calls, read from their call sites (next task: raytracing):**
+  * List slot 85 (`vtable+0x2a8`, game+0x4f49b7): called in a loop, once per item, with a
+    description pointer, two u32 from `[r15+0x20]`/`[r15+0x24]`, and on the stack 0, a
+    pointer, a pointer to a local, 0: the shape of DXR's BuildRaytracingAccelerationStructure.
+  * List slot 86 (`+0x2b0`, game+0x4f4b4c): `(dest, source, 0)`: CopyRaytracingAcceleration-
+    Structure, mode 0 (clone), by its shape.
+  * Device slot 71 (`+0x238`, game+0x511f261): a description (a field `0x20004` at +0x30) and
+    two output pointers, the fourth argument `[r12+0x18]`: the prebuild-info query (sizes)
+    by its shape; we answer nothing, so the sizes the title uses are whatever was there.
+  * The title's lists then wait for values (reference 3435) that the work after these builds
+    would write; its watchdog trips on the missing progress. Options: implement DXR (the host
+    has it: map the console descriptions to D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC),
+    or answer the prebuild query with sizes and make the builds no-ops, so the frame's work runs
+    and the waited-for values get written (raytraced effects then show nothing).
