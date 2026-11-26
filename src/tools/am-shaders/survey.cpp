@@ -201,10 +201,37 @@ int survey(const fs::path& pack_dir, const fs::path& out_json) {
   return 0;
 }
 
+// The 24-byte marker a program's code starts with, as hex (what the runtime looks programs up by).
+std::string code_marker(std::span<const uint8_t> code) {
+  static const char* const kHex = "0123456789abcdef";
+  std::string h;
+  for (size_t k = 0; k < 24 && k < code.size(); ++k) {
+    h += kHex[code[k] >> 4];
+    h += kHex[code[k] & 15];
+  }
+  return h;
+}
+
 int disasm(const std::string& wanted, const fs::path& pack_dir, const fs::path& raw_dir) {
   fs::path file;
+  // A container name prefix, or a program's 48-digit marker (that program alone is listed).
+  const bool by_marker = wanted.size() == 48;
   for (const fs::path& f : corpus(pack_dir)) {
-    if (istarts_with_ascii(narrow(f.filename().wstring()), wanted)) {
+    if (by_marker) {
+      std::string e;
+      auto v = FileView::open(f, e);
+      const auto pc = v ? shader::parse_container(v->bytes(), e) : std::nullopt;
+      const shader::Part* part = pc ? pc->find("DXIL") : nullptr;
+      const auto cs = part ? shader::read_console_shader(part->data, e) : std::nullopt;
+      bool found = false;
+      for (size_t bi = 0; cs && bi < cs->blobs.size() && !found; ++bi) {
+        for (const shader::NativeProgram& p : cs->blobs[bi].programs) found = found || code_marker(cs->blobs[bi].code(p)) == wanted;
+      }
+      if (found) {
+        file = f;
+        break;
+      }
+    } else if (istarts_with_ascii(narrow(f.filename().wstring()), wanted)) {
       file = f;
       break;
     }
@@ -226,6 +253,10 @@ int disasm(const std::string& wanted, const fs::path& pack_dir, const fs::path& 
   for (const shader::NativeBlob& b : console->blobs) {
     for (const shader::NativeProgram& p : b.programs) {
       const auto bytes = b.code(p);
+      if (by_marker && code_marker(bytes) != wanted) {
+        ++index;
+        continue;
+      }
       const auto code = as_dwords(bytes);
       std::printf("; %s program %d: %s, %s, %zu dwords, VGPRs %u, SGPRs %u, LDS %u bytes\n",
                   narrow(file.stem().wstring()).c_str(), index, shader::hw_stage_name(p.stage),
@@ -240,7 +271,16 @@ int disasm(const std::string& wanted, const fs::path& pack_dir, const fs::path& 
       const rd::ProgramScan scan = rd::scan_program(code);
       size_t next = 0;
       for (uint32_t at : scan.starts) {
-        if (at > next) std::printf("%06zx data, %zu dwords\n", next * 4, at - next);
+        if (at > next) {
+          std::printf("%06zx data, %zu dwords\n", next * 4, at - next);
+          // What it decodes to (code reached only through indirect jumps shows here).
+          for (size_t d = next; d < at;) {
+            rd::Instruction insn;
+            if (rd::decode(code, d, insn) != rd::DecodeStatus::Ok || !insn.dwords) break;
+            std::printf("  ? %06zx %s\n", d * 4, rd::describe(insn).c_str());
+            d += insn.dwords;
+          }
+        }
         rd::Instruction insn;
         rd::decode(code, at, insn);
         std::printf("%06x %d %s\n", at * 4, insn.dwords, rd::describe(insn).c_str());

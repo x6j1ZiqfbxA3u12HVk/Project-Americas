@@ -82,6 +82,8 @@ class TitleMemory {
   // Writes bytes [offset, offset + size) of the pages listed (64 KiB each, in order), mapped
   // anywhere or not (DirectStorage destinations). False if a page is unknown.
   bool write_pages(const uint64_t* pages, uint64_t page_count, uint64_t offset, const uint8_t* data, uint64_t size);
+  // Whether `number` names an allocated physical page (diagnosis).
+  bool is_allocated_page(uint64_t number) const;
 
   // The fault handler's part: commits the never-touched physical page under `address` for an
   // access of `kind` (0 read, 1 write, 8 execute). True when the access can run again.

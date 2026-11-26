@@ -731,6 +731,44 @@ void packed16(std::unordered_map<std::string, Handler>& t, const char* name, con
   };
 }
 
+// A 64-bit float source (as a double): a register pair or a constant (the f64 inline values; a
+// literal is the high dword), with VOP3's abs and neg.
+std::string f64src(Ctx& c, int k) {
+  static const rd::Field fields[] = {Field::SRC0, Field::SRC1, Field::SRC2};
+  const uint32_t code = c.f(fields[k]);
+  std::string v;
+  if (code >= 240 && code <= 248) {
+    static const char* const kConst[] = {"0.5", "-0.5", "1.0", "-1.0", "2.0", "-2.0", "4.0", "-4.0", "0.15915494309189535"};
+    v = "double(" + std::string(kConst[code - 240]) + "L)";
+  } else if (code == 255) {
+    v = "asdouble(0u, " + hex32(c.in->literal()) + ")";
+  } else {
+    const std::string u = c.src64(code);
+    v = "asdouble(uint(" + u + "), uint(" + u + " >> 32))";
+  }
+  if (is_vop3(*c.in)) {
+    if ((c.f(Field::ABS) >> k) & 1) v = "abs(" + v + ")";
+    if ((c.f(Field::NEG) >> k) & 1) v = "(-" + v + ")";
+  }
+  return v;
+}
+// A double result into VDST's pair, with VOP3's output modifier and clamp.
+void write_f64(Ctx& c, std::string r) {
+  if (is_vop3(*c.in)) {
+    switch (c.f(Field::OMOD)) {
+      case 1: r = "(" + r + ") * 2.0L"; break;
+      case 2: r = "(" + r + ") * 4.0L"; break;
+      case 3: r = "(" + r + ") * 0.5L"; break;
+      default: break;
+    }
+    if (c.f(Field::CLAMP)) r = "clamp(" + r + ", 0.0L, 1.0L)";
+  }
+  const uint32_t d = c.f(Field::VDST);
+  c.touch_v(d + 1);
+  c.line("{ double r = " + r + "; uint lo, hi; asuint(r, lo, hi);");
+  c.line("  if (AM_ACT) { v[" + num(d) + "] = lo; v[" + num(d + 1) + "] = hi; } }");
+}
+
 // ---- the instruction table ----
 
 using Handler = std::function<bool(Ctx&)>;
@@ -1134,39 +1172,50 @@ const std::unordered_map<std::string, Handler>& table() {
       for (const F64& op : kF64) {
         t[op.name] = [op](Ctx& c) {
           if (!is_vop3(*c.in) || c.in->form != rd::Form::Plain) return c.fail(std::string(op.name) + " form");
-          const rd::Field fields[] = {Field::SRC0, Field::SRC1, Field::SRC2};
           std::string x[3];
-          for (int k = 0; k < op.sources; ++k) {
-            const uint32_t code = c.f(fields[k]);
-            std::string v;
-            if (code >= 240 && code <= 248) {
-              static const char* const kConst[] = {"0.5", "-0.5", "1.0", "-1.0", "2.0", "-2.0", "4.0", "-4.0", "0.15915494309189535"};
-              v = "double(" + std::string(kConst[code - 240]) + "L)";
-            } else if (code == 255) {
-              v = "asdouble(0u, " + hex32(c.in->literal()) + ")";
-            } else {
-              const std::string u = c.src64(code);
-              v = "asdouble(uint(" + u + "), uint(" + u + " >> 32))";
-            }
-            if ((c.f(Field::ABS) >> k) & 1) v = "abs(" + v + ")";
-            if ((c.f(Field::NEG) >> k) & 1) v = "(-" + v + ")";
-            x[k] = v;
-          }
-          std::string r = fill(op.body, x[0], x[1], x[2]);
-          switch (c.f(Field::OMOD)) {
-            case 1: r = "(" + r + ") * 2.0L"; break;
-            case 2: r = "(" + r + ") * 4.0L"; break;
-            case 3: r = "(" + r + ") * 0.5L"; break;
-            default: break;
-          }
-          if (c.f(Field::CLAMP)) r = "clamp(" + r + ", 0.0L, 1.0L)";
-          const uint32_t d = vop_dst(c);
-          c.touch_v(d + 1);
-          c.line("{ double r = " + r + "; uint lo, hi; asuint(r, lo, hi);");
-          c.line("  if (AM_ACT) { v[" + num(d) + "] = lo; v[" + num(d + 1) + "] = hi; } }");
+          for (int k = 0; k < op.sources; ++k) x[k] = f64src(c, k);
+          write_f64(c, fill(op.body, x[0], x[1], x[2]));
           return true;
         };
       }
+      t["v_rcp_f64"] = [](Ctx& c) {
+        if (c.in->form != rd::Form::Plain) return c.fail("v_rcp_f64 form");
+        write_f64(c, "(1.0L / " + f64src(c, 0) + ")");
+        return true;
+      };
+      // Conversions to and from doubles; to integers they saturate, as the hardware does (NaN: 0).
+      t["v_cvt_f64_f32"] = [](Ctx& c) {
+        if (c.in->form != rd::Form::Plain) return c.fail("v_cvt_f64_f32 form");
+        write_f64(c, "double(" + fsrc(c, 0) + ")");
+        return true;
+      };
+      t["v_cvt_f64_i32"] = [](Ctx& c) {
+        if (c.in->form != rd::Form::Plain) return c.fail("v_cvt_f64_i32 form");
+        write_f64(c, "double(asint(" + vsrc(c, 0) + "))");
+        return true;
+      };
+      t["v_cvt_f64_u32"] = [](Ctx& c) {
+        if (c.in->form != rd::Form::Plain) return c.fail("v_cvt_f64_u32 form");
+        write_f64(c, "double(" + vsrc(c, 0) + ")");
+        return true;
+      };
+      t["v_cvt_f32_f64"] = [](Ctx& c) {
+        if (c.in->form != rd::Form::Plain) return c.fail("v_cvt_f32_f64 form");
+        c.vwrite(vop_dst(c), fresult(c, "float(" + f64src(c, 0) + ")"));
+        return true;
+      };
+      t["v_cvt_i32_f64"] = [](Ctx& c) {
+        if (c.in->form != rd::Form::Plain) return c.fail("v_cvt_i32_f64 form");
+        const std::string x = f64src(c, 0);
+        c.vwrite(vop_dst(c), "asuint(" + x + " != " + x + " ? 0 : int(clamp(" + x + ", -2147483648.0L, 2147483647.0L)))");
+        return true;
+      };
+      t["v_cvt_u32_f64"] = [](Ctx& c) {
+        if (c.in->form != rd::Form::Plain) return c.fail("v_cvt_u32_f64 form");
+        const std::string x = f64src(c, 0);
+        c.vwrite(vop_dst(c), "(" + x + " != " + x + " ? 0u : uint(clamp(" + x + ", 0.0L, 4294967295.0L)))");
+        return true;
+      };
     }
 
     // -- compares --
@@ -3193,6 +3242,16 @@ Translation translate(const TranslateInput& in, Binding binding) {
       // The vertex fetch: the attributes are in place already; the return address is the
       // program's base for its own data (our code starts at address 0).
       c.set_s64(c.f(Field::SDST), "uint64_t(" + num(uint64_t{next} * 4) + ")");
+    } else if (name == "s_setpc_b64") {
+      // A far jump (the scan resolved its constant target): a branch like s_branch's. The
+      // instructions that computed the address ran as written.
+      const int64_t target = rd::far_jump_target(scan, at);
+      if (target < 0) {
+        ok = c.fail("indirect jumps (s_setpc_b64)");
+      } else {
+        blk.target = static_cast<uint32_t>(target);
+        blk.end = CfgBlock::Jump;
+      }
     } else if (flags & rd::kBranch) {
       const int64_t target = static_cast<int64_t>(next) + static_cast<int16_t>(insn.field(Field::SIMM16));
       std::string cond;

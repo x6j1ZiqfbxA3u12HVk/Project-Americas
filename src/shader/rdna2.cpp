@@ -301,6 +301,46 @@ std::string describe(const Instruction& insn) {
   return s;
 }
 
+namespace {
+
+// The constant target (dword) of the far-jump idiom ending in the s_setpc_b64 `jump`, whose
+// three instructions before it on this path start at `recent` (oldest first); -1 when it is not
+// one. Our code starts at address 0, so s_getpc_b64 gives the next instruction's byte offset.
+int64_t far_target(std::span<const uint32_t> code, const size_t* recent, const Instruction& jump) {
+  Instruction get, add, addc;
+  if (decode(code, recent[0], get) != DecodeStatus::Ok || decode(code, recent[1], add) != DecodeStatus::Ok ||
+      decode(code, recent[2], addc) != DecodeStatus::Ok) {
+    return -1;
+  }
+  const uint32_t d = jump.field(Field::SSRC0);
+  if (std::string_view(get.info->name) != "s_getpc_b64" || get.field(Field::SDST) != d) return -1;
+  if (std::string_view(add.info->name) != "s_add_u32" || add.field(Field::SDST) != d || add.field(Field::SSRC0) != d) return -1;
+  if (std::string_view(addc.info->name) != "s_addc_u32" || addc.field(Field::SDST) != d + 1 || addc.field(Field::SSRC0) != d + 1) {
+    return -1;
+  }
+  uint32_t k = 0;
+  const uint32_t ks = add.field(Field::SSRC1);
+  if (ks == 255) k = add.literal();
+  else if (ks >= 128 && ks <= 192) k = ks - 128;
+  else if (ks >= 193 && ks <= 208) k = static_cast<uint32_t>(-static_cast<int32_t>(ks - 192));
+  else return -1;
+  const uint32_t hs = addc.field(Field::SSRC1);
+  if (hs != 128 && hs != 193) return -1;  // 0 or -1
+  const uint64_t base = (recent[0] + get.dwords) * 4ull;
+  const uint64_t lo = (base & 0xFFFFFFFFull) + k;
+  const uint64_t hi = ((base >> 32) + (hs == 193 ? 0xFFFFFFFFull : 0) + (lo >> 32)) & 0xFFFFFFFFull;
+  const uint64_t target = hi << 32 | (lo & 0xFFFFFFFFull);
+  if (target % 4 || target / 4 >= code.size()) return -1;
+  return static_cast<int64_t>(target / 4);
+}
+
+}  // namespace
+
+int64_t far_jump_target(const ProgramScan& scan, uint32_t at) {
+  const auto it = std::lower_bound(scan.far_jumps.begin(), scan.far_jumps.end(), std::pair<uint32_t, uint32_t>{at, 0});
+  return it != scan.far_jumps.end() && it->first == at ? static_cast<int64_t>(it->second) : -1;
+}
+
 ProgramScan scan_program(std::span<const uint32_t> code) {
   ProgramScan r;
   std::vector<uint8_t> state(code.size(), 0);  // 1: an instruction starts here, 2: inside one
@@ -322,6 +362,7 @@ ProgramScan scan_program(std::span<const uint32_t> code) {
   while (!work.empty()) {
     size_t pc = work.back();
     work.pop_back();
+    size_t recent[3] = {}, seen = 0;  // the path's last three instructions (for far jumps)
     while (pc < code.size()) {
       if (state[pc] == 1) break;  // decoded already
       if (state[pc] == 2) {
@@ -342,6 +383,19 @@ ProgramScan scan_program(std::span<const uint32_t> code) {
       r.starts.push_back(static_cast<uint32_t>(pc));
       const size_t next = pc + insn.dwords;
       const uint16_t flags = insn.info->flags;
+      // A far jump (the three instructions before it on this path make its target): followed.
+      if (insn.encoding == Encoding::Sop1 && insn.opcode == 32 && seen >= 3) {
+        if (const int64_t target = far_target(code, recent, insn); target >= 0) {
+          r.far_jumps.emplace_back(static_cast<uint32_t>(pc), static_cast<uint32_t>(target));
+          r.targets.push_back(static_cast<uint32_t>(target));
+          work.push_back(static_cast<uint32_t>(target));
+          break;
+        }
+      }
+      recent[0] = recent[1];
+      recent[1] = recent[2];
+      recent[2] = pc;
+      if (seen < 3) ++seen;
       if (flags & kTerminator) {
         r.ends = true;
         break;
@@ -374,6 +428,7 @@ ProgramScan scan_program(std::span<const uint32_t> code) {
   }
   std::sort(r.starts.begin(), r.starts.end());
   std::sort(r.targets.begin(), r.targets.end());
+  std::sort(r.far_jumps.begin(), r.far_jumps.end());
   r.targets.erase(std::unique(r.targets.begin(), r.targets.end()), r.targets.end());
   return r;
 }

@@ -116,10 +116,16 @@ struct ProgramScan {
   bool ends = false;              // a reachable s_endpgm
   bool indirect = false;          // a reachable s_setpc / s_swappc: control we cannot follow
   bool setpc = false;             // a reachable s_setpc: a jump (s_swappc alone is a call that returns)
+  // Far jumps: s_setpc_b64 of `s_getpc_b64 sX; s_add_u32 sX, sX, k; s_addc_u32 sX+1, sX+1, 0|-1`
+  // just before it, a branch to a constant target (what compilers emit past 16-bit offsets).
+  // Per such s_setpc (dword), its target (dword), ascending; these are followed, not indirect.
+  std::vector<std::pair<uint32_t, uint32_t>> far_jumps;
   size_t errors = 0;              // reachable dwords that do not decode, bad branch targets
   size_t first_error = static_cast<size_t>(-1);
   std::string first_error_reason;
 };
 ProgramScan scan_program(std::span<const uint32_t> code);
+// The far jump's target of the s_setpc_b64 at `at` (scan.far_jumps), or -1 when it is none.
+int64_t far_jump_target(const ProgramScan& scan, uint32_t at);
 
 }  // namespace am::shader::rdna2

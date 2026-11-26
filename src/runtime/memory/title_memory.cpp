@@ -387,6 +387,12 @@ bool TitleMemory::page_index(uint64_t number, uint64_t* index) const {
   return true;
 }
 
+bool TitleMemory::is_allocated_page(uint64_t number) const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  uint64_t i = 0;
+  return page_index(number, &i);
+}
+
 bool TitleMemory::allocate_pages(uint64_t flags, uint64_t count, uint64_t* pages) {
   if (!count || !pages) {
     SetLastError(ERROR_INVALID_PARAMETER);

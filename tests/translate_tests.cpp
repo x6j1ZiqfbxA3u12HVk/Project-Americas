@@ -11,6 +11,7 @@
 #include "gpu_runner.h"
 #include "host/dxc_compile.h"
 #include "shader/image_bindings.h"
+#include "shader/rdna2.h"
 #include "shader/translate.h"
 #include "test.h"
 
@@ -1097,4 +1098,51 @@ TEST_CASE(translate_narrow_lds_signed_lds_atomics_and_short_stores) {
     if (!stored) std::printf("    word %u: %08x\n", k, r.memory[0x40 + k]);
   }
   CHECK(stored);
+}
+
+// Conversions to and from doubles (to integers they truncate and saturate) and the f64 reciprocal.
+TEST_CASE(translate_f64_conversions) {
+  const Result r = run({
+      0x7E0C0280,              // v_mov_b32_e32 v6, 0
+      0x7E0E02FF, 0xC0040000,  // v_mov_b32_e32 v7, 0xc0040000                   v[6:7] = -2.5
+      0x7E021F06,              // v_cvt_f32_f64_e32 v1, v[6:7]
+      0x7E0408C3,              // v_cvt_f64_i32_e32 v[2:3], -3
+      0x7E080706,              // v_cvt_i32_f64_e32 v4, v[6:7]
+      0x7E0A2B06,              // v_cvt_u32_f64_e32 v5, v[6:7]
+      0x7E1020F0,              // v_cvt_f64_f32_e32 v[8:9], 0.5
+      0x7E145EF6,              // v_rcp_f64_e32 v[10:11], 4.0
+      0xBF810000,              // s_endpgm
+  });
+  if (!r.ran) return;
+  bool ok = true;
+  for (uint32_t l = 0; l < 64 && ok; ++l) {
+    ok = r.v(l, 1) == 0xC0200000u && r.v(l, 2) == 0 && r.v(l, 3) == 0xC0080000u && r.v(l, 4) == 0xFFFFFFFEu && r.v(l, 5) == 0 &&
+         r.v(l, 8) == 0 && r.v(l, 9) == 0x3FE00000u && r.v(l, 10) == 0 && r.v(l, 11) == 0x3FD00000u;
+    if (!ok) {
+      std::printf("    lane %u: v1 %08x v[2:3] %08x %08x v4 %08x v5 %08x v[8:9] %08x %08x v[10:11] %08x %08x\n", l, r.v(l, 1),
+                  r.v(l, 2), r.v(l, 3), r.v(l, 4), r.v(l, 5), r.v(l, 8), r.v(l, 9), r.v(l, 10), r.v(l, 11));
+    }
+  }
+  CHECK(ok);
+}
+
+// A far jump (s_getpc, add, addc, s_setpc to a constant target) is a branch; the scan follows it.
+TEST_CASE(translate_far_jumps) {
+  const std::vector<uint32_t> code = {
+      0x7E020281,  // v_mov_b32_e32 v1, 1
+      0xBE841F00,  // s_getpc_b64 s[4:5]            (8)
+      0x80049004,  // s_add_u32 s4, s4, 16          -> 24
+      0x82058005,  // s_addc_u32 s5, s5, 0
+      0xBE802004,  // s_setpc_b64 s[4:5]
+      0x7E020282,  // v_mov_b32_e32 v1, 2           (skipped)
+      0x7E040283,  // v_mov_b32_e32 v2, 3           (24)
+      0xBF810000,  // s_endpgm
+  };
+  const am::shader::rdna2::ProgramScan scan = am::shader::rdna2::scan_program(code);
+  CHECK(!scan.indirect && scan.far_jumps.size() == 1 && am::shader::rdna2::far_jump_target(scan, 4) == 6);
+  const Result r = run(code);
+  if (!r.ran) return;
+  bool ok = true;
+  for (int l = 0; l < 64 && ok; ++l) ok = r.v(l, 1) == 1 && r.v(l, 2) == 3;
+  CHECK(ok);
 }

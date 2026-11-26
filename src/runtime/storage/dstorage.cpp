@@ -364,7 +364,19 @@ HRESULT execute(const Request& r) {
     std::vector<uint64_t> numbers(pages);
     if (!guarded_copy(numbers.data(), r.destination, pages * sizeof(uint64_t))) return E_INVALIDARG;
     if (!mem::title_memory().write_pages(numbers.data(), pages, within, data.data(), data.size())) {
-      return HRESULT_FROM_WIN32(GetLastError());
+      const DWORD error = GetLastError();
+      static std::atomic<int> told{0};
+      if (told.fetch_add(1) < 16) {
+        // Which page numbers the pool refuses: not a multiple of 16, or not allocated (freed?).
+        std::string list;
+        for (uint64_t k = 0; k < pages && k < 8; ++k) {
+          list += (k ? " " : "") + hex(numbers[k]) + (mem::title_memory().is_allocated_page(numbers[k]) ? "" : "(not allocated)");
+        }
+        logf("dstorage: page destination refused (error %lu): %llu bytes at +0x%llx over %llu pages: %s", error,
+             static_cast<unsigned long long>(data.size()), static_cast<unsigned long long>(within),
+             static_cast<unsigned long long>(pages), list.c_str());
+      }
+      return HRESULT_FROM_WIN32(error);
     }
     return S_OK;
   }
