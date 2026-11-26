@@ -820,3 +820,27 @@ Then the larger pieces before the 3D world shows:
     the planes never get data at all.
   * **Next:** log the T#s the video draws read, and whether Bink writes them. Bink plays
     its sound through the host's XAudio2 and may wait on that clock.
+
+## The intro video plays (2026-11-26)
+
+* **Cause of the green:** the video's Y/U/V planes (and the setup pages' art) sit in pages
+  the game maps for the GPU only (queue slot 31, `CopyPageMappingsBatchX`). The page table
+  followed those mappings, but texture uploads read the CPU address, where nothing is mapped,
+  so the planes uploaded as zeros. YUV of zeros through the video's matrix is solid green.
+* **Fix (400e29d):** `gpu_memory.cpp` keeps the CPU side of every GPU mapping (the pool's
+  mirror view for committed pool pages, else the source view) and `gpu_bytes_at` reads through
+  it. `bindings.cpp` uploads and checksums textures that way.
+* **Textures that change** (video frames) are checked every flush once a check has found them
+  changed; they drop back to the round-robin after 300 quiet checks. The round-robin now checks
+  8 MiB a flush (it was 16 MiB every 15th flush, far too slow for 1,300 textures).
+* Seen with `AMERICAS_PRESS=A:20`: the artwork intro and the logo animation play in color, and
+  the setup pages show their art (the flamingo float behind "Finish Setup?").
+* **Note for debugging:** the T# miss log never shows textures made from the title's own views
+  past the first 200 ("gpu: texture ..."); 1,300 images exist by the video. A lookup that "hits"
+  may hit a texture that was uploaded once while still empty.
+* **Next:**
+  * Pages in the lazy pool (committed on touch) still get no page-table entry for the GPU's
+    own mappings (shaders read zeros there); uploads read them through the source view.
+  * The setup text still misses letters ("The d f lt t l"): check whether those glyph
+    atlases are written by compute into memory the uploads do not see again.
+  * The loading phase after Confirm, compute correctness, XOR-mode detiling.
