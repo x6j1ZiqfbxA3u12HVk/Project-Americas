@@ -519,6 +519,21 @@ void forward(CommandList* l, const Command& c) {
       const uint64_t* handles = reinterpret_cast<const uint64_t*>(data);
       const size_t given = (range ? (count ? 1 : 0) : count);
       if (given * 8 > c.data_size) return;
+      // The targets drawn so far may be read by the next draws (bindless: we cannot see which;
+      // the UI draws a clip mask, then samples it at once). Their writes are flushed here: each
+      // goes back to COMMON, from which reads promote; those bound again return just below.
+      {
+        std::vector<D3D12_RESOURCE_BARRIER> back;
+        for (auto& [target, st] : h.states) {
+          if (st != D3D12_RESOURCE_STATE_RENDER_TARGET && st != D3D12_RESOURCE_STATE_DEPTH_WRITE) continue;
+          D3D12_RESOURCE_BARRIER b{};
+          b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+          b.Transition = {target, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, st, D3D12_RESOURCE_STATE_COMMON};
+          back.push_back(b);
+          st = D3D12_RESOURCE_STATE_COMMON;
+        }
+        if (!back.empty()) list->ResourceBarrier(static_cast<UINT>(back.size()), back.data());
+      }
       D3D12_CPU_DESCRIPTOR_HANDLE views[D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
       h.target_count = 0;
       for (UINT i = 0; i < count; ++i) {
