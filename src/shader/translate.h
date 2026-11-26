@@ -77,4 +77,9 @@ Translation translate(const TranslateInput& in, Binding binding);
 constexpr uint32_t kDumpSgprs = 0;     // 128 SGPRs, then SCC, written by thread 0 of group 0
 constexpr uint32_t kDumpLanes = 1024;  // from here, each thread's VGPRs (vgpr_count dwords)
 
+// The HLSL a translated program with the runtime binding starts with (helpers, the binding:
+// am_load, am_store over title memory, am_user root constants): for the runtime's own helper
+// shaders, which use the same root signature.
+std::string runtime_prelude();
+
 }  // namespace am::shader

@@ -30,6 +30,8 @@
 #include <unordered_map>
 
 #include "core/text.h"
+#include "host/dxc_compile.h"
+#include "shader/translate.h"
 #include "runtime/d3d12x/bindings.h"
 #include "runtime/d3d12x/commands.h"
 #include "runtime/d3d12x/d3d12x.h"
@@ -510,6 +512,81 @@ void dispatch(HostList& h, ID3D12GraphicsCommandList* list, const Command& c) {
   ++g_dispatches_run;
 }
 
+// ClearUnorderedAccessViewUint / Float (view GPU handle, view CPU handle, resource, values,
+// rect count, rects) on a buffer: the view's V# (our encoding, views.cpp) gives the range, and a
+// fill program of ours writes the first value into every dword of it through the same binding
+// as translated programs, in the list's order. Compute passes start from such clears (list
+// heads, counters); left undone, a pass walked stale lists and hung the GPU. Texture views and
+// views we cannot read are counted and logged.
+std::atomic<uint64_t> g_clears_done{0}, g_clears_skipped{0};
+
+ID3D12PipelineState* fill_pipeline() {
+  static ID3D12PipelineState* const pso = [] () -> ID3D12PipelineState* {
+    present::HostGpu* gpu = present::host_gpu();
+    ID3D12RootSignature* root = translated_root_signature();
+    if (!gpu || !root) return nullptr;
+    const std::string hlsl = shader::runtime_prelude() + R"(
+[numthreads(64, 1, 1)]
+void am_fill(uint3 id : SV_DispatchThreadID) {
+  const uint64_t base = am_u64(am_user[0].x, am_user[0].y);
+  const uint count = am_user[0].z, value = am_user[0].w;
+  for (uint i = id.x; i < count; i += 64u * 4096u) am_store(base + uint64_t(i) * 4u, value);
+}
+)";
+    const host::CompileResult r = host::compile_hlsl(hlsl, "am_fill", "cs_6_6");
+    if (!r.ok) {
+      logf("gpu: the fill program does not compile: %s", r.messages.substr(0, 300).c_str());
+      return nullptr;
+    }
+    D3D12_COMPUTE_PIPELINE_STATE_DESC d{};
+    d.pRootSignature = root;
+    d.CS = {r.dxil.data(), r.dxil.size()};
+    ID3D12PipelineState* p = nullptr;
+    if (FAILED(gpu->device->CreateComputePipelineState(&d, IID_PPV_ARGS(&p)))) return nullptr;
+    return p;
+  }();
+  return pso;
+}
+
+void clear_uav(HostList& h, ID3D12GraphicsCommandList* list, const Command& c, const Recording& r) {
+  const auto skip = [](const char* why) {
+    ++g_clears_skipped;
+    static std::atomic<int> told{0};
+    if (told.fetch_add(1, std::memory_order_relaxed) < 12) logf("gpu: a UAV clear not done: %s", why);
+  };
+  // The view's descriptor: a V# at the CPU handle (else the GPU handle, the same memory here).
+  uint32_t v[4] = {};
+  if (!guarded_copy(v, reinterpret_cast<const void*>(c.a[1]), sizeof v) && !guarded_copy(v, reinterpret_cast<const void*>(c.a[0]), sizeof v)) {
+    return skip("its descriptor cannot be read");
+  }
+  const uint32_t type = v[3] >> 30;  // 0 for a buffer descriptor; textures have their type here
+  if (type != 0) return skip("a texture view");
+  const uint64_t base = v[0] | (uint64_t{v[1] & 0xFFFFu} << 32);
+  const uint32_t stride = (v[1] >> 16) & 0x3FFFu;
+  const uint64_t bytes = stride ? uint64_t{v[2]} * stride : v[2];
+  if (!base || !bytes) return skip("an empty view");
+  uint32_t values[4] = {};
+  if (c.data_size >= sizeof values && c.data_at + sizeof values <= r.data.size()) std::memcpy(values, r.data.data() + c.data_at, sizeof values);
+  // The Float clear's value is a float's bits already (as the title passes them).
+  ID3D12PipelineState* pso = fill_pipeline();
+  const D3D12_GPU_VIRTUAL_ADDRESS table = pso ? set_heaps(h, list) : 0;
+  if (!pso || !table) return skip("no fill program");
+  if (!h.compute_bound) {
+    list->SetComputeRootSignature(translated_root_signature());
+    list->SetComputeRootUnorderedAccessView(1, table);
+    h.compute_bound = true;
+  }
+  const uint32_t count = static_cast<uint32_t>(std::min<uint64_t>(bytes / 4, 0xFFFFFFFFu));
+  const uint32_t constants[4] = {static_cast<uint32_t>(base), static_cast<uint32_t>(base >> 32), count, values[0]};
+  list->SetPipelineState(pso);
+  list->SetComputeRoot32BitConstants(0, 4, constants, 0);
+  list->Dispatch(std::min<uint32_t>((count + 63) / 64, 4096), 1, 1);
+  D3D12_RESOURCE_BARRIER b{};
+  b.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+  list->ResourceBarrier(1, &b);
+  ++g_clears_done;
+}
+
 // A draw, when its pipeline has a host pipeline: the translated root signature and heaps, the
 // image binding table, each stage's user data, the draw.
 void draw(HostList& h, ID3D12GraphicsCommandList* list, const Command& c) {
@@ -558,6 +635,8 @@ void forward(CommandList* l, const Command& c) {
     case kDrawInstanced:
     case kDrawIndexedInstanced:
     case kDispatch:
+    case kClearUavUint:
+    case kClearUavFloat:
     case kClearRenderTargetView:
     case kClearDepthStencilView:
     case kSetRenderTargets:
@@ -688,6 +767,8 @@ void forward(CommandList* l, const Command& c) {
     case kDrawInstanced:
     case kDrawIndexedInstanced: draw(h, list, c); return;
     case kDispatch: dispatch(h, list, c); return;
+    case kClearUavUint:
+    case kClearUavFloat: clear_uav(h, list, c, l->rec); return;
     // Vertex and index buffers in place: title memory at its host GPU address (null when the
     // memory cannot be reached that way yet).
     case kSetVertexBuffers: {
@@ -1207,6 +1288,7 @@ void frame_execute(const void* list) {
 }
 
 void frame_present() {
+  bindings_frame_ended();
   FrameLog& f = frame_log();
   std::lock_guard g(f.lock);
   ++f.frame;
@@ -1239,12 +1321,14 @@ void frame_present() {
                      format_bytes(shared.CurrentUsage) + " of " + format_bytes(shared.Budget);
         }
       }
-      logf("frame %llu: memory: process commit %s, working set %s; %s", static_cast<unsigned long long>(f.frame),
-           format_bytes(pm.PrivateUsage).c_str(), format_bytes(pm.WorkingSetSize).c_str(), gpu_text.c_str());
+      logf("frame %llu: memory: process commit %s, working set %s; %s; made: %s", static_cast<unsigned long long>(f.frame),
+           format_bytes(pm.PrivateUsage).c_str(), format_bytes(pm.WorkingSetSize).c_str(), gpu_text.c_str(),
+           host_memory_counts().c_str());
     }
-    logf("frame %llu: compute pipelines %s; copies done %llu, not done %llu", static_cast<unsigned long long>(f.frame),
-         compute_pipeline_counts().c_str(), static_cast<unsigned long long>(copies_done()),
-         static_cast<unsigned long long>(copies_skipped()));
+    logf("frame %llu: compute pipelines %s; copies done %llu, not done %llu; UAV clears done %llu, not done %llu",
+         static_cast<unsigned long long>(f.frame), compute_pipeline_counts().c_str(), static_cast<unsigned long long>(copies_done()),
+         static_cast<unsigned long long>(copies_skipped()), static_cast<unsigned long long>(g_clears_done.load()),
+         static_cast<unsigned long long>(g_clears_skipped.load()));
     if (!f.clears.empty()) logf("frame %llu: render-target clears:%s", static_cast<unsigned long long>(f.frame), f.clears.c_str());
     if (!f.pipelines.empty()) logf("frame %llu: pipelines and draws:%s", static_cast<unsigned long long>(f.frame), f.pipelines.c_str());
   }

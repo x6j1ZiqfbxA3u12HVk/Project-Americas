@@ -12,6 +12,7 @@
 
 #include "core/text.h"
 #include "runtime/d3d12x/d3d12x.h"
+#include "runtime/d3d12x/bindings.h"
 #include "runtime/d3d12x/host.h"
 #include "runtime/log.h"
 #include "runtime/present/host_gpu.h"
@@ -136,6 +137,7 @@ ID3D12Resource* host_texture(const void* console_resource, bool create) {
   const HRESULT hr =
       gpu->device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&t));
   if (t) t->SetName(widen("target " + std::to_string(d.Width) + "x" + std::to_string(d.Height)).c_str());
+  if (t) count_host_memory(HostMemoryKind::Target, t.Get());
   static std::atomic<int> logged{0};
   if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
     logf("gpu: host texture %llux%u x%u, %u mips, format %u, flags 0x%x for %p%s", static_cast<unsigned long long>(d.Width),

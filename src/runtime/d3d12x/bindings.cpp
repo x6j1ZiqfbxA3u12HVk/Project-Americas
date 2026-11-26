@@ -126,6 +126,7 @@ struct Texture {
   // physical pages (the GPU's own mappings place those) are hashed instead.
   bool watched = false;
   std::vector<std::pair<uint64_t, uint64_t>> watch_ranges;
+  uint32_t view = 0;  // its view slot (the table's srv index)
 };
 
 // A quick checksum of title memory (0 when it cannot be read). Not every write to a texture's
@@ -236,6 +237,16 @@ struct Bindings {
     ComPtr<ID3D12Resource> resource;
   };
   std::vector<Retired> retired;
+  // Textures dropped because the title's memory under them now holds another texture: their
+  // resource and view slot go once the GPU is past a fence signalled 3 frames later (lists
+  // recorded before the drop may still read them).
+  struct Evicted {
+    uint64_t frame = 0, fence = 0;
+    ComPtr<ID3D12Resource> resource;
+    uint32_t view = 0;
+  };
+  std::vector<Evicted> evicted;
+  uint64_t frames = 0, evictions = 0;
   const void* recording = nullptr;  // the list being flushed into
   const void* readback_list = nullptr;
 
@@ -259,6 +270,7 @@ struct Bindings {
                            D3D12_TEXTURE_LAYOUT_ROW_MAJOR, flags};
     ComPtr<ID3D12Resource> r;
     device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, state, nullptr, IID_PPV_ARGS(&r));
+    if (r) count_host_memory(HostMemoryKind::Buffer, r.Get());
     if (!r) {
       static std::atomic<int> told{0};
       if (told.fetch_add(1, std::memory_order_relaxed) < 8) {
@@ -449,6 +461,8 @@ struct Bindings {
       {
         std::lock_guard g(lock);
         for (const Watched& w : round) {
+          // Textures may have been dropped meanwhile: the index must still name this one.
+          if (w.index >= textures.size() || textures[w.index].address != w.address || textures[w.index].size != w.size) continue;
           Texture& t = textures[w.index];
           if (t.dirty || t.watched || t.checksum != w.checksum) continue;  // uploaded again meanwhile
           if (w.now != w.checksum) {
@@ -501,6 +515,15 @@ struct Bindings {
   void reclaim() {
     present::HostGpu* gpu = present::host_gpu();
     std::erase_if(retired, [gpu](const Retired& r) { return r.fence != kPending && gpu->done(r.fence); });
+    for (auto it = evicted.begin(); it != evicted.end();) {
+      if (!it->fence && frames >= it->frame + 3) it->fence = gpu->signal();
+      if (it->fence && gpu->done(it->fence)) {
+        release_view_slot(it->view);
+        it = evicted.erase(it);
+      } else {
+        ++it;
+      }
+    }
     static size_t told = 64;
     if (retired.size() >= told) {
       uint64_t bytes = 0, pending = 0;
@@ -855,6 +878,7 @@ void add_texture(Bindings* b, const D3D12_RESOURCE_DESC& resource, const D3D12_S
         return;
       }
       copy->SetName(widen("copy of a target, format " + std::to_string(resource.Format) + " at 0x" + hex(address)).c_str());
+      count_host_memory(HostMemoryKind::TargetCopy, copy.Get());
       D3D12_CPU_DESCRIPTOR_HANDLE slot{};
       const uint32_t index = allocate_view_slot(&slot);
       if (!index) return;
@@ -873,6 +897,21 @@ void add_texture(Bindings* b, const D3D12_RESOURCE_DESC& resource, const D3D12_S
            resource.Format, hex(address).c_str(), td.Format, index);
       return;
     }
+  }
+  // Textures the new one's memory overlaps, unless they are the same memory (same address and
+  // size, another view of it): the title has put something else there, they are dropped.
+  for (auto it = b->textures.begin(); it != b->textures.end();) {
+    const bool overlaps = address < it->address + it->size && it->address < address + layout.size;
+    if (!overlaps || (it->address == address && it->size == layout.size)) {
+      ++it;
+      continue;
+    }
+    const uint32_t view_index = it->view;
+    std::erase_if(b->images, [view_index](const shader::ImageBinding& i) { return i.srv == view_index; });
+    b->evicted.push_back({b->frames, 0, std::move(it->resource), view_index});
+    ++b->evictions;
+    it = b->textures.erase(it);
+    b->table_dirty = true;
   }
   Texture t;
   t.address = address;
@@ -894,6 +933,7 @@ void add_texture(Bindings* b, const D3D12_RESOURCE_DESC& resource, const D3D12_S
     return;
   }
   t.resource->SetName(widen("texture " + std::to_string(width) + "x" + std::to_string(height) + " from 0x" + hex(address)).c_str());
+  count_host_memory(HostMemoryKind::Texture, t.resource.Get());
   D3D12_CPU_DESCRIPTOR_HANDLE slot{};
   const uint32_t index = allocate_view_slot(&slot);
   if (!index) return;
@@ -906,6 +946,7 @@ void add_texture(Bindings* b, const D3D12_RESOURCE_DESC& resource, const D3D12_S
   ib.srv = ib.alt = index;
   ib.flags = image_flags;
   b->images.push_back(ib);
+  t.view = index;
   b->textures.push_back(std::move(t));
   b->table_dirty = true;
   static std::atomic<int> logged{0};
@@ -987,6 +1028,39 @@ ID3D12DescriptorHeap* sampler_heap() {
   std::lock_guard g(bindings().lock);
   Bindings* b = ready();
   return b ? b->samplers.Get() : nullptr;
+}
+
+namespace {
+std::atomic<uint64_t> g_host_bytes[static_cast<int>(HostMemoryKind::Count)];
+std::atomic<uint64_t> g_host_count[static_cast<int>(HostMemoryKind::Count)];
+}  // namespace
+
+void count_host_memory(HostMemoryKind kind, ID3D12Resource* resource) {
+  if (!resource) return;
+  Microsoft::WRL::ComPtr<ID3D12Device> device;
+  if (FAILED(resource->GetDevice(IID_PPV_ARGS(&device)))) return;
+  const D3D12_RESOURCE_DESC d = resource->GetDesc();
+  const D3D12_RESOURCE_ALLOCATION_INFO a = device->GetResourceAllocationInfo(0, 1, &d);
+  g_host_bytes[static_cast<int>(kind)] += a.SizeInBytes;
+  ++g_host_count[static_cast<int>(kind)];
+}
+
+void bindings_frame_ended() {
+  std::lock_guard g(bindings().lock);
+  ++bindings().frames;
+}
+
+std::string host_memory_counts() {
+  static const char* const kNames[] = {"textures", "targets", "target copies", "buffers"};
+  std::string text;
+  {
+    std::lock_guard g(bindings().lock);
+    text = "textures alive " + std::to_string(bindings().textures.size()) + ", dropped " + std::to_string(bindings().evictions) + "; ";
+  }
+  for (int k = 0; k < static_cast<int>(HostMemoryKind::Count); ++k) {
+    text += (k ? ", " : "") + std::string(kNames[k]) + " " + std::to_string(g_host_count[k].load()) + " (" + format_bytes(g_host_bytes[k].load()) + ")";
+  }
+  return text;
 }
 
 }  // namespace am::rt::d3d12x

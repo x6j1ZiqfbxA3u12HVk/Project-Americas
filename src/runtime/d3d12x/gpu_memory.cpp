@@ -63,6 +63,7 @@ struct GpuMemory {
   std::atomic<uint64_t> pool_mirror{0};  // the CPU address of the pool window's mirror view
   UINT step = 0;
   uint32_t next_view = kHeapSize;  // the lowest index handed out to a texture view so far
+  std::vector<uint32_t> free_views;  // given back (release_view_slot), handed out first
   uint32_t pool_window = 0;  // the committed physical page pool's window, once opened
 
   bool start() {
@@ -235,8 +236,14 @@ struct GpuMemory {
 
   // A heap index for a texture view, from the top down; 0 when the heap is full.
   uint32_t allocate_view(D3D12_CPU_DESCRIPTOR_HANDLE* handle) {
-    if (next_view <= windows.size() + 1) return 0;
-    const uint32_t n = --next_view;
+    uint32_t n = 0;
+    if (!free_views.empty()) {
+      n = free_views.back();
+      free_views.pop_back();
+    } else {
+      if (next_view <= windows.size() + 1) return 0;
+      n = --next_view;
+    }
     if (handle) {
       *handle = heap->GetCPUDescriptorHandleForHeapStart();
       handle->ptr += SIZE_T{n} * step;
@@ -400,6 +407,12 @@ uint32_t allocate_view_slot(D3D12_CPU_DESCRIPTOR_HANDLE* handle) {
   std::lock_guard g(memory().lock);
   GpuMemory* m = ready();
   return m ? m->allocate_view(handle) : 0;
+}
+
+void release_view_slot(uint32_t index) {
+  if (!index) return;
+  std::lock_guard g(memory().lock);
+  if (GpuMemory* m = ready()) m->free_views.push_back(index);
 }
 
 namespace {

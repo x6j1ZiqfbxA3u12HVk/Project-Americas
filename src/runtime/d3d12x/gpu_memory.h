@@ -50,6 +50,8 @@ ID3D12RootSignature* translated_graphics_root_signature();
 D3D12_GPU_VIRTUAL_ADDRESS host_gpu_address(uint64_t address, uint64_t size);
 // A shader heap index for a texture view (and its CPU handle); 0 when the heap is full.
 uint32_t allocate_view_slot(D3D12_CPU_DESCRIPTOR_HANDLE* handle);
+// Gives a slot back (once no submitted work reads it): the next allocation takes it.
+void release_view_slot(uint32_t index);
 // Records the page table's pending updates into `list` (before work that reads them).
 void flush_page_table(ID3D12GraphicsCommandList* list);
 // `list` (one that flushed) was submitted; `fence_value` follows it: its uploads are freed once

@@ -3299,6 +3299,14 @@ Translation finish_graphics(const TranslateInput& in, const Ctx& c, Translation 
   return tr;
 }
 
+std::string runtime_prelude() {
+  std::string h = kHelpers;
+  h += kRuntimeBinding;
+  h += format_table();
+  h += kBufferHelpers;
+  return h;
+}
+
 Translation translate(const TranslateInput& in, Binding binding) {
   Translation tr;
   tr.wave_size = in.wave32 ? 32 : 64;

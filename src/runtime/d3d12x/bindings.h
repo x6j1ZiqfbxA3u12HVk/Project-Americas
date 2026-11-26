@@ -1,5 +1,7 @@
 #pragma once
 
+#include <string>
+
 // Images and samplers for translated shaders (shader/image_bindings.h). A console shader reads
 // a texture's descriptor (T#, 8 words) and a sampler's (S#, 4 words) from memory or builds them
 // in registers; the translated shader looks those words up in a table the runtime keeps, which
@@ -28,6 +30,13 @@ void bind_texture_view(const D3D12_RESOURCE_DESC& resource, const D3D12_SHADER_R
 // again at the next submission. `live`: they are also checked at every submission for a while
 // (pages the GPU's own mapping just placed there, which the title is about to fill).
 void notify_title_write(uint64_t address, uint64_t size, bool live = false);
+
+// Host GPU memory made so far, by kind (diagnosis: the frame summary's memory line).
+enum class HostMemoryKind { Texture, Target, TargetCopy, Buffer, Count };
+void count_host_memory(HostMemoryKind kind, ID3D12Resource* resource);
+std::string host_memory_counts();
+// Called once a frame (PresentX): dropped textures are released some frames later.
+void bindings_frame_ended();
 // Records the table's upkeep into `list`, before its draws.
 void flush_bindings(ID3D12GraphicsCommandList* list);
 // Textures of another format over a render target's memory (the title views a target's bytes
