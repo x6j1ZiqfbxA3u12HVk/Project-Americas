@@ -932,3 +932,22 @@ Then the larger pieces before the 3D world shows:
 * **Running alongside the precompile is fine** (the user's call): several runs with both today
   were clean once XG slot 10 stayed a probe. To reach the legal pages, press Enter every 2 s
   from 20 s (`AMERICAS_PRESS=A:20,A:22,...,A:90`).
+
+## The text gaps: fixed; the settings preview is aliasing (2026-11-26, morning)
+
+* **Glitchy patches in the panels' text (fixed, 32581bb):** host render targets stayed in
+  RENDER_TARGET state until their list closed. The UI draws a clip mask into an A8 target and
+  samples it with the very next draws (the small glyphs), so they read it mid-write. Now, when
+  the title sets new targets, every target still being written goes back to COMMON first.
+  Found by elimination: an offline render of the dumped vertices and atlas was whole; waiting
+  for the GPU after each submission, re-uploading the atlas every time, fine derivatives in
+  the pixel program and refusing the rect-list pipelines did not help.
+* **Settings > Control Scheme preview (Tab on the blue setup page) shows static (open):** the
+  game renders the controller preview into R32_UINT targets (1280x720 at 0xddc1c0000 and
+  0xddc544000, 2560x1440 ones) and samples them through a second resource over the same
+  memory as R9G9B9E5_SHAREDEXP (format 67, modes 2 and 25). Our bindings make that second one
+  from title memory, which the GPU never writes. **Next:** give it a host texture of its own
+  format and copy the render target into it (D3D12 allows R32 <-> R9G9B9E5 copies) before
+  the reads; do not view the target in the other format (that removed the device once).
+* Driving the menus by script: Enter at 20 s, then after the intro 4 Enters (with margin,
+  e.g. A:36,A:39,A:42,A:45,A:48), then MENU (Tab) for the settings.
