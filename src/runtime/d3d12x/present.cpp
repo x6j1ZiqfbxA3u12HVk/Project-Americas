@@ -26,6 +26,7 @@
 #include "runtime/d3d12x/layout.h"
 #include "runtime/d3d12x/object.h"
 #include "runtime/log.h"
+#include "runtime/script.h"
 #include "runtime/process.h"
 #include "runtime/present/presenter.h"
 #include "runtime/present/window.h"
@@ -77,7 +78,7 @@ bool capture_wanted(uint64_t frame) {
 }
 
 // Rows of 8-bit RGBA or BGRA (as the swap chain holds them) as a 24-bit BMP, bottom row first.
-void save_bmp(uint64_t frame, const std::vector<uint8_t>& pixels, uint32_t width, uint32_t height, bool rgba) {
+void save_bmp(const std::string& name, const std::vector<uint8_t>& pixels, uint32_t width, uint32_t height, bool rgba) {
   TitleProcess* p = process();
   if (!p || p->logs_dir().empty() || pixels.size() < uint64_t{width} * height * 4) return;
   const uint32_t row = (width * 3 + 3) & ~3u, image = row * height;
@@ -101,11 +102,11 @@ void save_bmp(uint64_t frame, const std::vector<uint8_t>& pixels, uint32_t width
       to[2] = rgba ? from[0] : from[2];
     }
   }
-  const std::filesystem::path file = p->logs_dir() / ("frame-" + std::to_string(frame) + ".bmp");
+  const std::filesystem::path file = p->logs_dir() / (name + ".bmp");
   std::ofstream f(file, std::ios::binary);
   f.write(reinterpret_cast<const char*>(header), sizeof header);
   f.write(reinterpret_cast<const char*>(out.data()), static_cast<std::streamsize>(out.size()));
-  logf("present: frame %llu saved to %s", static_cast<unsigned long long>(frame), file.string().c_str());
+  logf("present: %s saved to %s", name.c_str(), file.string().c_str());
 }
 
 void count_frame(bool shown) {
@@ -171,10 +172,17 @@ HRESULT WINAPI queue_present_x(Object* self, UINT plane_count, const void* plane
       static std::atomic<uint64_t> presented{0};
       const uint64_t frame = ++presented;
       const DXGI_FORMAT shown_as = present::swap_chain_format(image.format);
-      const bool capture = capture_wanted(frame) && (shown_as == DXGI_FORMAT_R8G8B8A8_UNORM || shown_as == DXGI_FORMAT_B8G8R8A8_UNORM);
+      uint32_t shot = 0;
+      const bool scripted = script_wants_capture(shot);  // AMERICAS_SCRIPT's "capture"
+      const bool capture = (capture_wanted(frame) || scripted) &&
+                           (shown_as == DXGI_FORMAT_R8G8B8A8_UNORM || shown_as == DXGI_FORMAT_B8G8R8A8_UNORM);
       std::vector<uint8_t> pixels;
       if (present::Presenter* p = presenter()) shown = p->present(image, capture ? &pixels : nullptr);
-      if (capture && shown) save_bmp(frame, pixels, width, height, shown_as == DXGI_FORMAT_R8G8B8A8_UNORM);
+      if (capture && shown) {
+        save_bmp(scripted ? "script-" + std::to_string(shot) : "frame-" + std::to_string(frame), pixels, width, height,
+                 shown_as == DXGI_FORMAT_R8G8B8A8_UNORM);
+        if (scripted) logf("script: saved script-%u.bmp (frame %llu)", shot, static_cast<unsigned long long>(frame));
+      }
     }
   }
   count_frame(shown);

@@ -32,6 +32,7 @@
 
 #include "runtime/hle/registry.h"
 #include "runtime/log.h"
+#include "runtime/script.h"
 
 namespace am::rt::input {
 namespace {
@@ -431,7 +432,8 @@ class Hub {
     now_connected[kStandIn] = !std::any_of(now_connected, now_connected + kPads, [](bool c) { return c; });
     pads[kStandIn] = stand_in(keys);
     if (!start_us_) start_us_ = now_us();
-    pads[kStandIn].buttons |= scripted_buttons(now_us() - start_us_);
+    script_start();
+    pads[kStandIn].buttons |= scripted_buttons(now_us() - start_us_) | script_buttons();
     now_connected[kKeyboard] = true;
 
     std::vector<Event> events;

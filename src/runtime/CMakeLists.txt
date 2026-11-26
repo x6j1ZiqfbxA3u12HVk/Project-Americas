@@ -4,6 +4,7 @@ add_library(am_runtime STATIC
   host_patch.cpp
   image.cpp
   log.cpp
+  script.cpp
   process.cpp
   stubs.cpp
   title_config.cpp

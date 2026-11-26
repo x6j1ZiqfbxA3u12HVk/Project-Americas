@@ -33,6 +33,7 @@
 #include "runtime/d3d12x/root_signature.h"
 #include "runtime/d3d12x/object.h"
 #include "runtime/log.h"
+#include "runtime/script.h"
 #include "runtime/present/host_gpu.h"
 
 namespace am::rt::d3d12x {
@@ -453,6 +454,7 @@ void draw(HostList& h, ID3D12GraphicsCommandList* list, const Command& c) {
     const std::wstring w(d.begin(), d.end());
     list->SetMarker(0, w.c_str(), static_cast<UINT>((w.size() + 1) * sizeof(wchar_t)));
   }
+  script_on_draw(h.pipeline, [&] { return describe_pipeline(h.pipeline); });  // a scripted step may wait for it
   if (c.op == kDrawIndexedInstanced) {
     list->DrawIndexedInstanced(static_cast<UINT>(c.a[0]), static_cast<UINT>(c.a[1]), static_cast<UINT>(c.a[2]),
                                static_cast<INT>(c.a[3]), static_cast<UINT>(c.a[4]));

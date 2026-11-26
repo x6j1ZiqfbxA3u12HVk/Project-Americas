@@ -5,6 +5,8 @@
 #include <cstdarg>
 #include <cstdio>
 
+#include "runtime/script.h"
+
 namespace am::rt {
 namespace {
 
@@ -24,6 +26,7 @@ void log_open(const std::filesystem::path& file) {
 }
 
 void log_line(const std::string& line) {
+  script_on_log(line);  // a scripted step may wait for it
   const std::string text = line + "\n";
   AcquireSRWLockExclusive(&g_lock);
   std::fwrite(text.data(), 1, text.size(), stderr);
