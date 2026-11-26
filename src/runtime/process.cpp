@@ -483,6 +483,42 @@ void on_abort(int) {
   g_process->write_report();
 }
 
+// The class of the object at `v`, from the MSVC run-time type information its vtable points
+// to (x64: the complete object locator before the vtable, signature 1, holding its own RVA);
+// empty when `v` is not such an object.
+static bool rtti_name_at(uint64_t v, char* out, size_t size) {
+  __try {
+    const uint64_t vtable = *reinterpret_cast<const uint64_t*>(v);
+    const uint64_t col = *reinterpret_cast<const uint64_t*>(vtable - 8);
+    const auto* c = reinterpret_cast<const uint32_t*>(col);
+    if (c[0] != 1) return false;
+    const uint64_t base = col - c[5];
+    const char* name = reinterpret_cast<const char*>(base + c[3] + 16);
+    if (name[0] != '.' || name[1] != '?' || name[2] != 'A') return false;
+    size_t n = 0;
+    for (; n + 1 < size && name[n] && n < 160; ++n) out[n] = name[n];
+    out[n] = 0;
+    return n > 3;
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    return false;
+  }
+}
+
+static std::string describe_objects(const CONTEXT& ctx) {
+  const struct {
+    const char* name;
+    uint64_t value;
+  } regs[] = {{"rax", ctx.Rax}, {"rbx", ctx.Rbx}, {"rcx", ctx.Rcx}, {"rdx", ctx.Rdx}, {"rsi", ctx.Rsi}, {"rdi", ctx.Rdi},
+              {"rbp", ctx.Rbp}, {"r8", ctx.R8},   {"r9", ctx.R9},   {"r12", ctx.R12}, {"r13", ctx.R13}, {"r14", ctx.R14},
+              {"r15", ctx.R15}};
+  std::string text;
+  for (const auto& r : regs) {
+    char name[192];
+    if (r.value > 0x10000 && rtti_name_at(r.value, name, sizeof name)) text += std::string("\n  ") + r.name + " is a " + name;
+  }
+  return text;
+}
+
 long TitleProcess::crash_filter(EXCEPTION_POINTERS* info) {
   if (InterlockedIncrement(&crashing_) == 1) {
     const EXCEPTION_RECORD* r = info->ExceptionRecord;
@@ -504,6 +540,7 @@ long TitleProcess::crash_filter(EXCEPTION_POINTERS* info) {
                   ctx.Rax, ctx.Rbx, ctx.Rcx, ctx.Rdx, ctx.Rsi, ctx.Rdi, ctx.Rbp, ctx.Rsp, ctx.R8, ctx.R9, ctx.R10,
                   ctx.R11, ctx.R12, ctx.R13, ctx.R14, ctx.R15);
     text += regs;
+    text += describe_objects(ctx);
     text += describe_stack(ctx);
     log_line(text);
     std::ofstream(options_.logs_dir / L"crash.txt", std::ios::binary) << text << '\n';
