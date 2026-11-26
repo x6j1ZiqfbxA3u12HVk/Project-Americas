@@ -882,3 +882,18 @@ Then the larger pieces before the 3D world shows:
   text of the same size is whole. **Next probe:** that row buffer's V# (records, OOB mode)
   against the highest n of each draw. A collapsed transform (rows read as zero) would draw a
   dot, as seen where "Brightness" loses its n.
+
+* **The two crashes, analysed** (dumps copied to `C:\Project Americas\crash`, with their
+  `!analyze` output beside them): **not the GPU driver, and not our code's GPU paths.** Both
+  are in Windows' storage stack while it pages:
+  * 02:58 `0xC2/0x61` in `EhStorClass.sys`: storport could not free contiguous memory while
+    building a TRIM (DataSetManagement) request.
+  * 03:02 `0x133` in `fvevol.sys` (BitLocker) completing a write, spinning on the kernel pool
+    lock; in `americas.exe`'s context.
+  * The PC has 16 GiB of RAM (DDR4 at 2800). With the precompile running (3.5 GiB) 17.6 GiB is
+    committed before the game starts; a run adds the 6.1 GiB pool and the game's own memory,
+    so Windows pages hard to the encrypted disk. Two different pool failures minutes apart
+    can also mean unstable memory (a Windows Memory Diagnostic pass would tell).
+  * So c3b98c6 is probably not the cause; it made the UI streamer load more, which adds to
+    the pressure. **Do not run the game while the precompile runs**, and bring c3b98c6 back
+    when the user agrees.

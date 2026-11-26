@@ -1159,6 +1159,8 @@ slots), then the GPU back end.
 
 | Tool | Version, source | Use | Note |
 |---|---|---|---|
+| WinDbg (cdb.exe) | 1.2611.4001.0, winget `Microsoft.WinDbg` (system app, user approved) | Kernel crash dumps: `cdb -z <dmp> -y srv*C:\Project Americas\symbols*https://msdl.microsoft.com/download/symbols -c "!analyze -v; q"` | cdb is in the package's `amd64` folder |
+| capstone (Python) | 5.0.9, pip into `tools\py` | x86-64 disassembly of game code (`sys.path` to `tools\py`) | |
 | `amd-isa-xml\amdgpu_isa_rdna2.xml` | AMD machine-readable GPU ISA, 2026-08-06 release, gpuopen.com | The source for the RDNA 2 decoder tables: 1,153 instructions in every RDNA 2 encoding | MIT licence: generated tables that are committed must carry AMD's copyright notice |
 | `downloads\amd-rdna2-isa\*.pdf` | AMD RDNA 2 ISA reference guide (Nov 2020), docs.amd.com | Reading the instruction semantics | AMD's terms forbid copying or redistributing it: local reference only |
 | `llvm-23.1.6\bin\llvm-mc.exe`, `llvm-objdump.exe` | LLVM 23.1.6 Windows release, github.com/llvm | A second x86 disassembler next to `dumpbin` | **The official Windows build has no AMD GPU target** (x86 and ARM64 only), so it cannot check the RDNA 2 decoder |
