@@ -986,3 +986,57 @@ Then the larger pieces before the 3D world shows:
     game+0x3441f7, and where it turns tile info and table entries into offsets) and find
     where our tiling answer differs from the console's. Mode 10 textures also need 64KB_D
     detiling on upload once their data arrives.
+
+## START HERE (handed over 2026-11-26, morning, for an overnight run)
+
+State of main at d0ad54c. Nothing is pushed (never push). Everything below is committed.
+
+**What works now:** the intro video plays with no green frame; the setup, legal and settings
+menus draw their text whole (small glyphs fixed by pairing relinked stages by position,
+bf15cb8; the glitchy patches fixed by flushing render targets when the title switches them,
+32581bb); event-driven menu scripting (`AMERICAS_SCRIPT`, eb95cd6).
+
+**The task in hand: 16-bit attribute interpolation (translator version 5, d0ad54c).**
+1. Run the version-5 precompile (it compiles into `cache\shaders\dxil\rt5`, from scratch;
+   rt4 is obsolete). In the background, log to a file:
+   `"C:\Project Americas\build\release\bin\am-shaders.exe" precompile > "C:\Project Americas\logs\precompile15.txt" 2>&1`
+   It reads ~48,000 pipeline bundles first (minutes, nothing compiled yet), then compiles
+   ~18,700 programs; version 4 compiled 6,030 and refused ~12,600 (9,293 of them pixel
+   shaders on `v_interp_p1ll_f16`). Expect thousands more compiled now. It held ~4 GiB.
+2. Check `rt5\failures.tsv` (marker, stage, reason): if pixel shaders now fail with DXC errors
+   about `GetAttributeAtVertex`/`SV_Barycentrics`, fix the generated HLSL in
+   `finish_graphics` (translate.cpp). The design: an attribute read by the 16-bit forms is
+   declared `nointerpolation`; `main()` copies its three vertices' bits into
+   `static uint4 am_vtx<n>[3]` and `SV_Barycentrics` into `am_bary`; p1ll/p1lv give the
+   whole interpolation of the chosen half, p2 passes its SRC2 on as f16; `AM_IN<n>` is
+   `am_in.i<n>` or the same interpolation for 32-bit reads.
+3. Then run the game through the menus with a script (below) and compare captures with the
+   rt4-era ones: more UI should draw (backgrounds, icons, the 3D world later).
+4. Next refusal groups after this: `exp` targets (2,522, mostly depth export),
+   `image_get_lod` (385), `image_sample_b` (215), BVH (111).
+
+**Running the game** (`C:\Project Americas\build\release\bin\americas.exe --timeout N`):
+* Running it while the precompile runs is fine (the user's call), but the PC has 16 GiB of
+  RAM: keep to one game run at a time.
+* To the settings with no timing:
+  `AMERICAS_SCRIPT=A until draw 03fe8796; draw 03fe9527; wait 1; A; wait 3; A; wait 3; A; wait 3; A; wait 3; MENU; wait 4; capture; quit`
+  (`capture` saves `logs\script-<n>.bmp`; `trace` logs each new pipeline per page). The legal
+  notices need Down, ~6 s, Down, Enter. Ask the user not to type into the game window
+  during a run (their keys reach it).
+* Captures: `scratchpad` scripts are gone with the session; a 3840x2160 BMP is 24 MB.
+
+**Open items, most useful first:**
+1. Verify translator 5 (above).
+2. UI tile streaming (`AMERICAS_XG_TILING=1`, opt-in): the brightness page's logo and other
+   UI textures. Whole-texture requests get wrong offsets (see the section "Menu scripting; UI
+   tile streaming findings"). Needs the streamer's request builder disassembled
+   (game+0x3441f7 area; capstone is in `C:\Project Americas\tools\py`), and 64KB_D (mode
+   10) detiling. Do not leave tiling on by default: refused requests make the game retry and
+   abort.
+3. Settings preview static: R32_UINT targets read as R9G9B9E5 through a second resource
+   (see "The text gaps: fixed; the settings preview is aliasing"). Copy, do not alias views.
+4. XOR detiling (modes 21, 24-27) and the loading phase after Confirm.
+
+**Crashes:** the two PC bugchecks of the night were Windows' storage drivers under memory
+pressure (analysis in `C:\Project Americas\crash`, WinDbg's cdb in the WinDbg package's
+`amd64` folder). With tiling off, runs have been clean since.
