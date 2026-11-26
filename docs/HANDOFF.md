@@ -1402,3 +1402,23 @@ pressure (analysis in `C:\Project Americas\crash`, WinDbg's cdb in the WinDbg pa
 * Lesson: in the Bash tool, a Python heredoc can lose backslashes (a doubled backslash
   before `a` became a bell character in a document). Write scripts to files in the scratchpad and run them with
   `python -I`.
+
+### Later the same night: where it stopped
+
+* **Shader service hand-over:** a newer build no longer kills the running service. Asked to stop,
+  it takes no new work, finishes its compiles and ends; the replacement records itself in
+  `running.txt` and waits for it. Compiles over 1 MiB of HLSL (about 3 GB of DXC memory each)
+  run one at a time per 12 GB of RAM. **The service running at the end of this session
+  (process 4376, started 19:42) is from before that change:** the next game run asks it to
+  stop, and it ends at once, dropping what it is compiling.
+* **The two far-jump programs (`24ea...`, `3db4...`, about 80,000 instructions each) are too
+  deeply nested for DXC** when structured (more than 256 brackets), so they take the dispatcher
+  form. DXC had been compiling those for 45 minutes at 9 GB, unfinished, when the session
+  ended. If they never finish, the dispatcher is too slow at this size. Next: a structured form
+  that nests less, for example regions split into functions or a loop-and-switch per region.
+* With everything else compiled, the programs missing before the GPU waits are these two and
+  `1b16...` (raytracing). The watchdog still trips (8 waits not met in the last run).
+* Also dropped: pixel shader exports to render targets the signature does not declare. Still
+  refused (in order of count): `image_bvh(64)_intersect_ray`, `v_interp of attribute N beyond the
+  signature` (pixel shaders reading inputs the PC signature does not list), `image_gather4_l`
+  (D3D has no gather at a given level), real indirect jumps.
