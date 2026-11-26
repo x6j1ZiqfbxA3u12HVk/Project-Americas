@@ -185,7 +185,8 @@ HRESULT WINAPI queue_copy_page_mappings(Queue* self, UINT count, const PageBatch
           memory.gpu_pages_at(pool + uint64_t{range.start} * kPage, 1, pages.data());
           std::fill(pages.begin(), pages.end(), pages[0]);
         }
-        map_gpu_pages(at, pages.data(), range.count);
+        map_gpu_pages(at, pages.data(), range.count, range.kind == 2 ? 0 : pool + uint64_t{range.start} * kPage,
+                      range.kind == 0 ? kPage : 0);
       }
       at += uint64_t{range.count} * kPage;
     }

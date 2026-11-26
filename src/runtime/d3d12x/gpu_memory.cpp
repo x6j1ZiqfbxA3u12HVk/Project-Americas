@@ -53,6 +53,13 @@ struct GpuMemory {
   std::vector<std::pair<uint64_t, std::vector<uint32_t>>> pending;
   // The pool's views on the CPU side (first page -> pages, first pool page), for host addresses.
   std::map<uint64_t, std::pair<uint64_t, uint64_t>> pool_views;
+  // The GPU's own mappings as the CPU reads them (first page -> run); their own lock.
+  struct GpuRun {
+    uint64_t pages, source, step;  // source 0: the GPU sees nothing there
+  };
+  std::mutex gpu_runs_lock;
+  std::map<uint64_t, GpuRun> gpu_runs;
+  std::atomic<uint64_t> pool_mirror{0};  // the CPU address of the pool window's mirror view
   UINT step = 0;
   uint32_t next_view = kHeapSize;  // the lowest index handed out to a texture view so far
   uint32_t pool_window = 0;  // the committed physical page pool's window, once opened
@@ -201,7 +208,8 @@ struct GpuMemory {
       pool_window = UINT32_MAX;
       return;
     }
-    w.base = reinterpret_cast<uint64_t>(mirror);  // not a title address: kept only for the record
+    w.base = reinterpret_cast<uint64_t>(mirror);  // not a title address
+    pool_mirror = w.base;
     D3D12_RESOURCE_DESC bd{D3D12_RESOURCE_DIMENSION_BUFFER, 0, w.size, 1, 1, 1, DXGI_FORMAT_UNKNOWN, {1, 0}, D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
                            D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS};
     if (FAILED(device->CreatePlacedResource(w.heap.Get(), 0, &bd, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&w.buffer)))) {
@@ -383,9 +391,79 @@ uint32_t allocate_view_slot(D3D12_CPU_DESCRIPTOR_HANDLE* handle) {
   return m ? m->allocate_view(handle) : 0;
 }
 
-void map_gpu_pages(uint64_t address, const int64_t* pages, uint64_t count) {
+namespace {
+
+// Drops the runs' pages in [first, first + count), cutting the runs that reach into it.
+void cut_gpu_runs(std::map<uint64_t, GpuMemory::GpuRun>& runs, uint64_t first, uint64_t count) {
+  const uint64_t end = first + count;
+  const auto rest = [](const GpuMemory::GpuRun& r, uint64_t skip) {
+    return GpuMemory::GpuRun{r.pages - skip, r.source ? r.source + skip * r.step : 0, r.step};
+  };
+  auto it = runs.lower_bound(first);
+  if (it != runs.begin()) {
+    auto before = std::prev(it);
+    const GpuMemory::GpuRun r = before->second;
+    const uint64_t r_end = before->first + r.pages;
+    if (r_end > first) {
+      before->second.pages = first - before->first;
+      if (r_end > end) runs[end] = rest(r, end - before->first);
+    }
+  }
+  for (it = runs.lower_bound(first); it != runs.end() && it->first < end;) {
+    const GpuMemory::GpuRun r = it->second;
+    const uint64_t at = it->first;
+    it = runs.erase(it);
+    if (at + r.pages > end) {
+      runs[end] = rest(r, end - at);
+      break;
+    }
+  }
+}
+
+// The CPU side of a GPU mapping: each page's bytes (the committed pool's mirror for its pages,
+// else the source view), as runs.
+void record_gpu_runs(GpuMemory& m, uint64_t address, const int64_t* pages, uint64_t count, uint64_t source, uint64_t source_step) {
+  const uint64_t mirror = m.pool_mirror.load();
+  std::vector<uint64_t> at(count);
+  for (uint64_t k = 0; k < count; ++k) {
+    at[k] = mirror && pages[k] >= 0 ? mirror + static_cast<uint64_t>(pages[k]) * kPage : source ? source + k * source_step : 0;
+  }
+  std::lock_guard g(m.gpu_runs_lock);
+  const uint64_t first = address / kPage;
+  cut_gpu_runs(m.gpu_runs, first, count);
+  for (uint64_t k = 0; k < count;) {
+    uint64_t step = 0;
+    if (k + 1 < count) step = !at[k] ? 0 : at[k + 1] == at[k] + kPage ? kPage : 0;
+    uint64_t j = k + 1;
+    while (j < count && at[j] == (at[k] ? at[k] + (j - k) * step : 0)) ++j;
+    m.gpu_runs[first + k] = {j - k, at[k], step};
+    k = j;
+  }
+}
+
+}  // namespace
+
+const void* gpu_bytes_at(uint64_t address, uint64_t* bytes) {
+  GpuMemory& m = memory();
+  const uint64_t page = address / kPage, offset = address % kPage;
+  std::lock_guard g(m.gpu_runs_lock);
+  auto next = m.gpu_runs.upper_bound(page);
+  if (next != m.gpu_runs.begin()) {
+    const auto& [first, run] = *std::prev(next);
+    if (page - first < run.pages) {
+      const uint64_t k = page - first;
+      *bytes = (run.step ? run.pages - k : 1) * kPage - offset;
+      return run.source ? reinterpret_cast<const void*>(run.source + k * run.step + offset) : nullptr;
+    }
+  }
+  *bytes = next == m.gpu_runs.end() ? UINT64_MAX - address : next->first * kPage - address;
+  return reinterpret_cast<const void*>(address);
+}
+
+void map_gpu_pages(uint64_t address, const int64_t* pages, uint64_t count, uint64_t source, uint64_t source_step) {
   open_pool_if_ready();
   GpuMemory& m = memory();
+  if (!(address >> kAddressBits) && address % kPage == 0) record_gpu_runs(m, address, pages, count, source, source_step);
   if (!m.pool_window || m.pool_window == UINT32_MAX || (address >> kAddressBits) || address % kPage) return;
   std::vector<uint32_t> entries(count, 0u);
   for (uint64_t k = 0; k < count; ++k) {

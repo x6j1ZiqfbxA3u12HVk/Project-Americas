@@ -54,7 +54,13 @@ void flush_page_table(ID3D12GraphicsCommandList* list);
 // that completes.
 void page_table_submitted(uint64_t fence_value, const void* list);
 // The GPU's own page mapping (queue slot 31): the 64 KiB pages from `address` read GPU pool
-// pages `pages` (-1: unmapped), whatever the CPU sees there.
-void map_gpu_pages(uint64_t address, const int64_t* pages, uint64_t count);
+// pages `pages` (-1: unmapped or not in the committed pool), whatever the CPU sees there. On
+// the CPU side their bytes are at `source` (title memory, the pages' view; 0: nowhere), a page
+// further each (`source_step` 64 KiB) or all on one page (0).
+void map_gpu_pages(uint64_t address, const int64_t* pages, uint64_t count, uint64_t source, uint64_t source_step);
+// Where the CPU reads the bytes the GPU sees at `address`: for pages the GPU's own mapping
+// placed, the pages it put there; elsewhere `address` itself. nullptr where the GPU sees
+// nothing. `*bytes`: how many bytes from there stay in a row.
+const void* gpu_bytes_at(uint64_t address, uint64_t* bytes);
 
 }  // namespace am::rt::d3d12x

@@ -34,6 +34,27 @@ bool read_guarded(const void* from, void* to, size_t size) {
   }
 }
 
+// Title memory as the GPU sees it (gpu_bytes_at: through the GPU's own page mappings); bytes it
+// cannot read are zero.
+bool read_gpu(uint64_t address, void* to, uint64_t size) {
+  bool ok = true;
+  auto* out = static_cast<uint8_t*>(to);
+  while (size) {
+    uint64_t run = 0;
+    const void* from = gpu_bytes_at(address, &run);
+    const uint64_t n = std::min(size, std::max<uint64_t>(run, 1));
+    if (from) {
+      ok = read_guarded(from, out, n) && ok;
+    } else {
+      std::memset(out, 0, n);
+    }
+    address += n;
+    out += n;
+    size -= n;
+  }
+  return ok;
+}
+
 // GFX10's SW_4KB_S ("standard") tiling, the mode nearly every texture of the game uses: 4 KiB
 // tiles, row by row across the surface; inside a tile the address bits interleave the element's
 // x and y bits by element size (from AMD's address library patterns; 'z' is a byte within the
@@ -87,18 +108,33 @@ struct Texture {
   ComPtr<ID3D12Resource> resource;
   bool dirty = true;
   uint64_t checksum = 0;  // of its bytes in title memory when last uploaded
+  // Checks in a row that found it unchanged since it last changed; kLive and under: checked
+  // every flush (video frames, textures the title rewrites).
+  uint32_t quiet = UINT32_MAX;
 };
 
 // A quick checksum of title memory (0 when it cannot be read). Not every write to a texture's
 // memory passes through a path we see (the CPU, DirectStorage into physical pages), so the
 // textures are checked against their memory from time to time.
-uint64_t checksum_of(uint64_t address, uint64_t size) {
-  uint64_t h = 0x9E3779B97F4A7C15ull;
+uint64_t checksum_span(uint64_t h, const uint64_t* p, uint64_t words) {
   __try {
-    const auto* p = reinterpret_cast<const uint64_t*>(address);
-    for (uint64_t k = 0; k < size / 8; ++k) h = (h ^ p[k]) * 0x100000001B3ull + (h >> 29);
+    for (uint64_t k = 0; k < words; ++k) h = (h ^ p[k]) * 0x100000001B3ull + (h >> 29);
   } __except (EXCEPTION_EXECUTE_HANDLER) {
     return 0;
+  }
+  return h;
+}
+
+uint64_t checksum_of(uint64_t address, uint64_t size) {
+  uint64_t h = 0x9E3779B97F4A7C15ull;
+  for (uint64_t at = address, end = address + size / 8 * 8; at < end;) {
+    uint64_t run = 0;
+    const void* from = gpu_bytes_at(at, &run);
+    const uint64_t n = std::min(end - at, std::max<uint64_t>(run, 8)) / 8 * 8;
+    if (from) h = checksum_span(h, static_cast<const uint64_t*>(from), n / 8);
+    if (!h) return 0;
+    h += n;
+    at += n;
   }
   return h;
 }
@@ -289,7 +325,7 @@ struct Bindings {
         // The subresource's tiles, then each element from its place in its 4 KiB tile.
         const uint64_t size = uint64_t{s.row_pitch} * s.padded_rows;
         tiled.resize(size);
-        read_guarded(reinterpret_cast<const void*>(t.address + s.offset), tiled.data(), size);
+        read_gpu(t.address + s.offset, tiled.data(), size);
         const uint32_t eb = t.layout.element_bytes, pitch = s.row_pitch / eb;
         for (UINT y = 0; y < rows[k] && y < s.rows; ++y) {
           uint8_t* row = p + fp[k].Offset + uint64_t{y} * fp[k].Footprint.RowPitch;
@@ -303,8 +339,7 @@ struct Bindings {
       for (UINT z = 0; z < fp[k].Footprint.Depth; ++z) {
         for (UINT y = 0; y < rows[k] && y < s.rows; ++y) {
           const uint64_t from = t.address + s.offset + (uint64_t{z} * s.padded_rows + y) * s.row_pitch;
-          read_guarded(reinterpret_cast<const void*>(from),
-                       p + fp[k].Offset + (uint64_t{z} * rows[k] + y) * fp[k].Footprint.RowPitch, bytes);
+          read_gpu(from, p + fp[k].Offset + (uint64_t{z} * rows[k] + y) * fp[k].Footprint.RowPitch, bytes);
         }
       }
     }
@@ -325,17 +360,36 @@ struct Bindings {
     retired.push_back({kPending, recording, std::move(up)});
   }
 
-  // Every 15th flush, textures whose memory changed since their upload are marked for another:
-  // in turn, up to 16 MiB of them a time.
-  size_t flushes = 0, next_check = 0;
+  // Textures whose memory changed since their upload are marked for another. Those that
+  // changed lately (video frames) are checked every flush; the rest in turn, up to 8 MiB of them
+  // a flush.
+  static constexpr uint32_t kLive = 300;
+  size_t next_check = 0;
+  void check(Texture& t) {
+    if (checksum_of(t.address, t.size) != t.checksum) {
+      t.dirty = true;
+      t.quiet = 0;
+    } else if (t.quiet != UINT32_MAX) {
+      ++t.quiet;
+    }
+  }
   void check_textures() {
-    if (++flushes % 15 || textures.empty()) return;
-    uint64_t budget = 16ull << 20;
+    if (textures.empty()) return;
+    for (Texture& t : textures) {
+      if (!t.dirty && t.resource && t.quiet <= kLive) check(t);
+    }
+    constexpr uint64_t kBudget = 8ull << 20;
+    uint64_t budget = kBudget;
     for (size_t n = 0; n < textures.size() && budget; ++n) {
-      Texture& t = textures[next_check++ % textures.size()];
-      if (t.dirty || !t.resource || t.size > budget) continue;
-      budget -= t.size;
-      if (checksum_of(t.address, t.size) != t.checksum) t.dirty = true;
+      Texture& t = textures[next_check % textures.size()];
+      if (t.dirty || !t.resource || t.quiet <= kLive) {
+        ++next_check;
+        continue;
+      }
+      if (t.size > budget && budget != kBudget) break;  // a large one gets the next flush's whole budget
+      ++next_check;
+      budget -= std::min(t.size, budget);
+      check(t);
     }
   }
 
