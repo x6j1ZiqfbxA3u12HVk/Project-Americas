@@ -138,6 +138,132 @@ void hw_watch_thread() {
   }
 }
 
+// ---- AMERICAS_CLAMP_PAGE_RELEASE (diagnosis) ----
+// The title's 64 KiB page allocator keeps one 8-byte entry a page (the array's address at
+// game+0x71bfb08): a size class in bits 15-19, a reference count in bits 0-14. Its release
+// (game+0xe8890) drops one reference on the block holding a page and frees the block at 0. In
+// the loading after Confirm some pages are released more often than taken; the count wraps and
+// the free lists break (a thread then spins in game+0x4f8f120). With this switch, the release
+// is ours: the same steps, but a release of a page whose count is already 0 is refused and
+// logged with its stack.
+
+constexpr uint64_t kPageTableRva = 0x71bfb08, kPageReleaseRva = 0xe8890, kPageFreeRva = 0x221b7d0;
+uint8_t* g_title_base = nullptr;
+
+void clamped_page_release(uint32_t index) {
+  uint64_t* const table = *reinterpret_cast<uint64_t**>(g_title_base + kPageTableRva);
+  const uint32_t size_class = static_cast<uint32_t>(table[index] >> 15) & 0x1F;
+  const uint32_t mask = size_class >= 0x18 ? 0xFFFFFFFFu : (0xFFFFFFFFu << size_class);
+  const uint32_t head = index & mask;
+  const uint64_t entry = table[head];
+  if ((entry & 0x7FFF) == 0) {
+    static std::atomic<int> told{0};
+    const int n = told.fetch_add(1);
+    if (n < 40) {
+      void* frames[8] = {};
+      const USHORT got = RtlCaptureStackBackTrace(1, 8, frames, nullptr);
+      std::string text;
+      for (USHORT k = 0; k < got; ++k) text += " " + g_process->describe_address(reinterpret_cast<uint64_t>(frames[k]));
+      logf("pages: a release of page 0x%x (block 0x%x, entry 0x%llx) with no reference left: refused;%s", index, head,
+           static_cast<unsigned long long>(entry), text.c_str());
+    } else if (n == 40 || n == 1000 || n == 100000) {
+      logf("pages: %d releases with no reference left refused so far", n + 1);
+    }
+    return;
+  }
+  const uint64_t count = (entry - 1) & 0x7FFF;
+  table[head] = (entry & ~0x7FFFull) | count;
+  if (!count) reinterpret_cast<void (*)(uint64_t, uint64_t*)>(g_title_base + kPageFreeRva)(head, table);
+}
+
+// The title releases an object's pages (game+0x41db90): its GPU address at +0x18 (64 KiB
+// aligned down), its size (u32 at +0x8 times the low 12 bits of the u16 at +0xc, 64 KiB
+// aligned up), moved from the pool's GPU view to its CPU view (+ [game+0x9e1dac0] -
+// [game+0x9e1dad0]) and released (game+0x41dbe0). Ours does the same and logs the releases
+// larger than the allocator's block they start in.
+constexpr uint64_t kObjectReleaseRva = 0x41db90, kPoolReleaseRva = 0x41dbe0, kCpuViewRva = 0x9e1dac0,
+                   kPoolSizeRva = 0x9e1dac8, kGpuViewRva = 0x9e1dad0;
+
+void checked_object_release(uint8_t* object) {
+  uint64_t& gpu = *reinterpret_cast<uint64_t*>(object + 0x18);
+  if (!gpu) return;
+  const uint64_t address = gpu & ~0xFFFFull;
+  const uint32_t size = static_cast<uint32_t>(
+      ((*reinterpret_cast<uint16_t*>(object + 0xC) & 0xFFFu) * *reinterpret_cast<uint32_t*>(object + 0x8) + 0xFFFFu) &
+      0xFFFF0000u);
+  const uint64_t cpu_view = *reinterpret_cast<uint64_t*>(g_title_base + kCpuViewRva);
+  const uint64_t gpu_view = *reinterpret_cast<uint64_t*>(g_title_base + kGpuViewRva);
+  static std::atomic<bool> bases{false};
+  if (!bases.exchange(true)) {
+    logf("pages: the pool's CPU view 0x%llx, GPU view 0x%llx, %llu bytes", static_cast<unsigned long long>(cpu_view),
+         static_cast<unsigned long long>(gpu_view),
+         static_cast<unsigned long long>(*reinterpret_cast<uint64_t*>(g_title_base + kPoolSizeRva)));
+  }
+  const uint64_t pool = address + cpu_view - gpu_view;
+  const uint64_t* const table = *reinterpret_cast<uint64_t**>(g_title_base + kPageTableRva);
+  const uint64_t pool_size = *reinterpret_cast<uint64_t*>(g_title_base + kPoolSizeRva);
+  if (pool >= cpu_view && pool < cpu_view + pool_size && size) {
+    const uint32_t unit = static_cast<uint32_t>((pool - cpu_view) >> 16), units = size >> 16;
+    const uint32_t size_class = static_cast<uint32_t>(table[unit] >> 15) & 0x1F;
+    const uint32_t block = size_class >= 0x18 ? 1u : (1u << size_class);
+    if (units > block && (size_class == 0 || size_class >= 0x18)) {
+      static std::atomic<int> told{0};
+      if (told.fetch_add(1) < 30) {
+        void* frames[6] = {};
+        const USHORT got = RtlCaptureStackBackTrace(1, 6, frames, nullptr);
+        std::string text;
+        for (USHORT k = 0; k < got; ++k) text += " " + g_process->describe_address(reinterpret_cast<uint64_t>(frames[k]));
+        const uint64_t* q = reinterpret_cast<const uint64_t*>(object);
+        logf("pages: object %p%s releases %u units from unit 0x%x, a block of %u (entry 0x%llx); object words %llx %llx %llx "
+             "%llx %llx %llx;%s",
+             object, d3d12x::is_object(object) ? " (one of ours)" : "", units, unit, block,
+             static_cast<unsigned long long>(table[unit]), static_cast<unsigned long long>(q[0]),
+             static_cast<unsigned long long>(q[1]), static_cast<unsigned long long>(q[2]), static_cast<unsigned long long>(q[3]),
+             static_cast<unsigned long long>(q[4]), static_cast<unsigned long long>(q[5]), text.c_str());
+      }
+    }
+  }
+  reinterpret_cast<void (*)(uint64_t, uint64_t)>(g_title_base + kPoolReleaseRva)(address, uint64_t{size});
+  gpu = 0;
+}
+
+void install_page_release_clamp(uint8_t* base) {
+  g_title_base = base;
+  if (GetEnvironmentVariableA("AMERICAS_CHECK_PAGE_RELEASE", nullptr, 0)) {
+    uint8_t* at = base + kObjectReleaseRva;
+    const uint8_t expected[] = {0x56, 0x48, 0x83, 0xEC, 0x20, 0x48, 0x89, 0xCE, 0x48, 0x8B, 0x49, 0x18};
+    if (std::memcmp(at, expected, sizeof expected) == 0) {
+      uint8_t jump[12] = {0x48, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xE0};
+      const uint64_t target = reinterpret_cast<uint64_t>(&checked_object_release);
+      std::memcpy(jump + 2, &target, 8);
+      DWORD old = 0;
+      if (VirtualProtect(at, sizeof jump, PAGE_EXECUTE_READWRITE, &old)) {
+        std::memcpy(at, jump, sizeof jump);
+        VirtualProtect(at, sizeof jump, old, &old);
+        FlushInstructionCache(GetCurrentProcess(), at, sizeof jump);
+        logf("pages: AMERICAS_CHECK_PAGE_RELEASE: object page releases are checked");
+      }
+    }
+  }
+  if (!GetEnvironmentVariableA("AMERICAS_CLAMP_PAGE_RELEASE", nullptr, 0)) return;
+  uint8_t* at = base + kPageReleaseRva;
+  // mov rdx, [rip+...] (the page table); mov eax, ecx; mov ecx, ecx: the version this was read from.
+  const uint8_t expected[] = {0x48, 0x8B, 0x15, 0x71, 0x72, 0x0D, 0x07, 0x89, 0xC8, 0x89, 0xC9};
+  if (std::memcmp(at, expected, sizeof expected) != 0) {
+    logf("pages: AMERICAS_CLAMP_PAGE_RELEASE: the release is not where this build expects it; not patched");
+    return;
+  }
+  uint8_t jump[12] = {0x48, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xE0};  // mov rax, imm64; jmp rax
+  const uint64_t target = reinterpret_cast<uint64_t>(&clamped_page_release);
+  std::memcpy(jump + 2, &target, 8);
+  DWORD old = 0;
+  if (!VirtualProtect(at, sizeof jump, PAGE_EXECUTE_READWRITE, &old)) return;
+  std::memcpy(at, jump, sizeof jump);
+  VirtualProtect(at, sizeof jump, old, &old);
+  FlushInstructionCache(GetCurrentProcess(), at, sizeof jump);
+  logf("pages: AMERICAS_CLAMP_PAGE_RELEASE: releases of pages with no reference left are refused");
+}
+
 void start_hw_watch() {
   char spec[256] = {};
   if (!GetEnvironmentVariableA("AMERICAS_HW_WATCH", spec, sizeof spec)) return;
@@ -326,7 +452,9 @@ bool TitleProcess::prepare(MappedImage& m, bool is_executable, std::string& erro
   CpuCompatResult cpu;
   if (!apply_cpu_compat(m, options_.cache_dir, options_.allow_missing_cpu_features, cpu, error)) return false;
   cpu_[&m] = cpu;
-  return tls_.install(m, is_executable, error) && finish_image(m, error);
+  if (!tls_.install(m, is_executable, error) || !finish_image(m, error)) return false;
+  if (is_executable) install_page_release_clamp(m.base);
+  return true;
 }
 
 void TitleProcess::call_tls_callbacks(const MappedImage& m, unsigned long reason) {

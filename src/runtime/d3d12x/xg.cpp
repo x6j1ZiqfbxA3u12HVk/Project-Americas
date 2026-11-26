@@ -19,15 +19,33 @@
 #include <algorithm>
 #include <atomic>
 #include <cstring>
+#include <intrin.h>
+#include <mutex>
+#include <set>
 
 #include "runtime/d3d12x/bindings.h"
 #include "runtime/d3d12x/d3d12x.h"
 #include "runtime/d3d12x/layout.h"
 #include "runtime/d3d12x/object.h"
 #include "runtime/log.h"
+#include "runtime/process.h"
 
 namespace am::rt::d3d12x {
 namespace {
+
+// Each place in the title that asks XG something is logged once (which code depends on our
+// answers), with the first texture it asked about.
+void note_caller(const char* what, const void* caller, const D3D12_RESOURCE_DESC& d, uint64_t size) {
+  static std::mutex lock;
+  static std::set<const void*> seen;
+  {
+    std::lock_guard g(lock);
+    if (seen.size() > 64 || !seen.insert(caller).second) return;
+  }
+  logf("xg: %s asked from %s: %llux%u, %u mips, format %u: %llu bytes", what,
+       process() ? process()->describe_address(reinterpret_cast<uint64_t>(caller)).c_str() : "?",
+       static_cast<unsigned long long>(d.Width), d.Height, d.MipLevels, d.Format, static_cast<unsigned long long>(size));
+}
 
 struct TextureComputer : Object {
   D3D12_RESOURCE_DESC desc{};
@@ -71,6 +89,7 @@ HRESULT WINAPI get_resource_layout(TextureComputer* self, ResourceLayout* out) {
   std::memset(out, 0, sizeof *out);
   const TextureLayout& l = self->layout;
   const D3D12_RESOURCE_DESC& d = self->desc;
+  note_caller("GetResourceLayout", _ReturnAddress(), d, l.size);
   const bool three_d = d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
   const uint32_t mips = std::min<uint32_t>(l.mips, 15), array = three_d ? 1 : std::max<uint32_t>(d.DepthOrArraySize, 1);
   out->size = l.size;

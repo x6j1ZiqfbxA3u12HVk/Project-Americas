@@ -1193,3 +1193,39 @@ pressure (analysis in `C:\Project Americas\crash`, WinDbg's cdb in the WinDbg pa
     twice: a completion reported twice, a status array or fence value written more than
     once, a residency or tile-mapping call that reports a failure, a physical-page free or
     query answered wrongly. The underflow is deterministic, so the same watch reproduces.
+
+## The loading stall, narrowed to four textures (2026-11-26, evening)
+
+* **The pool.** The title's 64 KiB page allocator manages a 24 GB pool with two views of the
+  same physical pages: CPU `[game+0x9e1dac0]` = `0x180090000`, GPU `[game+0x9e1dad0]` =
+  `0x780090000` (both from `+0x5f3fcc0` with `0x20402000`; pages mapped into both by
+  `+0xf2cbxx`). One 8-byte entry a 64 KiB unit (array at `[game+0x71bfb08]`): size class in
+  bits 15-19, reference count in bits 0-14, free-list next index in bits 41-61.
+  Allocation: `+0x221b9e0` (size rounded to 64 KiB and a power of two) -> `+0x5238780`.
+  Release of a unit: `+0xe8890`. Release of a range: `+0x4f8f330(cpu address, size)`, which
+  for a range starting in a class-0 (one unit) block releases every unit of the range one by
+  one.
+* **The culprits (`AMERICAS_CHECK_PAGE_RELEASE=1`):** the title releases a texture's pages in
+  `+0x41db90`: GPU address at +0x18 (64 KiB down), size = u32 +0x8 x (u16 +0xc & 0xfff) (64 KiB
+  up), moved to the CPU view, released. The check replaces that function with an identical
+  one that logs releases larger than the block they start in. Each run: **exactly four**,
+  all objects with vtable `0x1461ecdb0` (a texture class, RTTI stripped; constructors
+  `+0x325060`/`+0x325090` for textures placed in a resource, `+0x501f3a0` for others),
+  1728 x 1024 (`+0x8` = 0x6c0, `+0xc` = 0x400, `+0xe` = 8), each releasing 27 units from a
+  1-unit block, 128 KiB apart (GPU `0xbf2320000`..`0xbf2380000`, CPU `0x5f2320000`..: inside
+  `story000.rpf`'s data). Their 27-unit releases run through neighbouring blocks: those
+  lose references they never gave, are freed while in use (the corrupt fields of the
+  earlier crashes) and the free lists break (the spin).
+* So the title believes these four textures own 1.7 MB of pages of their own, while their
+  address still points into the resource they were loaded with. On the console a step must
+  move them first (texture streaming giving them memory of their own, e.g. for higher mips)
+  or keep them from being released this way. Not the cause: XG (only two callers, both
+  single-mip textures early on), GetResourceAllocationInfo (48 calls, render targets),
+  refused DirectStorage requests (none), our objects (`is_object` false).
+* **Next:** follow one of the four from its constructor: which resource holds it (its
+  memory sits in `story000.rpf`'s data at `0x5f23xxxxx`), what the streamer's entry for it
+  (table `[game+0x9c3e108]`, 16 bytes an index; state in the top 3 bits of the qword the
+  release reads at `(rdx)`) says, and which call of ours the streamer waits on before
+  giving such a texture memory of its own. `AMERICAS_CLAMP_PAGE_RELEASE=1` refuses releases
+  past zero but does not save the run (the over-release takes references that exist).
+* Also new: `xg: GetResourceLayout asked from ...` logs each place that asks XG (once).
