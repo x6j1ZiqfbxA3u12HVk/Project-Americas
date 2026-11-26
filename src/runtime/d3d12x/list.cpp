@@ -441,9 +441,26 @@ void dispatch(HostList& h, ID3D12GraphicsCommandList* list, const Command& c) {
       logf("gpu: compute root signature of %s:%s", describe_pipeline(h.pipeline).c_str(), params.c_str());
     }
   }
+  // Large dispatches are named (the GPU ran some for seconds, and lost the device): D3D12 takes
+  // at most 65,535 groups a dimension, the console more; those are skipped, not sent.
+  const uint64_t gx = static_cast<uint32_t>(c.a[0]), gy = static_cast<uint32_t>(c.a[1]), gz = static_cast<uint32_t>(c.a[2]);
+  const bool too_large = gx > 65535 || gy > 65535 || gz > 65535;
+  if (too_large || gx * gy * gz > (uint64_t{1} << 20)) {
+    static std::atomic<int> told{0};
+    if (told.fetch_add(1, std::memory_order_relaxed) < 24) {
+      logf("gpu: a dispatch of %llu x %llu x %llu groups (%s)%s", static_cast<unsigned long long>(gx), static_cast<unsigned long long>(gy),
+           static_cast<unsigned long long>(gz), compute_marker_of(h.pipeline).substr(0, 16).c_str(),
+           too_large ? ": over D3D12's 65,535 a dimension, skipped" : "");
+    }
+    if (too_large) {
+      ++g_dispatches_skipped;
+      return;
+    }
+  }
+  if (gx == 0 || gy == 0 || gz == 0) return;  // nothing to run
   list->SetPipelineState(pso);
   list->SetComputeRoot32BitConstants(0, kUserDataConstants, cs, 0);
-  list->Dispatch(static_cast<UINT>(c.a[0]), static_cast<UINT>(c.a[1]), static_cast<UINT>(c.a[2]));
+  list->Dispatch(static_cast<UINT>(gx), static_cast<UINT>(gy), static_cast<UINT>(gz));
   D3D12_RESOURCE_BARRIER b{};
   b.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
   list->ResourceBarrier(1, &b);
