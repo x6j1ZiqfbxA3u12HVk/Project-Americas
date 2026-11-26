@@ -56,6 +56,8 @@ struct Ctx {
   std::set<uint32_t> per_vertex_attrs;
   // The pixel shader exports depth (MRTZ): AmOut gains SV_Depth.
   bool depth_export = false;
+  bool uses_lod = false;     // image_get_lod: the level-of-detail helpers
+  bool uses_movrel = false;  // v_movrel*: am_nv bounds the indexed VGPRs
   // Descriptor lookups still valid in this block, by first SGPR (T#s, S#s), and every one made.
   std::set<uint32_t> live_images, live_samplers, image_vars, sampler_vars;
   // Forgets the lookups whose registers [lo, hi] may have changed.
@@ -482,6 +484,7 @@ bool image(Ctx& c, const ImgOp& op) {
       const std::string gsel = dim == 3 ? "cc.xyz" : dim == 0 || dim == 4 ? "cc.x" : dim == 2 ? "cc" : "cc.xy";
       const std::string gtype = dim == 3 || dim == 2 ? "float3" : dim == 0 || dim == 4 ? "float" : "float2";
       c.line("  " + gtype + " dx = AM_DX(" + gsel + "), dy = AM_DY(" + gsel + ");");
+      c.uses_lod = true;
       c.line("  uint4 r = asuint(float4(am_lod_" + suffix + "(im, sm, dx, dy), 0.0f, 0.0f));");
       write_results(channels, true);
       break;
@@ -1432,6 +1435,36 @@ const std::unordered_map<std::string, Handler>& table() {
       write16(c, f16_result(c, "asfloat(" + c.src(c.f(Field::SRC2)) + ")"));
       return true;
     };
+    // Relative VGPR moves: M0 (s124) indexes the source (movrels), the destination (movreld)
+    // or both (movrelsd), kept inside the program's VGPRs.
+    t["v_movrels_b32"] = [](Ctx& c) {
+      if (!vector_form(c)) return false;
+      c.uses_movrel = true;
+      const uint32_t sr = c.f(Field::SRC0);
+      if (sr < 256) return c.fail("v_movrels_b32 of a scalar source");
+      c.touch_v(sr - 256);
+      c.vwrite(vop_dst(c), "v[min(" + num(sr - 256) + "u + s[124], am_nv - 1u)]");
+      return true;
+    };
+    t["v_movreld_b32"] = [](Ctx& c) {
+      if (!vector_form(c)) return false;
+      c.uses_movrel = true;
+      const uint32_t d = vop_dst(c);
+      c.touch_v(d);
+      c.line("if (AM_ACT) { uint x = " + c.src(c.f(Field::SRC0)) + "; v[min(" + num(d) + "u + s[124], am_nv - 1u)] = x; }");
+      return true;
+    };
+    t["v_movrelsd_b32"] = [](Ctx& c) {
+      if (!vector_form(c)) return false;
+      c.uses_movrel = true;
+      const uint32_t sr = c.f(Field::SRC0), d = vop_dst(c);
+      if (sr < 256) return c.fail("v_movrelsd_b32 of a scalar source");
+      c.touch_v(sr - 256);
+      c.touch_v(d);
+      c.line("if (AM_ACT) { uint x = v[min(" + num(sr - 256) + "u + s[124], am_nv - 1u)]; v[min(" + num(d) +
+             "u + s[124], am_nv - 1u)] = x; }");
+      return true;
+    };
     t["s_barrier"] = [](Ctx& c) {
       c.line("GroupMemoryBarrierWithGroupSync();");
       return true;
@@ -2088,7 +2121,9 @@ float4 am_sample_cube(AmImage im, AmSampler sm, float4 c, float lod) {
   if (AM_ARR(im)) { TextureCubeArray<float4> t = ResourceDescriptorHeap[im.srv]; return t.SampleLevel(s, c, lod); }
   TextureCube<float4> t1 = ResourceDescriptorHeap[im.srv]; return t1.SampleLevel(s, c.xyz, lod);
 }
-)" R"(
+)";
+// Level-of-detail helpers, only for programs with image_get_lod (the others keep their source).
+const char* kLodHelpers = R"(
 // The level of detail for these gradients: (clamped to the image's levels, unclamped). The
 // sampler's own lod clamps are not applied.
 float2 am_lod_of(float r, uint mips) {
@@ -2127,7 +2162,8 @@ float2 am_lod_cube(AmImage im, AmSampler sm, float3 dx, float3 dy) {
   float3 a = dx * (0.5f * w), b = dy * (0.5f * w);
   return am_lod_of(max(dot(a, a), dot(b, b)), m);
 }
-// Sampling with gradients (given, or taken across the console's quads of lanes).
+)";
+const char* kImageHelpers2 = R"(// Sampling with gradients (given, or taken across the console's quads of lanes).
 float4 am_grad_1d(AmImage im, AmSampler sm, float2 c, float dx, float dy) {
   if (!AM_SAMPLED(im, sm)) return 0.0f;
   SamplerState s = SamplerDescriptorHeap[sm.index];
@@ -2753,7 +2789,11 @@ Translation finish_graphics(const TranslateInput& in, const Ctx& c, Translation 
   h += binding == Binding::Runtime ? kRuntimeBinding : kTestBinding;
   h += format_table();
   h += kBufferHelpers;
-  if (c.uses_images) h += kImageHelpers;
+  if (c.uses_images) {
+    h += kImageHelpers;
+    if (c.uses_lod) h += kLodHelpers;
+    h += kImageHelpers2;
+  }
   h += "\nstruct AmIn {\n";
   if (!vs) h += "  float4 am_pos : SV_Position;\n";
   for (size_t k = 0; k < in.inputs.size(); ++k) {
@@ -2788,7 +2828,7 @@ Translation finish_graphics(const TranslateInput& in, const Ctx& c, Translation 
   h += lane_macros(c.wave64);
   h += vs ? "#define AM_END() {}\n" : "#define AM_END() { if (AM_ACT == 0u) discard; }\n";
   h += vs ? "void am_body(AmIn am_in, uint am_vid, uint am_iid, inout AmOut am_o) {\n" : "void am_body(AmIn am_in, inout AmOut am_o) {\n";
-  h += "  uint s[128];\n  uint v[" + num(nv) + "];\n ";
+  h += "  uint s[128];\n  uint v[" + num(nv) + "];\n" + (c.uses_movrel ? "  const uint am_nv = " + num(nv) + "u;\n" : std::string()) + " ";
   for (uint32_t i = 0; i < 128; ++i) h += " s[" + num(i) + "] = 0u;";
   h += "\n ";
   for (uint32_t j = 0; j < nv; ++j) h += " v[" + num(j) + "] = 0u;";
@@ -2962,13 +3002,17 @@ Translation translate(const TranslateInput& in, Binding binding) {
   h += binding == Binding::Runtime ? kRuntimeBinding : kTestBinding;
   h += format_table();
   h += kBufferHelpers;
-  if (c.uses_images) h += kImageHelpers;
+  if (c.uses_images) {
+    h += kImageHelpers;
+    if (c.uses_lod) h += kLodHelpers;
+    h += kImageHelpers2;
+  }
   if (c.uses_lds || in.lds_bytes) h += "groupshared uint am_lds[" + num(std::max<uint32_t>(in.lds_bytes / 4, 1)) + "];\n";
   const uint32_t tx = std::max<uint32_t>(in.cs_threads[0], 1), ty = std::max<uint32_t>(in.cs_threads[1], 1),
                  tz = std::max<uint32_t>(in.cs_threads[2], 1);
   h += "\n[numthreads(" + num(tx) + ", " + num(ty) + ", " + num(tz) + ")]\n[WaveSize(" + num(tr.wave_size) + ")]\n";
   h += "void main(uint3 am_tid : SV_GroupThreadID, uint3 am_gid : SV_GroupID, uint am_flat : SV_GroupIndex) {\n";
-  h += "  uint s[128];\n  uint v[" + num(nv) + "];\n ";
+  h += "  uint s[128];\n  uint v[" + num(nv) + "];\n" + (c.uses_movrel ? "  const uint am_nv = " + num(nv) + "u;\n" : std::string()) + " ";
   for (uint32_t i = 0; i < 128; ++i) h += " s[" + num(i) + "] = 0u;";
   h += "\n ";
   for (uint32_t j = 0; j < nv; ++j) h += " v[" + num(j) + "] = 0u;";

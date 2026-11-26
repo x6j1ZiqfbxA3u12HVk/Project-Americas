@@ -990,3 +990,20 @@ TEST_CASE(translate_f16_compares) {
   CHECK(r.s(106) == 0xFFFFFFE0u && r.s(107) == 0xFFFFFFFFu);
   CHECK(r.s(4) == 0xFFFFFFFBu && r.s(5) == 0xFFFFFFFFu);
 }
+
+// Relative VGPR moves, indexed by M0.
+TEST_CASE(translate_relative_vgpr_moves) {
+  const Result r = run({
+      0x7E0A028B,  // v_mov_b32 v5, 11
+      0x7E0C0296,  // v_mov_b32 v6, 22
+      0x7E0E02A1,  // v_mov_b32 v7, 33
+      0xBEFC0382,  // s_mov_b32 m0, 2
+      0x7E108705,  // v_movrels_b32 v8, v5     (v7)
+      0x7E028506,  // v_movreld_b32 v1, v6     (into v3)
+      0xBF810000,  // s_endpgm
+  });
+  if (!r.ran) return;
+  bool ok = true;
+  for (int l = 0; l < 64 && ok; ++l) ok = r.v(l, 8) == 33 && r.v(l, 3) == 22;
+  CHECK(ok);
+}
