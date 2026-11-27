@@ -1,5 +1,7 @@
 #include "shader/dxil/dxil.h"
 
+#include <windows.h>
+
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -598,8 +600,8 @@ Value Module::attribute_at_vertex(uint32_t id, uint8_t col, uint8_t vertex) {
 
 // ---- finishing: SSA, checks, metadata ----
 
-bool Module::finish(std::string& error) {
-  if (finished_) return true;
+// Reachable blocks in reverse postorder, and their predecessors (from reachable blocks only).
+bool Module::compute_order(std::string& error) {
   // Reachable blocks in reverse postorder (an explicit stack: programs have 100,000s of blocks).
   const size_t nb = blocks_.size();
   std::vector<uint8_t> seen(nb, 0);
@@ -643,7 +645,39 @@ bool Module::finish(std::string& error) {
   // Predecessors from reachable blocks only.
   for (auto& b : blocks_) b.preds.clear();
   for (Block b : order_) each_successor(insts_[blocks_[b].insts.back()], [&](uint32_t s) { blocks_[s].preds.push_back(b); });
+  return true;
+}
+
+bool Module::finish(std::string& error) {
+  if (finished_) return true;
+  if (!compute_order(error)) return false;
   build_ssa();
+  // AM_DXIL_NO_OPT=1: the module as made (to compare what the optimizer does).
+  if (!GetEnvironmentVariableA("AM_DXIL_NO_OPT", nullptr, 0)) optimize();
+  // Declarations and globals something left uses (an instruction dropped may have been their last).
+  for (auto& f : functions_) f.used = f.body;
+  for (auto& g : globals_) g.used = false;
+  for (Block b : order_) {
+    for (const auto* list : {&blocks_[b].phis, &blocks_[b].insts}) {
+      for (uint32_t ii : *list) {
+        const Inst& in = insts_[ii];
+        if (in.op == Op::Read || in.op == Op::Write || (in.result != kNone && resolve(in.result) != in.result)) continue;
+        const bool blocks_in_ops = in.op == Op::Br || in.op == Op::CondBr || in.op == Op::Switch || in.op == Op::Phi;
+        for (size_t k = 0; k < in.ops.size(); ++k) {
+          // Blocks are not values: a br has only its block; a conditional branch or switch, its
+          // condition first; a phi, value and block pairs.
+          if (blocks_in_ops && (in.op == Op::Br || (in.op == Op::Phi ? (k & 1) != 0 : k > 0))) continue;
+          if (in.op == Op::Extract && k > 0) break;
+          const Value v = resolve(in.ops[k]);
+          if (v >= values_.size()) continue;
+          if (values_[v].kind == ValueKind::Function) {
+            functions_[values_[v].bits].used = true;
+          }
+          if (values_[v].kind == ValueKind::Global) globals_[values_[v].bits].used = true;
+        }
+      }
+    }
+  }
   // Shader flags from what the program does; the signatures' usage masks from its loads and
   // stores (attributeAtVertex reads count for no mask, as DXC has it).
   input_masks_.assign(inputs_.size(), 0);
@@ -652,6 +686,7 @@ bool Module::finish(std::string& error) {
     for (uint32_t ii : blocks_[b].insts) {
       const Inst& in = insts_[ii];
       if (in.op == Op::Read || in.op == Op::Write) continue;
+      if (in.result != kNone && resolve(in.result) != in.result) continue;  // folded or dead: not written
       if (in.result != kNone) {
         const Type t = values_[in.result].type;
         if (t == i64_) flags_ |= kFlagInt64;
@@ -751,6 +786,461 @@ void Module::entry_metadata() {
   }
   const Md entry = md_node({md_value(main_), md_string("main"), signatures, resources, md_node(props)});
   named_metadata("dx.entryPoints", {entry});
+}
+
+// Branches the driver need not see: a small triangle or diamond whose arms only compute (no
+// stores, calls with effects, wave or quad operations, derivatives, or loads from memory a bad
+// index could miss) runs both arms in the block that branched, the join's phis becoming selects;
+// a block with one successor that has no other predecessor is merged with it. What DXC's
+// SimplifyCFG does for the programs it compiles; every block costs the driver's compiler.
+void Module::simplify_cfg() {
+  constexpr size_t kSpeculate = 48;  // instructions both arms may hold together
+  const auto term = [&](Block x) -> Inst& { return insts_[blocks_[x].insts.back()]; };
+  const auto live = [&](const Inst& in) { return in.result == kNone || resolve(in.result) == in.result; };
+  const auto only_pred = [&](Block x, Block p) { return blocks_[x].preds.size() == 1 && blocks_[x].preds[0] == p; };
+  const auto br_to = [&](Block x, Block& to) {
+    const Inst& t = term(x);
+    if (t.op != Op::Br) return false;
+    to = t.ops[0];
+    return true;
+  };
+  const auto has_live_phi = [&](Block x) {
+    for (uint32_t pi : blocks_[x].phis) {
+      if (live(insts_[pi])) return true;
+    }
+    return false;
+  };
+  const auto incoming = [&](const Inst& phi, Block from) -> Value {
+    for (size_t k = 0; k + 1 < phi.ops.size(); k += 2) {
+      if (phi.ops[k + 1] == from) return phi.ops[k];
+    }
+    return kNone;
+  };
+  // The cost of running a block's body unconditionally, or kNone if it must not be.
+  const auto spec_cost = [&](Block x) -> size_t {
+    size_t cost = 0;
+    const auto& list = blocks_[x].insts;
+    for (size_t k = 0; k + 1 < list.size(); ++k) {
+      const Inst& in = insts_[list[k]];
+      if (in.op == Op::Read || in.op == Op::Write || !live(in)) continue;
+      switch (in.op) {
+        case Op::Cast:
+        case Op::Cmp:
+        case Op::Select:
+        case Op::Gep:
+        case Op::Extract: break;
+        case Op::Bin: {
+          const Bin op = static_cast<Bin>(in.code);
+          uint64_t d = 0;
+          const bool division = op == Bin::UDiv || op == Bin::SDiv || op == Bin::URem || op == Bin::SRem;
+          if (division && is_int(values_[in.result].type) && !(constant_int(in.ops[1], d) && d != 0)) return kNone;
+          break;
+        }
+        case Op::Call: {
+          if (in.result == kNone) return kNone;
+          const FunctionInfo& f = functions_[values_[in.ops[0]].bits];
+          if (f.attr != Attr::ReadNone && f.attr != Attr::ReadOnly) return kNone;
+          const std::string_view n(f.name);
+          if (n.substr(0, 10) == "dx.op.wave" || n.substr(0, 10) == "dx.op.quad" || n.substr(0, 18) == "dx.op.isHelperLane") return kNone;
+          uint64_t opcode = 0;
+          if (constant_int(in.ops[1], opcode) && opcode >= 83 && opcode <= 86) return kNone;  // derivatives
+          break;
+        }
+        default: return kNone;
+      }
+      ++cost;
+    }
+    return cost;
+  };
+  const auto move_body = [&](Block from, Block into) {
+    auto& dst = blocks_[into].insts;
+    const uint32_t t = dst.back();
+    dst.pop_back();
+    const auto& src = blocks_[from].insts;
+    dst.insert(dst.end(), src.begin(), src.end() - 1);
+    dst.push_back(t);
+    blocks_[from].insts.clear();
+    blocks_[from].phis.clear();
+  };
+  const auto add_select = [&](Block into, Value c, Value a, Value b) {
+    const Type t = values_[resolve(a)].type;
+    Inst in;
+    in.op = Op::Select;
+    in.type = t;
+    in.ops = {c, a, b};
+    const uint32_t index = static_cast<uint32_t>(insts_.size());
+    in.result = add_value(ValueKind::Inst, t, index);
+    insts_.push_back(std::move(in));
+    auto& list = blocks_[into].insts;
+    list.insert(list.end() - 1, index);
+    forward_.resize(values_.size(), kNone);
+    return insts_[index].result;
+  };
+  const auto fwd = [&](Value from, Value to) {
+    forward_.resize(values_.size(), kNone);
+    forward_[from] = to;
+  };
+  std::string error;
+  for (int sweep = 0; sweep < 64; ++sweep) {
+    bool changed = false;
+    std::vector<uint8_t> touched(blocks_.size(), 0);
+    const auto free = [&](std::initializer_list<Block> bs) {
+      for (Block x : bs) {
+        if (touched[x]) return false;
+      }
+      return true;
+    };
+    const auto touch = [&](std::initializer_list<Block> bs) {
+      for (Block x : bs) touched[x] = 1;
+    };
+    const std::vector<Block> order = order_;
+    for (const Block b : order) {
+      if (blocks_[b].insts.empty() || touched[b]) continue;
+      Inst& t = term(b);
+      if (t.op == Op::CondBr) {
+        const Value c = t.ops[0];
+        const Block bt = t.ops[1], bf = t.ops[2];
+        if (bt == bf || bt == b || bf == b) continue;
+        Block jt = kNone, jf = kNone;
+        const bool arm_t = only_pred(bt, b) && br_to(bt, jt) && !has_live_phi(bt);
+        const bool arm_f = only_pred(bf, b) && br_to(bf, jf) && !has_live_phi(bf);
+        // A diamond: both arms meet at a block with only them before it.
+        if (arm_t && arm_f && jt == jf && jt != b && blocks_[jt].preds.size() == 2 && free({b, bt, bf, jt})) {
+          const size_t ct = spec_cost(bt), cf = spec_cost(bf);
+          if (ct != kNone && cf != kNone && ct + cf <= kSpeculate) {
+            move_body(bt, b);
+            move_body(bf, b);
+            for (uint32_t pi : blocks_[jt].phis) {
+              const Inst& p = insts_[pi];
+              if (!live(p)) continue;
+              fwd(p.result, add_select(b, c, incoming(p, bt), incoming(p, bf)));
+            }
+            Inst& nt = term(b);
+            nt.op = Op::Br;
+            nt.ops = {jt};
+            touch({b, bt, bf, jt});
+            changed = true;
+            continue;
+          }
+        }
+        // A triangle: one arm goes on to the other target.
+        for (int side = 0; side < 2; ++side) {
+          const Block arm = side == 0 ? bt : bf, other = side == 0 ? bf : bt;
+          const bool ok = side == 0 ? arm_t && jt == other : arm_f && jf == other;
+          if (!ok || blocks_[other].preds.size() != 2 || !free({b, arm, other})) continue;
+          const size_t cost = spec_cost(arm);
+          if (cost == kNone || cost > kSpeculate) continue;
+          move_body(arm, b);
+          for (uint32_t pi : blocks_[other].phis) {
+            const Inst& p = insts_[pi];
+            if (!live(p)) continue;
+            const Value va = incoming(p, arm), vb = incoming(p, b);
+            fwd(p.result, side == 0 ? add_select(b, c, va, vb) : add_select(b, c, vb, va));
+          }
+          Inst& nt = term(b);
+          nt.op = Op::Br;
+          nt.ops = {other};
+          touch({b, arm, other});
+          changed = true;
+          break;
+        }
+        continue;
+      }
+      // A chain: b goes only to j, and j is reached only from b.
+      Block j = kNone;
+      if (br_to(b, j) && j != b && j != order_[0] && only_pred(j, b) && free({b, j})) {
+        for (uint32_t pi : blocks_[j].phis) {
+          const Inst& p = insts_[pi];
+          if (live(p)) fwd(p.result, incoming(p, b));
+        }
+        std::vector<Block> succ;
+        each_successor(term(j), [&](uint32_t x) { succ.push_back(x); });
+        auto& dst = blocks_[b].insts;
+        dst.pop_back();
+        dst.insert(dst.end(), blocks_[j].insts.begin(), blocks_[j].insts.end());
+        blocks_[j].insts.clear();
+        blocks_[j].phis.clear();
+        for (const Block x : succ) {
+          for (uint32_t pi : blocks_[x].phis) {
+            Inst& p = insts_[pi];
+            for (size_t k = 1; k < p.ops.size(); k += 2) {
+              if (p.ops[k] == j) p.ops[k] = b;
+            }
+          }
+          touched[x] = 1;
+        }
+        touch({b, j});
+        changed = true;
+      }
+    }
+    if (!changed) break;
+    compute_order(error);
+  }
+}
+
+// ---- optimizing: folding and dead code, after SSA ----
+
+// Values whose operands are constants, or whose operation does nothing, become what they are
+// (forwarded: the writer skips an instruction whose value is forwarded); then every instruction
+// nothing with an effect depends on goes (forwarded to undef: nothing uses it). The translated
+// programs compute much they never use, and convert booleans back and forth: this keeps the
+// module small for the driver's compiler.
+void Module::optimize() {
+  forward_.resize(values_.size(), kNone);
+  const auto def = [&](Value v) -> const Inst* {
+    v = resolve(v);
+    return values_[v].kind == ValueKind::Inst ? &insts_[values_[v].bits] : nullptr;
+  };
+  const auto fwd = [&](Value from, Value to) {
+    forward_.resize(values_.size(), kNone);
+    forward_[from] = to;
+  };
+  // A zext or sext of an i1: that i1, else kNone.
+  const auto bool_widened = [&](Value v) -> Value {
+    const Inst* d = def(v);
+    if (!d || d->op != Op::Cast) return kNone;
+    const Cast c = static_cast<Cast>(d->code);
+    const Value x = resolve(d->ops[0]);
+    return (c == Cast::ZExt || c == Cast::SExt) && values_[x].type == i1_ ? x : kNone;
+  };
+  const auto sext_bits = [](uint64_t k, uint32_t bits) {
+    return bits >= 64 ? static_cast<int64_t>(k) : static_cast<int64_t>(k << (64 - bits)) >> (64 - bits);
+  };
+  for (int pass = 0; pass < 2; ++pass) {
+  if (pass == 1) simplify_cfg();
+  for (int round = 0; round < 16; ++round) {
+    bool changed = false;
+    for (Block b : order_) {
+      for (uint32_t pi : blocks_[b].phis) {
+        const Inst& p = insts_[pi];
+        if (resolve(p.result) != p.result) continue;
+        Value same = kNone;
+        bool trivial = true;
+        for (size_t k = 0; k < p.ops.size(); k += 2) {
+          const Value o = resolve(p.ops[k]);
+          if (o == p.result || o == same) continue;
+          if (same != kNone) {
+            trivial = false;
+            break;
+          }
+          same = o;
+        }
+        if (trivial && same != kNone) {
+          fwd(p.result, same);
+          changed = true;
+        }
+      }
+      for (uint32_t ii : blocks_[b].insts) {
+        const Inst& in = insts_[ii];
+        if (in.result == kNone || in.op == Op::Read || in.op == Op::Write || resolve(in.result) != in.result) continue;
+        const Value r = in.result;
+        const Type t = values_[r].type;
+        Value to = kNone;
+        uint64_t ka = 0, kb = 0;
+        switch (in.op) {
+          case Op::Cast: {
+            const Cast c = static_cast<Cast>(in.code);
+            const Value x = resolve(in.ops[0]);
+            const Type ft = values_[x].type;
+            if (is_int(t) && is_int(ft) && constant_int(x, ka)) {
+              if (c == Cast::ZExt || c == Cast::Trunc) to = const_int(t, ka);
+              else if (c == Cast::SExt) to = const_int(t, static_cast<uint64_t>(sext_bits(ka, types_[ft].n)));
+            } else if (c == Cast::Trunc || c == Cast::Bitcast) {
+              const Inst* d = def(x);
+              if (d && d->op == Op::Cast) {
+                const Cast dc = static_cast<Cast>(d->code);
+                const Value inner = resolve(d->ops[0]);
+                const bool undoes = c == Cast::Trunc ? (dc == Cast::ZExt || dc == Cast::SExt) : dc == Cast::Bitcast;
+                if (undoes && values_[inner].type == t) to = inner;
+              }
+            }
+            break;
+          }
+          case Op::Cmp: {
+            const Pred p = static_cast<Pred>(in.code);
+            const Value a = resolve(in.ops[0]), b2 = resolve(in.ops[1]);
+            if (static_cast<uint8_t>(p) < static_cast<uint8_t>(Pred::IEq) || !is_int(values_[a].type)) break;
+            const uint32_t bits = types_[values_[a].type].n;
+            if (constant_int(a, ka) && constant_int(b2, kb)) {
+              const int64_t sa = sext_bits(ka, bits), sb = sext_bits(kb, bits);
+              bool v = false;
+              switch (p) {
+                case Pred::IEq: v = ka == kb; break;
+                case Pred::INe: v = ka != kb; break;
+                case Pred::IUgt: v = ka > kb; break;
+                case Pred::IUge: v = ka >= kb; break;
+                case Pred::IUlt: v = ka < kb; break;
+                case Pred::IUle: v = ka <= kb; break;
+                case Pred::ISgt: v = sa > sb; break;
+                case Pred::ISge: v = sa >= sb; break;
+                case Pred::ISlt: v = sa < sb; break;
+                case Pred::ISle: v = sa <= sb; break;
+                default: break;
+              }
+              to = boolean(v);
+            } else if (a == b2) {
+              to = boolean(p == Pred::IEq || p == Pred::IUge || p == Pred::IUle || p == Pred::ISge || p == Pred::ISle);
+            } else if (const Value w = bool_widened(a); w != kNone && constant_int(b2, kb)) {
+              // (zext b) != 0, (zext b) > 0, (zext b) == 1: b.
+              if (kb == 0 && (p == Pred::INe || p == Pred::IUgt)) to = w;
+              if (kb == 1 && p == Pred::IEq && static_cast<Cast>(def(a)->code) == Cast::ZExt) to = w;
+            }
+            break;
+          }
+          case Op::Select: {
+            const Value c = resolve(in.ops[0]), a = resolve(in.ops[1]), b2 = resolve(in.ops[2]);
+            if (a == b2) to = a;
+            else if (constant_int(c, ka)) to = ka ? a : b2;
+            else if (t == i1_ && constant_int(a, ka) && constant_int(b2, kb) && ka == 1 && kb == 0) to = c;
+            break;
+          }
+          case Op::Bin: {
+            if (!is_int(t)) break;
+            const Bin op = static_cast<Bin>(in.code);
+            const Value a = resolve(in.ops[0]), b2 = resolve(in.ops[1]);
+            const bool ca = constant_int(a, ka), cb = constant_int(b2, kb);
+            const uint32_t bits = types_[t].n;
+            const uint64_t ones = bits >= 64 ? ~0ull : (1ull << bits) - 1;
+            if (ca && cb) {
+              bool ok = true;
+              uint64_t v = 0;
+              switch (op) {
+                case Bin::Add: v = ka + kb; break;
+                case Bin::Sub: v = ka - kb; break;
+                case Bin::Mul: v = ka * kb; break;
+                case Bin::And: v = ka & kb; break;
+                case Bin::Or: v = ka | kb; break;
+                case Bin::Xor: v = ka ^ kb; break;
+                case Bin::Shl: v = kb < bits ? ka << kb : 0; ok = kb < bits; break;
+                case Bin::LShr: v = kb < bits ? ka >> kb : 0; ok = kb < bits; break;
+                case Bin::AShr: v = static_cast<uint64_t>(sext_bits(ka, bits) >> kb); ok = kb < bits; break;
+                case Bin::UDiv: ok = kb != 0; v = ok ? ka / kb : 0; break;
+                case Bin::URem: ok = kb != 0; v = ok ? ka % kb : 0; break;
+                default: ok = false; break;
+              }
+              if (ok) to = const_int(t, v & ones);
+              break;
+            }
+            const bool a0 = ca && ka == 0, b0 = cb && kb == 0, a1 = ca && ka == 1, b1 = cb && kb == 1;
+            const bool aall = ca && ka == ones, ball = cb && kb == ones;
+            switch (op) {
+              case Bin::Add:
+              case Bin::Or:
+              case Bin::Xor:
+                if (b0) to = a;
+                else if (a0) to = b2;
+                else if (op == Bin::Or && a == b2) to = a;
+                else if (op == Bin::Xor && a == b2) to = const_int(t, 0);
+                else if (op == Bin::Or && (aall || ball)) to = const_int(t, ones);
+                break;
+              case Bin::Sub:
+                if (b0) to = a;
+                else if (a == b2) to = const_int(t, 0);
+                break;
+              case Bin::Shl:
+              case Bin::LShr:
+              case Bin::AShr:
+                if (b0) to = a;
+                else if (a0) to = a;
+                break;
+              case Bin::Mul:
+                if (b1) to = a;
+                else if (a1) to = b2;
+                else if (a0 || b0) to = const_int(t, 0);
+                break;
+              case Bin::And:
+                if (a0 || b0) to = const_int(t, 0);
+                else if (ball) to = a;
+                else if (aall) to = b2;
+                else if (a == b2) to = a;
+                break;
+              case Bin::UDiv:
+                if (b1) to = a;
+                break;
+              default: break;
+            }
+            break;
+          }
+          default: break;
+        }
+        if (to != kNone && to != r) {
+          fwd(r, to);
+          changed = true;
+        }
+      }
+    }
+    if (!changed) break;
+  }
+  }
+
+  // Dead code: from what has an effect (stores, atomics, calls that write or synchronize,
+  // terminators), every instruction whose value it uses, transitively.
+  std::vector<uint8_t> live(insts_.size(), 0);
+  std::vector<uint32_t> work;
+  const auto use = [&](Value v) {
+    v = resolve(v);
+    if (values_[v].kind != ValueKind::Inst) return;
+    const uint32_t i = static_cast<uint32_t>(values_[v].bits);
+    if (!live[i]) {
+      live[i] = 1;
+      work.push_back(i);
+    }
+  };
+  const auto has_effect = [&](const Inst& in) {
+    switch (in.op) {
+      case Op::Store:
+      case Op::AtomicRmw:
+      case Op::CmpXchg:
+      case Op::Br:
+      case Op::CondBr:
+      case Op::Switch:
+      case Op::Ret:
+      case Op::Unreachable: return true;
+      case Op::Call: {
+        const Attr a = functions_[values_[in.ops[0]].bits].attr;
+        return in.result == kNone || (a != Attr::ReadNone && a != Attr::ReadOnly);
+      }
+      default: return false;
+    }
+  };
+  for (Block b : order_) {
+    for (uint32_t ii : blocks_[b].insts) {
+      const Inst& in = insts_[ii];
+      if (in.op == Op::Read || in.op == Op::Write) continue;
+      if (has_effect(in)) {
+        live[ii] = 1;
+        work.push_back(ii);
+      }
+    }
+  }
+  while (!work.empty()) {
+    const Inst& in = insts_[work.back()];
+    work.pop_back();
+    switch (in.op) {
+      case Op::Phi:
+        for (size_t k = 0; k < in.ops.size(); k += 2) use(in.ops[k]);
+        break;
+      case Op::Br: break;
+      case Op::CondBr:
+      case Op::Switch: use(in.ops[0]); break;
+      case Op::Extract: use(in.ops[0]); break;
+      case Op::Call:
+        for (size_t k = 1; k < in.ops.size(); ++k) use(in.ops[k]);
+        break;
+      default:
+        for (const uint32_t o : in.ops) use(o);
+        break;
+    }
+  }
+  for (Block b : order_) {
+    for (const auto* list : {&blocks_[b].phis, &blocks_[b].insts}) {
+      for (uint32_t ii : *list) {
+        const Inst& in = insts_[ii];
+        if (live[ii] || in.result == kNone || in.op == Op::Read || in.op == Op::Write || resolve(in.result) != in.result) continue;
+        fwd(in.result, undef(values_[in.result].type));
+      }
+    }
+  }
 }
 
 // Registers into SSA values: phis where a register's definitions meet (the iterated dominance

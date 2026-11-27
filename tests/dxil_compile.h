@@ -24,7 +24,15 @@ inline host::CompileResult assemble_module(shader::dxil::Module& m) {
     r.messages = error;
     return r;
   }
-  r = host::assemble_dxil(shader::dxil::write_bitcode(m));
+  const std::vector<uint8_t> bc = shader::dxil::write_bitcode(m);
+  // AM_DXIL_BC=<file>: the module's bitcode kept there (llvm-bcanalyzer -dump reads it).
+  if (char path[512] = {}; GetEnvironmentVariableA("AM_DXIL_BC", path, sizeof path) && path[0]) {
+    if (FILE* f = nullptr; fopen_s(&f, path, "wb") == 0 && f) {
+      std::fwrite(bc.data(), 1, bc.size(), f);
+      std::fclose(f);
+    }
+  }
+  r = host::assemble_dxil(bc);
   uint64_t flags = 0;
   if (!r.ok && shader::dxil::validator_flags(r.messages, flags)) {
     std::printf("    the validator wants flags 0x%llx (ours 0x%llx)\n", static_cast<unsigned long long>(flags),

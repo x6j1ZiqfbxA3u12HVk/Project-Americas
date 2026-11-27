@@ -72,6 +72,9 @@ struct TranslateInput {
   // HLSL compiler (shader/dxil/hlsl.h), which keeps the console's control flow. DXC cannot take
   // it. Off, the output is unchanged.
   bool goto_form = false;
+  // The structured form however deeply it nests (for our compiler, which has no limit like DXC's
+  // 256 brackets): no chained form. Programs that fit DXC's limit are unchanged.
+  bool any_depth = false;
 };
 
 struct Translation {

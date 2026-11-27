@@ -116,9 +116,13 @@ int translate(const std::string& wanted, const fs::path& pack_dir, const fs::pat
         for (const shader::NativeProgram& pr : b.programs) {
           if (marker_of(b.code(pr)) != wanted) continue;
           // AM_SHADERS_OURS=1: the goto form through our own compiler (shader/dxil) instead of DXC.
-          const bool ours = GetEnvironmentVariableA("AM_SHADERS_OURS", nullptr, 0) != 0;
+          // AM_SHADERS_OURS=nested: the structured form at any depth through ours instead.
+          char ours_form[16] = {};
+          const bool ours = GetEnvironmentVariableA("AM_SHADERS_OURS", ours_form, sizeof ours_form) != 0;
+          const bool nested = std::string(ours_form) == "nested";
           shader::TranslateInput tin = input_of(shader->bytes, b, pr);
-          tin.goto_form = ours;
+          tin.goto_form = ours && !nested;
+          tin.any_depth = nested;
           const shader::Translation t = shader::translate(tin, shader::Binding::Runtime);
           if (!t.ok) {
             std::printf("%s: not translated: %s\n", wanted.c_str(), t.failure.c_str());
@@ -463,8 +467,22 @@ int ours_survey(const fs::path& pack_dir, const fs::path& out_json, size_t every
             }
           }
         }
-        if (const size_t d = ++done; d % 200 == 0) {
-          std::fprintf(stderr, "  %zu of %zu containers\n", d, files.size());
+        if (const size_t d = ++done; d % 50 == 0 || d == files.size()) {
+          // Progress: share done, programs through so far, time left at this pace.
+          uint64_t total = 0, valid = 0;
+          {
+            std::lock_guard<std::mutex> g(lock);
+            for (const auto& [k, c] : by_stage) {
+              total += c.total;
+              valid += c.valid;
+            }
+          }
+          const double took = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+          const double left = took / static_cast<double>(d) * static_cast<double>(files.size() - d);
+          std::fprintf(stderr, "  %zu of %zu containers (%.1f %%): %llu of %llu programs through ours (%.1f %%); about %.0f min to go\n", d,
+                       files.size(), 100.0 * static_cast<double>(d) / static_cast<double>(files.size()),
+                       static_cast<unsigned long long>(valid), static_cast<unsigned long long>(total),
+                       total ? 100.0 * static_cast<double>(valid) / static_cast<double>(total) : 0.0, left / 60.0);
         }
       }
     });

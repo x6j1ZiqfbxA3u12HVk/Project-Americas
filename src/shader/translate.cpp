@@ -3491,6 +3491,92 @@ class Structurer {
   bool ok_ = true, uses_br_ = false;
 };
 
+// Whether the blocks' control flow is reducible (DXIL requires it): every edge that goes back
+// in a depth-first order from the first block goes to a block that dominates its source.
+bool reducible(const std::vector<CfgBlock>& blocks) {
+  const size_t n = blocks.size();
+  if (n == 0) return true;
+  std::unordered_map<uint32_t, uint32_t> at;
+  for (size_t i = 0; i < n; ++i) at[blocks[i].start] = static_cast<uint32_t>(i);
+  constexpr uint32_t kNo = ~0u;
+  std::vector<std::vector<uint32_t>> succ(n), pred(n);
+  for (size_t i = 0; i < n; ++i) {
+    const CfgBlock& b = blocks[i];
+    const auto add = [&](uint32_t dword) {
+      const auto it = at.find(dword);
+      if (it == at.end()) return;
+      succ[i].push_back(it->second);
+      pred[it->second].push_back(static_cast<uint32_t>(i));
+    };
+    if (b.end == CfgBlock::Fall) add(b.next);
+    if (b.end == CfgBlock::Jump) add(b.target);
+    if (b.end == CfgBlock::Cond) {
+      add(b.target);
+      add(b.next);
+    }
+  }
+  // Reverse postorder (an explicit stack).
+  std::vector<uint32_t> post, rpo_index(n, kNo);
+  std::vector<uint8_t> state(n, 0);
+  std::vector<std::pair<uint32_t, size_t>> stack{{0u, 0u}};
+  state[0] = 1;
+  while (!stack.empty()) {
+    auto& [v, k] = stack.back();
+    if (k < succ[v].size()) {
+      const uint32_t w = succ[v][k++];
+      if (!state[w]) {
+        state[w] = 1;
+        stack.emplace_back(w, 0);
+      }
+      continue;
+    }
+    post.push_back(v);
+    stack.pop_back();
+  }
+  std::vector<uint32_t> order(post.rbegin(), post.rend());
+  for (size_t i = 0; i < order.size(); ++i) rpo_index[order[i]] = static_cast<uint32_t>(i);
+  // Dominators (Cooper, Harvey and Kennedy).
+  std::vector<uint32_t> idom(n, kNo);
+  idom[order[0]] = order[0];
+  for (bool changed = true; changed;) {
+    changed = false;
+    for (size_t i = 1; i < order.size(); ++i) {
+      const uint32_t b = order[i];
+      uint32_t nd = kNo;
+      for (const uint32_t p : pred[b]) {
+        if (idom[p] == kNo) continue;
+        if (nd == kNo) {
+          nd = p;
+          continue;
+        }
+        uint32_t x = p, y = nd;
+        while (x != y) {
+          while (rpo_index[x] > rpo_index[y]) x = idom[x];
+          while (rpo_index[y] > rpo_index[x]) y = idom[y];
+        }
+        nd = x;
+      }
+      if (nd != idom[b]) {
+        idom[b] = nd;
+        changed = true;
+      }
+    }
+  }
+  const auto dominates = [&](uint32_t a, uint32_t b) {
+    for (;;) {
+      if (a == b) return true;
+      if (b == idom[b] || idom[b] == kNo) return false;
+      b = idom[b];
+    }
+  };
+  for (const uint32_t u : order) {
+    for (const uint32_t v : succ[u]) {
+      if (rpo_index[v] <= rpo_index[u] && !dominates(v, u)) return false;
+    }
+  }
+  return true;
+}
+
 // The fallback: one loop over a switch on the block's start.
 // The goto form (TranslateInput::goto_form): the blocks in order, each a label, branches gotos.
 std::string gotos(const std::vector<CfgBlock>& blocks) {
@@ -4121,7 +4207,9 @@ Translation translate(const TranslateInput& in, Binding binding) {
   if (!tr.unsupported.empty()) return tr;
   std::string body;
   bool uses_br = false;
-  if (in.goto_form) {
+  // The goto form keeps the console's control flow; an irreducible one takes the other forms.
+  const bool goto_form = in.goto_form && reducible(blocks);
+  if (goto_form) {
     body = gotos(blocks);
     tr.structured = true;
   } else {
@@ -4139,8 +4227,8 @@ Translation translate(const TranslateInput& in, Binding binding) {
     return deepest;
   };
   const auto too_deep = [&](const std::string& text) { return depth_of(text) > 200; };
-  if (tr.structured && !in.goto_form) tr.nested_depth = depth_of(body);
-  if (tr.structured && !in.goto_form && too_deep(body)) {
+  if (tr.structured && !goto_form) tr.nested_depth = depth_of(body);
+  if (tr.structured && !goto_form && !in.any_depth && too_deep(body)) {
     std::string chained;
     bool chained_br = false;
     tr.structured = Structurer(blocks, true).run(chained, chained_br) && !too_deep(chained);

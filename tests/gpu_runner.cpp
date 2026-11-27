@@ -4,12 +4,29 @@
 #include <wrl/client.h>
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 
 using Microsoft::WRL::ComPtr;
 
 namespace am::test {
 namespace {
+
+// The debug layer's messages since the last call (with AM_D3D12_DEBUG=1), for a failure's reason.
+std::string debug_messages(ID3D12Device* d) {
+  ComPtr<ID3D12InfoQueue> q;
+  if (FAILED(d->QueryInterface(IID_PPV_ARGS(&q)))) return {};
+  std::string out;
+  for (UINT64 i = 0, n = q->GetNumStoredMessages(); i < n; ++i) {
+    SIZE_T size = 0;
+    q->GetMessage(i, nullptr, &size);
+    std::vector<char> buffer(size);
+    auto* m = reinterpret_cast<D3D12_MESSAGE*>(buffer.data());
+    if (SUCCEEDED(q->GetMessage(i, m, &size))) out += std::string(": ") + m->pDescription;
+  }
+  q->ClearStoredMessages();
+  return out;
+}
 
 struct Gpu {
   ComPtr<ID3D12Device> device;
@@ -25,6 +42,11 @@ const Gpu& gpu() {
     ComPtr<IDXGIAdapter1> adapter;
     if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) {
       factory->EnumAdapterByGpuPreference(0, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE, IID_PPV_ARGS(&adapter));
+    }
+    // AM_D3D12_DEBUG=1: the debug layer, whose messages say why the driver refuses a pipeline.
+    if (GetEnvironmentVariableA("AM_D3D12_DEBUG", nullptr, 0)) {
+      ComPtr<ID3D12Debug> debug;
+      if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debug)))) debug->EnableDebugLayer();
     }
     if (FAILED(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&x.device)))) {
       x.why = "no D3D12 device";
@@ -234,8 +256,10 @@ GpuRun run_compute(const std::vector<uint8_t>& dxil, uint32_t groups, const std:
   pd.pRootSignature = g.root.Get();
   pd.CS = {dxil.data(), dxil.size()};
   ComPtr<ID3D12PipelineState> pso;
-  if (FAILED(d->CreateComputePipelineState(&pd, IID_PPV_ARGS(&pso)))) {
-    run.why = "the driver refused the pipeline";
+  if (const HRESULT hr = d->CreateComputePipelineState(&pd, IID_PPV_ARGS(&pso)); FAILED(hr)) {
+    char code[48];
+    std::snprintf(code, sizeof code, " (0x%08lX)", static_cast<unsigned long>(hr));
+    run.why = "the driver refused the pipeline" + std::string(code) + debug_messages(d);
     return run;
   }
   if (memory.empty()) memory.resize(1);
@@ -388,7 +412,7 @@ GraphicsRun run_graphics(const std::vector<uint8_t>& vs, const std::vector<uint8
   pd.SampleDesc.Count = 1;
   ComPtr<ID3D12PipelineState> pso;
   if (FAILED(d->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pso)))) {
-    run.why = "the driver refused the pipeline";
+    run.why = "the driver refused the pipeline" + debug_messages(d);
     return run;
   }
   const size_t vb_bytes = vertices.size() * sizeof(float);

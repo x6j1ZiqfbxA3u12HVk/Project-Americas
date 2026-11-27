@@ -196,8 +196,12 @@ std::vector<uint8_t> write_bitcode(const Module& m) {
   // Value ids: globals, functions, constants, then the body's instructions.
   std::vector<uint32_t> id(m.value_count(), kNone);
   uint32_t next = 0;
-  for (const auto& g : m.globals()) id[g.value] = next++;
-  for (const auto& f : m.functions()) id[f.value] = next++;
+  for (const auto& g : m.globals()) {
+    if (g.used) id[g.value] = next++;
+  }
+  for (const auto& f : m.functions()) {
+    if (f.used) id[f.value] = next++;
+  }
   for (Value c : m.constants()) id[c] = next++;
   const auto vid = [&](Value v) {
     const uint32_t x = id[m.resolve(v)];
@@ -208,12 +212,14 @@ std::vector<uint8_t> write_bitcode(const Module& m) {
     return x;
   };
   for (const auto& g : m.globals()) {
+    if (!g.used) continue;
     // [type, (space << 2) | explicit type | constant, init, linkage, alignment, section, ...]
     const bool constant = g.init != kNone;
     w.record(kModGlobalVar, {g.type, (static_cast<uint64_t>(g.space) << 2) | 2u | (constant ? 1u : 0u), constant ? id[g.init] + 1u : 0u,
                              constant ? 3u : 0u, align_code(g.align), 0, 0, 0, 0, 0, 0, 0});
   }
   for (const auto& f : m.functions()) {
+    if (!f.used) continue;
     w.record(kModFunction, {f.type, 0, f.body ? 0u : 1u, 0, f.body ? 0u : attr_set(f.attr), 0, 0, 0, 0, 0, 0, 0, 0, 0, 0});
   }
 
@@ -275,8 +281,12 @@ std::vector<uint8_t> write_bitcode(const Module& m) {
   w.exit();
 
   w.enter(kValueSymtabBlock);
-  for (const auto& g : m.globals()) w.text(kVstEntry, g.name, {id[g.value]});
-  for (const auto& f : m.functions()) w.text(kVstEntry, f.name, {id[f.value]});
+  for (const auto& g : m.globals()) {
+    if (g.used) w.text(kVstEntry, g.name, {id[g.value]});
+  }
+  for (const auto& f : m.functions()) {
+    if (f.used) w.text(kVstEntry, f.name, {id[f.value]});
+  }
   w.exit();
 
   // The entry function's body.

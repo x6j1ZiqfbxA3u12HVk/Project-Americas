@@ -256,6 +256,7 @@ class Module {
     Attr attr = Attr::None;
     Value value = 0;
     bool body = false;
+    bool used = true;  // after finish(): something left calls it (the validator refuses unused declarations)
   };
   struct GlobalInfo {
     std::string name;
@@ -263,6 +264,7 @@ class Module {
     uint32_t space = 0, align = 0;
     Value value = 0;
     Value init = kNone;  // a constant: the global is constant and internal
+    bool used = true;    // after finish(): an instruction left uses it
   };
   struct MdInfo {
     enum Kind : uint8_t { String, Value, Node } kind = String;
@@ -296,6 +298,9 @@ class Module {
   bool is_int(Type t) const { return types_[t].kind == TypeKind::Int; }
   bool is_float(Type t) const;
   void build_ssa();
+  void optimize();  // folding and dead code, after build_ssa()
+  void simplify_cfg();  // small branches into selects, chains of blocks merged
+  bool compute_order(std::string& error);  // order_ and preds
   void entry_metadata();
 
   std::vector<TypeInfo> types_;

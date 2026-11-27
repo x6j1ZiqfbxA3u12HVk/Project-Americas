@@ -3,7 +3,13 @@
 // and every register compared with what the ISA says. Skipped without a D3D12 GPU of shader
 // model 6.6.
 
+#include <algorithm>
 #include <cmath>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
+#include <map>
+#include <random>
 #include <cstdio>
 #include <cstring>
 #include <vector>
@@ -11,6 +17,8 @@
 #include "dxil_compile.h"
 #include "gpu_runner.h"
 #include "host/dxc_compile.h"
+#include "shader/console_program.h"
+#include "shader/container.h"
 #include "shader/image_bindings.h"
 #include "shader/rdna2.h"
 #include "shader/translate.h"
@@ -1261,4 +1269,193 @@ TEST_CASE(translate_bvh_intersect_stand_in) {
                          r.v(l, 16), r.v(l, 17), r.v(l, 18), r.v(l, 19));
   }
   CHECK(ok);
+}
+
+// Our compiler against DXC on the game's own compute programs: AM_COMPARE=<the pack folder>
+// (cache\shaders\pack), AM_COMPARE_EVERY=N (one container in N, default 20), AM_COMPARE_MAX_KIB
+// (programs up to this much HLSL, default 512). Each program is translated twice (the structured
+// form for DXC, the goto form for ours), run on the same memory of small numbers and user data
+// (pointers into that memory), and every register at its end and the memory compared. DXC's
+// build runs twice: a program whose two runs differ (atomics racing) is not compared.
+// State in AM_COMPARE_STATE (default <pack>\..\compare): done.txt (a line a program: its name
+// and result) and running.txt. A program that hangs the GPU resets the device: the test stops,
+// and run again it marks that program "hung" and goes on (tools\compare-ours.cmd loops).
+TEST_CASE(translate_ours_matches_dxc_on_game_programs) {
+  namespace fs = std::filesystem;
+  char dir[512] = {};
+  if (!GetEnvironmentVariableA("AM_COMPARE", dir, sizeof dir) || !dir[0]) {
+    std::printf("    skipped: AM_COMPARE (the pack folder) not set\n");
+    return;
+  }
+  const auto env_num = [](const char* name, uint32_t fallback) {
+    char v[32] = {};
+    return GetEnvironmentVariableA(name, v, sizeof v) && v[0] ? static_cast<uint32_t>(std::strtoul(v, nullptr, 10)) : fallback;
+  };
+  const uint32_t every = std::max(1u, env_num("AM_COMPARE_EVERY", 20)), max_kib = env_num("AM_COMPARE_MAX_KIB", 512);
+  char state_dir[512] = {};
+  const fs::path state = GetEnvironmentVariableA("AM_COMPARE_STATE", state_dir, sizeof state_dir) && state_dir[0]
+                             ? fs::path(state_dir)
+                             : fs::path(dir).parent_path() / "compare";
+  fs::create_directories(state);
+  const fs::path done_file = state / "done.txt", running_file = state / "running.txt";
+  std::map<std::string, std::string> done;
+  {
+    std::ifstream in(done_file);
+    for (std::string name, result; in >> name >> result;) done[name] = result;
+  }
+  {
+    std::ifstream in(running_file);
+    std::string name;
+    if (in >> name && !done.count(name)) {
+      done[name] = "hung";
+      std::ofstream(done_file, std::ios::app) << name << " hung\n";
+    }
+  }
+  std::ofstream(running_file, std::ios::trunc).close();
+  const auto record = [&](const std::string& name, const char* result) {
+    done[name] = result;
+    std::ofstream(done_file, std::ios::app) << name << ' ' << result << '\n';
+    std::ofstream(running_file, std::ios::trunc).close();
+    std::printf("    %s %s\n", name.c_str(), result);
+    std::fflush(stdout);
+  };
+  fs::remove(state / "finished.txt");
+  std::vector<fs::path> files;
+  for (const auto& e : fs::directory_iterator(dir)) {
+    if (e.path().extension() == L".dxbc") files.push_back(e.path());
+  }
+  std::sort(files.begin(), files.end());
+  bool stopped = false;
+  for (size_t fi = 0; fi < files.size() && !stopped; fi += every) {
+    std::ifstream in(files[fi], std::ios::binary);
+    const std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    std::string error;
+    const auto c = parse_container(bytes, error);
+    const Part* dxil = c ? c->find("DXIL") : nullptr;
+    if (!dxil) continue;
+    const auto shader = read_console_shader(dxil->data, error);
+    if (!shader) continue;
+    int index = 0;
+    for (const NativeBlob& b : shader->blobs) {
+      for (const NativeProgram& p : b.programs) {
+        if (stopped) break;
+        const std::string name = files[fi].stem().string().substr(0, 16) + "_" + std::to_string(index++);
+        if (p.stage != HwStage::Cs || done.count(name)) continue;
+        TranslateInput tin;
+        const auto code = b.code(p);
+        tin.code = {reinterpret_cast<const uint32_t*>(code.data()), code.size() / 4};
+        tin.stage = p.stage;
+        tin.wave32 = p.wave32;
+        tin.vgprs = p.vgprs;
+        tin.lds_bytes = p.lds_bytes;
+        tin.cs_rsrc2 = p.cs_rsrc2;
+        for (int k = 0; k < 3; ++k) tin.cs_threads[k] = p.cs_threads[k];
+        const Translation td = translate(tin, Binding::Test);
+        tin.goto_form = true;
+        const Translation to = translate(tin, Binding::Test);
+        if (!td.ok || !to.ok) {
+          record(name, "untranslated");
+          continue;
+        }
+        if (td.hlsl.size() > max_kib * 1024u) {
+          record(name, "big");
+          continue;
+        }
+        const am::host::CompileResult cd = am::host::compile_hlsl(td.hlsl, td.entry, td.profile);
+        if (!cd.ok) {
+          record(name, "dxc-refused");
+          continue;
+        }
+        const am::host::CompileResult co = am::test::compile_ours(to.hlsl, to.entry, to.profile);
+        if (!co.ok) {
+          std::printf("    %s: ours refused: %s\n", name.c_str(), co.messages.substr(0, 300).c_str());
+          record(name, "ours-refused");
+          continue;
+        }
+        // Inputs: small numbers (so loops that count with them end) and small floats; user SGPR
+        // pairs that point into the memory (as descriptor tables do).
+        constexpr uint64_t kBase = 0x100000000ull;
+        constexpr uint32_t kMemoryDwords = 1u << 16;
+        std::mt19937 rng(static_cast<uint32_t>(fi * 131 + index));
+        std::vector<uint32_t> memory(kMemoryDwords);
+        for (size_t k = 0; k < memory.size(); ++k) {
+          if (k & 1) {
+            const float x = static_cast<float>(rng() % 1000) / 250.0f - 2.0f;
+            std::memcpy(&memory[k], &x, 4);
+          } else {
+            memory[k] = rng() % 64;
+          }
+        }
+        std::vector<uint32_t> args(36, 0);
+        for (int i = 0; i < 32; i += 2) {
+          args[i] = static_cast<uint32_t>(kBase) + ((rng() % (kMemoryDwords * 4 - 4096)) & ~63u);
+          args[i + 1] = static_cast<uint32_t>(kBase >> 32);
+        }
+        args[32] = static_cast<uint32_t>(kBase);
+        args[33] = static_cast<uint32_t>(kBase >> 32);
+        const uint32_t threads = std::max(1u, p.cs_threads[0]) * std::max(1u, p.cs_threads[1]) * std::max(1u, p.cs_threads[2]);
+        const size_t dump_d = kDumpLanes / 4 + static_cast<size_t>(threads) * td.vgpr_count;
+        const size_t dump_o = kDumpLanes / 4 + static_cast<size_t>(threads) * to.vgpr_count;
+        std::ofstream(running_file, std::ios::trunc) << name << '\n';
+        const am::test::GpuRun d1 = am::test::run_compute(cd.dxil, 1, args, memory, dump_d);
+        const am::test::GpuRun d2 = d1.ran ? am::test::run_compute(cd.dxil, 1, args, memory, dump_d) : am::test::GpuRun{};
+        const am::test::GpuRun o = d2.ran ? am::test::run_compute(co.dxil, 1, args, memory, dump_o) : am::test::GpuRun{};
+        if (!d1.ran || !d2.ran || !o.ran) {
+          const std::string why = !d1.ran ? d1.why : !d2.ran ? d2.why : o.why;
+          std::printf("    %s: not run (%s): %s\n", name.c_str(), !d1.ran || !d2.ran ? "DXC's" : "ours", why.c_str());
+          if (why.find("did not finish") != std::string::npos || why.find("0x887A0005") != std::string::npos) {
+            // The device is gone for this process: stop; the next run marks this program hung.
+            std::printf("    stopped: the GPU was reset; run again to go on\n");
+            stopped = true;
+            break;
+          }
+          record(name, "not-run");
+          continue;
+        }
+        if (d1.dump != d2.dump || d1.memory != d2.memory) {
+          record(name, "racing");
+          continue;
+        }
+        const bool comparable = td.vgpr_count == to.vgpr_count;
+        if (comparable && o.dump == d1.dump && o.memory == d1.memory) {
+          record(name, "same");
+          continue;
+        }
+        // Not bit-equal: close as floats (DXC may fuse and reorder float arithmetic)?
+        size_t bad = 0, first = ~size_t(0);
+        const auto close_enough = [](uint32_t a, uint32_t b) {
+          if (a == b) return true;
+          float x, y;
+          std::memcpy(&x, &a, 4);
+          std::memcpy(&y, &b, 4);
+          if (std::isnan(x) && std::isnan(y)) return true;
+          return std::isfinite(x) && std::isfinite(y) && std::fabs(x - y) <= 1e-4f * std::max({1.0f, std::fabs(x), std::fabs(y)});
+        };
+        const auto scan = [&](const std::vector<uint32_t>& a, const std::vector<uint32_t>& bb, size_t offset) {
+          for (size_t k = 0; k < std::min(a.size(), bb.size()); ++k) {
+            if (!close_enough(a[k], bb[k]) && !bad++) first = offset + k;
+          }
+        };
+        if (comparable) scan(d1.dump, o.dump, 0);
+        scan(d1.memory, o.memory, 1u << 30);
+        if (bad == 0 && comparable) {
+          record(name, "close");
+        } else {
+          std::printf("    %s: %s%zu dwords differ (first: %s %zu)\n", name.c_str(), comparable ? "" : "VGPR counts differ; ", bad,
+                      first >= (1u << 30) ? "memory" : "dump", first >= (1u << 30) ? first - (1u << 30) : first);
+          record(name, "differ");
+        }
+      }
+    }
+  }
+  std::map<std::string, uint32_t> totals;
+  for (const auto& [name, result] : done) ++totals[result];
+  std::printf("    %s; compute programs so far (1 container in %u):", stopped ? "stopped" : "finished", every);
+  for (const auto& [result, n] : totals) std::printf(" %s %u,", result.c_str(), n);
+  std::printf(" (state in %s)\n", state.string().c_str());
+  if (!stopped) {
+    std::printf("    compare: all done\n");
+    std::ofstream(state / "finished.txt") << "done\n";
+  }
+  CHECK(!totals.count("differ") && !totals.count("ours-refused"));
 }
