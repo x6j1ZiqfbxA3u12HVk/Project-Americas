@@ -163,7 +163,30 @@ int translate(const std::string& wanted, const fs::path& pack_dir, const fs::pat
               r.messages = "ours: " + r.messages;
             } else {
               if (skip_opt) m.set_flags(m.shader_flags() | 1u);
-              r = host::assemble_dxil(shader::dxil::write_bitcode(m));
+              // AM_DXIL_LLVM_PASSES="-instcombine -gvn ...": our module through DXC's LLVM
+              // optimizer before assembling (an experiment: which of its passes the driver needs).
+              char passes_text[1024] = {};
+              std::vector<uint8_t> bitcode = shader::dxil::write_bitcode(m);
+              if (GetEnvironmentVariableA("AM_DXIL_LLVM_PASSES", passes_text, sizeof passes_text) && passes_text[0]) {
+                std::vector<std::wstring> passes;
+                std::string p;
+                for (const char* q = passes_text;; ++q) {
+                  if (*q == ' ' || *q == 0) {
+                    if (!p.empty()) passes.push_back(widen(p));
+                    p.clear();
+                    if (*q == 0) break;
+                  } else {
+                    p += *q;
+                  }
+                }
+                const auto o0 = std::chrono::steady_clock::now();
+                const host::CompileResult o = host::optimize_dxil(bitcode, passes);
+                std::printf("%s: DXC's optimizer (%zu passes): %s in %.1f s, %zu -> %zu bytes %s\n", wanted.c_str(), passes.size(),
+                            o.ok ? "ok" : "failed", std::chrono::duration<double>(std::chrono::steady_clock::now() - o0).count(), bitcode.size(),
+                            o.dxil.size(), o.messages.substr(0, 300).c_str());
+                if (o.ok) bitcode = o.dxil;
+              }
+              r = host::assemble_dxil(bitcode);
               uint64_t flags = 0;
               if (!r.ok && shader::dxil::validator_flags(r.messages, flags)) {
                 std::printf("%s: the validator wants flags 0x%llx (ours 0x%llx)\n", wanted.c_str(), static_cast<unsigned long long>(flags),

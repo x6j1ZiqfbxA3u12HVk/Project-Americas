@@ -5,10 +5,12 @@
 
 #include <cstdio>
 #include <fstream>
+#include <iterator>
 #include <cstring>
 #include <string>
 #include <vector>
 
+#include "dxil_compile.h"
 #include "gpu_runner.h"
 #include "host/dxc_compile.h"
 #include "shader/container.h"
@@ -207,4 +209,18 @@ am_done:
   }
   std::printf("    %u of %u threads wrong\n", wrong, kThreads);
   CHECK(wrong == 0);
+}
+
+// Not a test: AM_OURS_HLSL=<file.hlsl> AM_OURS_OUT=<file.dxil> [AM_OURS_PROFILE=cs_6_6] compiles a
+// translated program's HLSL (edited by hand, for an experiment) with our compiler into DXIL.
+TEST_CASE(dxil_compile_file) {
+  char in[1024] = {}, out[1024] = {}, profile[32] = {};
+  if (!GetEnvironmentVariableA("AM_OURS_HLSL", in, sizeof in) || !GetEnvironmentVariableA("AM_OURS_OUT", out, sizeof out)) return;
+  GetEnvironmentVariableA("AM_OURS_PROFILE", profile, sizeof profile);
+  std::ifstream f(in, std::ios::binary);
+  const std::string hlsl((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+  const am::host::CompileResult c = am::test::compile_ours(hlsl, "main", profile[0] ? profile : "cs_6_6");
+  std::printf("    %s: %s (%zu bytes of DXIL) %s\n", in, c.ok ? "compiled" : "refused", c.dxil.size(), c.messages.substr(0, 400).c_str());
+  CHECK(c.ok);
+  if (c.ok) std::ofstream(out, std::ios::binary).write(reinterpret_cast<const char*>(c.dxil.data()), static_cast<std::streamsize>(c.dxil.size()));
 }

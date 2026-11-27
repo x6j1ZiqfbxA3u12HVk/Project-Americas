@@ -4097,11 +4097,35 @@ Translation translate(const TranslateInput& in, Binding binding) {
     c.lane = mask_kinds(in.code, scan, starts, c.wave64, in.stage == HwStage::Vs, kinds, kinds_at);
   }
   tr.lanes = c.lane;
-  for (const uint32_t at : scan.starts) {
-    rd::Instruction insn;
-    rd::decode(in.code, at, insn);
-    const std::string_view n = insn.info ? insn.info->name : "";
-    if (n.starts_with("buffer_load_format_") && !n.starts_with("buffer_load_format_d16")) c.typed_vs.insert(insn.field(Field::SRSRC) * 4);
+  // A V# typed loads read gets its parameters where it is written only when that is less work
+  // than at its loads: written no more often than it is loaded (3db4: s12 written 7 times,
+  // loaded 3,280). A program that reuses the V#'s registers for other values writes them far
+  // more often (24ea: s12 written 13,982 times, loaded 1,888; s16 4,199 times, loaded once),
+  // and its loads decode the V# themselves (buffer_address and am_fmt_out).
+  {
+    std::map<uint32_t, uint32_t> loads, writes;
+    std::vector<std::pair<uint32_t, uint32_t>> written;
+    for (const uint32_t at : scan.starts) {
+      rd::Instruction insn;
+      rd::decode(in.code, at, insn);
+      const std::string_view n = insn.info ? insn.info->name : "";
+      if (n.starts_with("buffer_load_format_") && !n.starts_with("buffer_load_format_d16")) ++loads[insn.field(Field::SRSRC) * 4];
+    }
+    for (const uint32_t at : scan.starts) {
+      rd::Instruction insn;
+      rd::decode(in.code, at, insn);
+      if (!insn.info) continue;
+      written.clear();
+      sgpr_writes(insn, c.wave64, written);
+      for (const auto& [first, count] : written) {
+        for (const auto& [r, n] : loads) {
+          if (r < first + count && first < r + 4) ++writes[r];
+        }
+      }
+    }
+    for (const auto& [r, n] : loads) {
+      if (writes[r] <= n) c.typed_vs.insert(r);
+    }
   }
   const auto typed_params = [&](uint32_t first, uint32_t count) {
     std::string out;
@@ -4114,6 +4138,9 @@ Translation translate(const TranslateInput& in, Binding binding) {
   };
   std::vector<CfgBlock> blocks;
   const auto& ops = table();
+  // What SCC holds for a branch (goto form): a number (an ordinary scalar compare: the same in
+  // every lane) or a lane's bit (a mask operation's); unknown when set in another block.
+  enum class SccKind : uint8_t { Unknown, Mask, Num } scc_kind = SccKind::Unknown;
   for (size_t k = 0; k < scan.starts.size(); ++k) {
     const uint32_t at = scan.starts[k];
     rd::Instruction insn;
@@ -4123,6 +4150,7 @@ Translation translate(const TranslateInput& in, Binding binding) {
       if (!blocks.empty() && blocks.back().end == CfgBlock::Fall) blocks.back().next = at;
       blocks.emplace_back();
       blocks.back().start = at;
+      scc_kind = SccKind::Unknown;
       c.live_images.clear();
       c.live_samplers.clear();
       if (c.lane) {
@@ -4141,6 +4169,13 @@ Translation translate(const TranslateInput& in, Binding binding) {
     const std::string name = insn.info->name;
     const uint16_t flags = insn.info->flags;
     bool ok = true;
+    // The SCC a later branch reads (branches only read it).
+    if (!(flags & rd::kBranch)) {
+      for (int i = 0; i < insn.info->operand_count; ++i) {
+        const rd::OperandInfo& op = insn.info->operands[i];
+        if (op.type == rd::OperandType::OPR_SSRC_SPECIAL_SCC && (op.flags & rd::kOut)) scc_kind = c.mask_op ? SccKind::Mask : SccKind::Num;
+      }
+    }
     if (flags & rd::kTerminator) {
       // The tests read the SGPRs at the end: masks as the console has them.
       if (c.lane && binding == Binding::Test) {
@@ -4176,6 +4211,24 @@ Translation translate(const TranslateInput& in, Binding binding) {
       else if (name == "s_cbranch_execz") cond = c.zero_test(126);
       else if (name == "s_cbranch_execnz") cond = "!" + c.zero_test(126);
       else ok = c.fail(name);
+      // The goto form branches on the wave where the test is of a lane mask, as the console does:
+      // a zero test (execz, vccz, scc0) is taken when it holds for every lane, a non-zero one when
+      // it holds for any. So the wave never splits at a branch and the scalar registers stay
+      // uniform: with per-lane branches AMD's compiler must take every scalar after one as
+      // divergent, and restructure joins of hundreds of such branches (giant 24ea: a block of
+      // 568 predecessors) in tens of GB. A test of a number (SCC from a scalar compare, VCC
+      // holding a number) is the same in every lane: it stays as it is, so what the branch says
+      // stays known after it.
+      if (ok && in.goto_form && c.lane && name != "s_branch") {
+        const bool scc = name == "s_cbranch_scc0" || name == "s_cbranch_scc1";
+        const bool vcc = name == "s_cbranch_vccz" || name == "s_cbranch_vccnz";
+        const bool vcc_number = ((c.mt[106] | (c.wave64 ? c.mt[107] : 0)) & kNum) != 0;
+        const bool wave = scc ? scc_kind != SccKind::Num : vcc ? !vcc_number : true;
+        if (wave) {
+          const bool zero = name == "s_cbranch_scc0" || name == "s_cbranch_vccz" || name == "s_cbranch_execz";
+          cond = std::string(zero ? "WaveActiveAllTrue(" : "WaveActiveAnyTrue(") + cond + ")";
+        }
+      }
       if (ok) {
         blk.target = static_cast<uint32_t>(target);
         blk.next = next;

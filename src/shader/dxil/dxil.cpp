@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 
 namespace am::shader::dxil {
 namespace {
@@ -980,6 +981,410 @@ void Module::simplify_cfg() {
 
 // ---- optimizing: folding and dead code, after SSA ----
 
+// A conditional branch on a constant becomes a jump (the other successor's phis lose this
+// block's entry; a block nothing reaches then drops out of the order).
+void Module::fold_constant_branches() {
+  bool changed = false;
+  for (Block b : order_) {
+    Inst& t = insts_[blocks_[b].insts.back()];
+    uint64_t k = 0;
+    if (t.op != Op::CondBr || !constant_int(t.ops[0], k)) continue;
+    const Block keep = k ? t.ops[1] : t.ops[2], drop = k ? t.ops[2] : t.ops[1];
+    // One edge goes (when both lead to one block, its phis keep one entry of the two).
+    for (uint32_t pi : blocks_[drop].phis) {
+      Inst& p = insts_[pi];
+      for (size_t j = 0; j + 1 < p.ops.size(); j += 2) {
+        if (p.ops[j + 1] == b) {
+          p.ops.erase(p.ops.begin() + static_cast<std::ptrdiff_t>(j), p.ops.begin() + static_cast<std::ptrdiff_t>(j + 2));
+          break;
+        }
+      }
+    }
+    t.op = Op::Br;
+    t.ops = {keep};
+    changed = true;
+  }
+  if (!changed) return;
+  std::string error;
+  compute_order(error);
+  // Blocks nothing reaches now were predecessors of others: their phis keep one entry per
+  // edge that is left.
+  std::unordered_map<Block, uint32_t> edges;
+  for (Block b : order_) {
+    if (blocks_[b].phis.empty()) continue;
+    edges.clear();
+    for (Block p : blocks_[b].preds) ++edges[p];
+    for (uint32_t pi : blocks_[b].phis) {
+      Inst& p = insts_[pi];
+      std::unordered_map<Block, uint32_t> left = edges;
+      std::vector<uint32_t> kept;
+      for (size_t j = 0; j + 1 < p.ops.size(); j += 2) {
+        auto it = left.find(p.ops[j + 1]);
+        if (it == left.end() || it->second == 0) continue;
+        --it->second;
+        kept.push_back(p.ops[j]);
+        kept.push_back(p.ops[j + 1]);
+      }
+      p.ops = std::move(kept);
+    }
+  }
+}
+
+// Blocks that only jump on (no live phis, a lone br) go: their predecessors branch to the target,
+// whose phis take the value that came through the block from each of them (not done where a
+// predecessor already reaches the target directly with another value). The goto form and
+// inlined helpers leave many (3db4: 10,084 of 25,210 blocks), which LLVM's SimplifyCFG removes
+// for DXC; AMD's compiler otherwise has them all to structure.
+void Module::remove_empty_blocks() {
+  const auto live_phi = [&](Block x) {
+    for (uint32_t pi : blocks_[x].phis) {
+      if (resolve(insts_[pi].result) == insts_[pi].result) return true;
+    }
+    return false;
+  };
+  const auto incoming = [&](const Inst& phi, Block from) -> Value {
+    for (size_t k = 0; k + 1 < phi.ops.size(); k += 2) {
+      if (phi.ops[k + 1] == from) return resolve(phi.ops[k]);
+    }
+    return kNone;
+  };
+  bool changed = false;
+  for (Block b : order_) {
+    if (b == order_[0] || blocks_[b].insts.size() != 1 || blocks_[b].preds.empty() || live_phi(b)) continue;
+    Inst& t = insts_[blocks_[b].insts.back()];
+    if (t.op != Op::Br) continue;
+    const Block to = t.ops[0];
+    if (to == b) continue;
+    // The target's phis: each predecessor of b must give the value b gave (or not reach the target already).
+    bool ok = true;
+    for (uint32_t pi : blocks_[to].phis) {
+      const Inst& p = insts_[pi];
+      if (resolve(p.result) != p.result) continue;
+      const Value via = incoming(p, b);
+      for (Block q : blocks_[b].preds) {
+        const Value direct = incoming(p, q);
+        if (direct != kNone && direct != via) ok = false;
+      }
+    }
+    if (!ok) continue;
+    // Redirect the predecessors' branches.
+    for (Block q : blocks_[b].preds) {
+      Inst& qt = insts_[blocks_[q].insts.back()];
+      switch (qt.op) {
+        case Op::Br:
+          if (qt.ops[0] == b) qt.ops[0] = to;
+          break;
+        case Op::CondBr:
+          if (qt.ops[1] == b) qt.ops[1] = to;
+          if (qt.ops[2] == b) qt.ops[2] = to;
+          break;
+        case Op::Switch:
+          if (qt.ops[1] == b) qt.ops[1] = to;
+          for (size_t k = 3; k < qt.ops.size(); k += 2) {
+            if (qt.ops[k] == b) qt.ops[k] = to;
+          }
+          break;
+        default: break;
+      }
+    }
+    // The target's phis: b's entry becomes one per edge into b.
+    for (uint32_t pi : blocks_[to].phis) {
+      Inst& p = insts_[pi];
+      const Value via = incoming(p, b);
+      if (via == kNone) continue;
+      for (size_t k = 0; k + 1 < p.ops.size(); k += 2) {
+        if (p.ops[k + 1] == b) {
+          p.ops.erase(p.ops.begin() + static_cast<std::ptrdiff_t>(k), p.ops.begin() + static_cast<std::ptrdiff_t>(k + 2));
+          break;
+        }
+      }
+      for (Block q : blocks_[b].preds) {
+        p.ops.push_back(via);
+        p.ops.push_back(q);
+      }
+    }
+    // Predecessor lists, kept current for the blocks after this one.
+    auto& tp = blocks_[to].preds;
+    for (size_t k = 0; k < tp.size(); ++k) {
+      if (tp[k] == b) {
+        tp.erase(tp.begin() + static_cast<std::ptrdiff_t>(k));
+        break;
+      }
+    }
+    tp.insert(tp.end(), blocks_[b].preds.begin(), blocks_[b].preds.end());
+    blocks_[b].preds.clear();
+    changed = true;
+  }
+  if (changed) {
+    std::string error;
+    compute_order(error);
+  }
+}
+
+// Immediate dominators of the reachable blocks (Cooper, Harvey and Kennedy), by block.
+std::vector<Block> Module::idoms() const {
+  const size_t nb = blocks_.size();
+  std::vector<uint32_t> rpo(nb, kNone);
+  for (size_t i = 0; i < order_.size(); ++i) rpo[order_[i]] = static_cast<uint32_t>(i);
+  std::vector<Block> idom(nb, kNone);
+  if (order_.empty()) return idom;
+  idom[order_[0]] = order_[0];
+  for (bool changed = true; changed;) {
+    changed = false;
+    for (size_t i = 1; i < order_.size(); ++i) {
+      const Block b = order_[i];
+      Block nd = kNone;
+      for (Block p : blocks_[b].preds) {
+        if (idom[p] == kNone) continue;
+        if (nd == kNone) {
+          nd = p;
+          continue;
+        }
+        Block x = p, y = nd;
+        while (x != y) {
+          while (rpo[x] > rpo[y]) x = idom[x];
+          while (rpo[y] > rpo[x]) y = idom[y];
+        }
+        nd = x;
+      }
+      if (idom[b] != nd) {
+        idom[b] = nd;
+        changed = true;
+      }
+    }
+  }
+  return idom;
+}
+
+// Common subexpressions (what DXC's GVN does): an instruction with no effect that computes
+// what one dominating it already computed (the same operation, flags, type and operands; the
+// operands of commutative ones in either order) becomes that one. Without it a translated
+// program made a descriptor-heap handle at every load (3db4: 7,080 against DXC's 429) and
+// repeated its address arithmetic, and AMD's compiler passed 10 GB in 18 s on it. Loads,
+// atomics and wave operations are not merged (memory and the wave can change between them).
+void Module::cse() {
+  forward_.resize(values_.size(), kNone);
+  const std::vector<Block> idom = idoms();
+  const size_t nb = blocks_.size();
+  if (order_.empty()) return;
+  std::vector<uint32_t> child_start(nb + 1, 0);
+  for (Block b : order_) {
+    if (b != order_[0]) ++child_start[idom[b] + 1];
+  }
+  for (size_t i = 0; i < nb; ++i) child_start[i + 1] += child_start[i];
+  std::vector<Block> children(order_.size());
+  {
+    std::vector<uint32_t> fill(child_start.begin(), child_start.end() - 1);
+    for (Block b : order_) {
+      if (b != order_[0]) children[fill[idom[b]]++] = b;
+    }
+  }
+  std::unordered_map<std::string, Value> table;
+  std::vector<std::pair<std::string, Value>> undo;  // a key and what it held before (kNone: nothing)
+  std::string key;
+  // Facts the branch into a block gives the blocks it dominates (a block entered from one
+  // conditional branch only): the condition's value, and x == k or x != k for a compare of x
+  // with a constant. Translated code is full of them: a vector write is select(lane active, new,
+  // old) inside a branch that skips the inactive lanes, so the select is the new value there.
+  std::unordered_map<Value, bool> known;                       // an i1 value and its value
+  std::map<std::pair<Value, Value>, bool> equal;               // (x, constant k): whether x == k
+  std::vector<std::pair<Value, int>> known_undo;               // value, previous (-1: none)
+  std::vector<std::pair<std::pair<Value, Value>, int>> equal_undo;
+  const auto def_of = [&](Value v) -> const Inst* {
+    v = resolve(v);
+    return values_[v].kind == ValueKind::Inst ? &insts_[values_[v].bits] : nullptr;
+  };
+  // (0 - zext b), (0 - sext b), zext b, sext b of an i1: b; else kNone (a lane mask spread over a
+  // register and its bool).
+  const auto mask_bool = [&](Value v) -> Value {
+    const Inst* d = def_of(v);
+    if (d && d->op == Op::Bin && static_cast<Bin>(d->code) == Bin::Sub) {
+      uint64_t k = 1;
+      if (!constant_int(d->ops[0], k) || k != 0) return kNone;
+      d = def_of(d->ops[1]);
+    }
+    if (!d || d->op != Op::Cast) return kNone;
+    const Cast c = static_cast<Cast>(d->code);
+    const Value x = resolve(d->ops[0]);
+    return (c == Cast::ZExt || c == Cast::SExt) && values_[x].type == i1_ ? x : kNone;
+  };
+  const auto set_known = [&](Value c, bool v) {
+    c = resolve(c);
+    const auto it = known.find(c);
+    known_undo.emplace_back(c, it == known.end() ? -1 : static_cast<int>(it->second));
+    known[c] = v;
+    // A compare of x with a constant: x == k (or not) holds too; a mask's bool likewise.
+    const Inst* d = def_of(c);
+    if (d && d->op == Op::Cmp) {
+      const Pred p = static_cast<Pred>(d->code);
+      uint64_t k = 0;
+      const Value x = resolve(d->ops[0]), kv = resolve(d->ops[1]);
+      if ((p == Pred::IEq || p == Pred::INe) && constant_int(kv, k)) {
+        const bool eq = p == Pred::IEq ? v : !v;
+        const auto key2 = std::make_pair(x, kv);
+        const auto e = equal.find(key2);
+        equal_undo.emplace_back(key2, e == equal.end() ? -1 : static_cast<int>(e->second));
+        equal[key2] = eq;
+        // x is a mask (0 - zext b): x == 0 says b is false, x != 0 that it is true.
+        if (const Value b = mask_bool(x); b != kNone && k == 0) {
+          const auto kb = known.find(b);
+          known_undo.emplace_back(b, kb == known.end() ? -1 : static_cast<int>(kb->second));
+          known[b] = !eq;
+        }
+      }
+    }
+  };
+  // What an instruction is, from the facts: kNone if they say nothing.
+  const auto from_facts = [&](const Inst& in) -> Value {
+    const auto is_known = [&](Value v, bool& out) {
+      const auto it = known.find(resolve(v));
+      if (it == known.end()) return false;
+      out = it->second;
+      return true;
+    };
+    bool kc = false;
+    switch (in.op) {
+      case Op::Select: {
+        uint64_t k = 0;
+        if (constant_int(in.ops[0], k)) return k ? in.ops[1] : in.ops[2];
+        if (is_known(in.ops[0], kc)) return kc ? in.ops[1] : in.ops[2];
+        break;
+      }
+      case Op::Cmp: {
+        const Pred p = static_cast<Pred>(in.code);
+        if (p != Pred::IEq && p != Pred::INe) break;
+        const Value x = resolve(in.ops[0]), kv = resolve(in.ops[1]);
+        uint64_t k = 0;
+        if (!constant_int(kv, k)) break;
+        const auto e = equal.find(std::make_pair(x, kv));
+        if (e != equal.end()) return boolean(p == Pred::IEq ? e->second : !e->second);
+        // (0 - zext b) != 0 is b.
+        if (const Value b = mask_bool(x); b != kNone && k == 0) {
+          if (p == Pred::INe) return b;
+          if (is_known(b, kc)) return boolean(!kc);
+        }
+        break;
+      }
+      case Op::Bin: {
+        if (values_[in.result].type != i1_) break;
+        const Bin op = static_cast<Bin>(in.code);
+        if (op != Bin::And && op != Bin::Or) break;
+        for (int s = 0; s < 2; ++s) {
+          if (!is_known(in.ops[s], kc)) continue;
+          if (op == Bin::And) return kc ? in.ops[1 - s] : boolean(false);
+          return kc ? boolean(true) : in.ops[1 - s];
+        }
+        break;
+      }
+      case Op::Cast: {
+        const Cast c = static_cast<Cast>(in.code);
+        if ((c == Cast::ZExt || c == Cast::SExt) && is_known(in.ops[0], kc)) {
+          return const_int(in.type, kc ? (c == Cast::ZExt ? 1u : ~0ull) : 0u);
+        }
+        break;
+      }
+      default: break;
+    }
+    return kNone;
+  };
+  // Wave and quad operations: the same call on the same values gives the same result within a
+  // block (the lanes taking part cannot change inside one), not across blocks. Each first-lane
+  // read was a ballot of the lane masks of its own (24ea: 1,990, several a block alike).
+  const auto wave_op = [&](const Inst& in) {
+    if (in.op != Op::Call) return false;
+    const std::string& n = functions_[values_[in.ops[0]].bits].name;
+    return n.compare(0, 10, "dx.op.wave") == 0 || n.compare(0, 10, "dx.op.quad") == 0;
+  };
+  const auto pure = [&](const Inst& in) {
+    switch (in.op) {
+      case Op::Bin:
+      case Op::Cast:
+      case Op::Cmp:
+      case Op::Select:
+      case Op::Gep:
+      case Op::Extract: return true;
+      case Op::Call: return functions_[values_[in.ops[0]].bits].attr == Attr::ReadNone || wave_op(in);
+      default: return false;
+    }
+  };
+  const auto visit = [&](Block b) {
+    // Entered only from a conditional branch: its condition is known here and below.
+    if (blocks_[b].preds.size() == 1) {
+      const Block p = blocks_[b].preds[0];
+      const Inst& t = insts_[blocks_[p].insts.back()];
+      if (t.op == Op::CondBr && t.ops[1] != t.ops[2] && (t.ops[1] == b || t.ops[2] == b)) set_known(t.ops[0], t.ops[1] == b);
+    }
+    for (uint32_t ii : blocks_[b].insts) {
+      const Inst& in = insts_[ii];
+      if (in.result == kNone || in.op == Op::Read || in.op == Op::Write || resolve(in.result) != in.result || !pure(in)) continue;
+      if (const Value to = from_facts(in); to != kNone && resolve(to) != in.result) {
+        forward_.resize(values_.size(), kNone);
+        forward_[in.result] = resolve(to);
+        continue;
+      }
+      key.assign(1, static_cast<char>(in.op));
+      key += static_cast<char>(in.code);
+      key_u32(key, in.aux);
+      key_u32(key, in.type);
+      key_u32(key, values_[in.result].type);
+      if (wave_op(in)) key_u32(key, b);  // within this block only
+      std::vector<uint32_t> ops(in.ops.begin(), in.ops.end());
+      const size_t values = in.op == Op::Extract ? 1 : ops.size();  // an extract's indices are numbers
+      for (size_t k = 0; k < values; ++k) ops[k] = resolve(ops[k]);
+      const bool commutative =
+          (in.op == Op::Bin && (static_cast<Bin>(in.code) == Bin::Add || static_cast<Bin>(in.code) == Bin::Mul ||
+                                static_cast<Bin>(in.code) == Bin::And || static_cast<Bin>(in.code) == Bin::Or ||
+                                static_cast<Bin>(in.code) == Bin::Xor)) ||
+          (in.op == Op::Cmp && (static_cast<Pred>(in.code) == Pred::IEq || static_cast<Pred>(in.code) == Pred::INe));
+      if (commutative && ops.size() == 2 && ops[0] > ops[1]) std::swap(ops[0], ops[1]);
+      for (uint32_t o : ops) key_u32(key, o);
+      const auto it = table.find(key);
+      if (it != table.end()) {
+        forward_.resize(values_.size(), kNone);
+        forward_[in.result] = it->second;
+        continue;
+      }
+      undo.emplace_back(key, kNone);
+      table.emplace(key, in.result);
+    }
+  };
+  struct Frame {
+    Block b;
+    uint32_t next;
+    size_t mark, known_mark, equal_mark;
+  };
+  std::vector<Frame> frames;
+  const auto enter = [&](Block b) {
+    const size_t mark = undo.size(), km = known_undo.size(), em = equal_undo.size();
+    visit(b);
+    frames.push_back({b, child_start[b], mark, km, em});
+  };
+  enter(order_[0]);
+  while (!frames.empty()) {
+    Frame& f = frames.back();
+    if (f.next < child_start[f.b + 1]) {
+      const Block c = children[f.next++];
+      enter(c);
+      continue;
+    }
+    while (undo.size() > f.mark) {
+      table.erase(undo.back().first);
+      undo.pop_back();
+    }
+    while (known_undo.size() > f.known_mark) {
+      if (known_undo.back().second < 0) known.erase(known_undo.back().first);
+      else known[known_undo.back().first] = known_undo.back().second != 0;
+      known_undo.pop_back();
+    }
+    while (equal_undo.size() > f.equal_mark) {
+      if (equal_undo.back().second < 0) equal.erase(equal_undo.back().first);
+      else equal[equal_undo.back().first] = equal_undo.back().second != 0;
+      equal_undo.pop_back();
+    }
+    frames.pop_back();
+  }
+}
+
 // Values whose operands are constants, or whose operation does nothing, become what they are
 // (forwarded: the writer skips an instruction whose value is forwarded); then every instruction
 // nothing with an effect depends on goes (forwarded to undef: nothing uses it). The translated
@@ -1006,8 +1411,36 @@ void Module::optimize() {
   const auto sext_bits = [](uint64_t k, uint32_t bits) {
     return bits >= 64 ? static_cast<int64_t>(k) : static_cast<int64_t>(k << (64 - bits)) >> (64 - bits);
   };
-  for (int pass = 0; pass < 2; ++pass) {
-  if (pass == 1) simplify_cfg();
+  // A register pair made 64 bits (the translator's am_u64: (zext hi << 32) | zext lo, either
+  // order): lo (i32), the zext of lo and the shifted part's operand (hi's zext, or what it is).
+  // DXC sees through taking such a pair apart again (uint(r), uint(r >> 32)); without it a giant
+  // kept 20,000 64-bit shifts DXC has none of.
+  const auto pair_parts = [&](Value v, Value& lo, Value& lo_ext, Value& hi_ext) {
+    const Inst* o = def(v);
+    if (!o || o->op != Op::Bin || static_cast<Bin>(o->code) != Bin::Or || values_[resolve(v)].type != i64_) return false;
+    for (int s = 0; s < 2; ++s) {
+      const Inst* sh = def(o->ops[s]);
+      const Inst* z = def(o->ops[1 - s]);
+      uint64_t k = 0;
+      if (!sh || sh->op != Op::Bin || static_cast<Bin>(sh->code) != Bin::Shl || !constant_int(sh->ops[1], k) || k != 32) continue;
+      if (!z || z->op != Op::Cast || static_cast<Cast>(z->code) != Cast::ZExt || values_[resolve(z->ops[0])].type != i32_) continue;
+      lo = resolve(z->ops[0]);
+      lo_ext = resolve(o->ops[1 - s]);
+      hi_ext = resolve(sh->ops[0]);
+      return true;
+    }
+    return false;
+  };
+  // Folding; then common subexpressions and what branches say (which leaves constants for
+  // folding again); then branches on constants become jumps and the CFG is simplified.
+  for (int pass = 0; pass < 3; ++pass) {
+  if (pass == 1) cse();
+  if (pass == 2) {
+    fold_constant_branches();
+    simplify_cfg();
+    remove_empty_blocks();
+    simplify_cfg();
+  }
   for (int round = 0; round < 16; ++round) {
     bool changed = false;
     for (Block b : order_) {
@@ -1047,11 +1480,14 @@ void Module::optimize() {
               else if (c == Cast::SExt) to = const_int(t, static_cast<uint64_t>(sext_bits(ka, types_[ft].n)));
             } else if (c == Cast::Trunc || c == Cast::Bitcast) {
               const Inst* d = def(x);
+              Value lo = kNone, lo_ext = kNone, hi_ext = kNone;
               if (d && d->op == Op::Cast) {
                 const Cast dc = static_cast<Cast>(d->code);
                 const Value inner = resolve(d->ops[0]);
                 const bool undoes = c == Cast::Trunc ? (dc == Cast::ZExt || dc == Cast::SExt) : dc == Cast::Bitcast;
                 if (undoes && values_[inner].type == t) to = inner;
+              } else if (c == Cast::Trunc && t == i32_ && pair_parts(x, lo, lo_ext, hi_ext)) {
+                to = lo;  // uint(am_u64(lo, hi))
               }
             }
             break;
@@ -1142,6 +1578,14 @@ void Module::optimize() {
               case Bin::AShr:
                 if (b0) to = a;
                 else if (a0) to = a;
+                else if (op == Bin::LShr && t == i64_ && cb && kb == 32) {
+                  // am_u64(lo, hi) >> 32: hi's zext (its top half is zero).
+                  Value lo = kNone, lo_ext = kNone, hi_ext = kNone;
+                  if (pair_parts(a, lo, lo_ext, hi_ext)) {
+                    const Inst* z = def(hi_ext);
+                    if (z && z->op == Op::Cast && static_cast<Cast>(z->code) == Cast::ZExt && values_[resolve(z->ops[0])].type == i32_) to = hi_ext;
+                  }
+                }
                 break;
               case Bin::Mul:
                 if (b1) to = a;
@@ -1153,6 +1597,10 @@ void Module::optimize() {
                 else if (ball) to = a;
                 else if (aall) to = b2;
                 else if (a == b2) to = a;
+                else if (t == i64_ && cb && kb == 0xFFFFFFFFull) {
+                  Value lo = kNone, lo_ext = kNone, hi_ext = kNone;
+                  if (pair_parts(a, lo, lo_ext, hi_ext)) to = lo_ext;  // am_u64(lo, hi) & 0xFFFFFFFF
+                }
                 break;
               case Bin::UDiv:
                 if (b1) to = a;
@@ -1172,6 +1620,8 @@ void Module::optimize() {
     if (!changed) break;
   }
   }
+
+  cse();
 
   // Dead code: from what has an effect (stores, atomics, calls that write or synchronize,
   // terminators), every instruction whose value it uses, transitively.

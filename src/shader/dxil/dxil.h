@@ -303,6 +303,10 @@ class Module {
   bool is_float(Type t) const;
   void build_ssa();
   void optimize();  // folding and dead code, after build_ssa()
+  void cse();       // common subexpressions, down the dominator tree
+  void fold_constant_branches();
+  void remove_empty_blocks();
+  std::vector<Block> idoms() const;
   void simplify_cfg();  // small branches into selects, chains of blocks merged
   bool compute_order(std::string& error);  // order_ and preds
   void entry_metadata();

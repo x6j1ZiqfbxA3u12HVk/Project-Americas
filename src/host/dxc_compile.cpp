@@ -167,3 +167,43 @@ CompileResult assemble_dxil(const std::vector<uint8_t>& module) {
 }
 
 }  // namespace am::host
+
+namespace am::host {
+
+// DXC's LLVM optimizer (IDxcOptimizer) over a module's bitcode: `passes` are LLVM pass options
+// ("-instcombine", "-gvn", ...). The optimized bitcode in `dxil`; then assemble_dxil.
+CompileResult optimize_dxil(const std::vector<uint8_t>& module, const std::vector<std::wstring>& passes) {
+  CompileResult r;
+  const Loaded& l = loaded();
+  if (!l.create) {
+    r.messages = l.why;
+    return r;
+  }
+  ComPtr<IDxcOptimizer> opt;
+  ComPtr<IDxcUtils> utils;
+  if (FAILED(l.create(CLSID_DxcOptimizer, IID_PPV_ARGS(&opt))) || FAILED(l.create(CLSID_DxcUtils, IID_PPV_ARGS(&utils)))) {
+    r.messages = "cannot create the optimizer";
+    return r;
+  }
+  ComPtr<IDxcBlobEncoding> input;
+  if (FAILED(utils->CreateBlob(module.data(), static_cast<UINT32>(module.size()), DXC_CP_ACP, &input))) {
+    r.messages = "cannot make a blob";
+    return r;
+  }
+  std::vector<LPCWSTR> args;
+  for (const std::wstring& p : passes) args.push_back(p.c_str());
+  ComPtr<IDxcBlob> out;
+  ComPtr<IDxcBlobEncoding> text;
+  const HRESULT hr = opt->RunOptimizer(input.Get(), args.data(), static_cast<UINT32>(args.size()), &out, &text);
+  if (text && text->GetBufferSize()) r.messages.assign(static_cast<const char*>(text->GetBufferPointer()), text->GetBufferSize());
+  if (FAILED(hr) || !out) {
+    r.messages = "optimizing failed (0x" + std::to_string(static_cast<unsigned long>(hr)) + "): " + r.messages;
+    return r;
+  }
+  const auto* p = static_cast<const uint8_t*>(out->GetBufferPointer());
+  r.dxil.assign(p, p + out->GetBufferSize());
+  r.ok = true;
+  return r;
+}
+
+}  // namespace am::host

@@ -25,6 +25,10 @@ CompileResult compile_hlsl(std::string_view source, std::string_view entry, std:
 // A DXIL module (LLVM 3.7 bitcode) made into a validated, signed container.
 CompileResult assemble_dxil(const std::vector<uint8_t>& module);
 
+// DXC's LLVM optimizer over a module's bitcode (LLVM pass options such as "-instcombine"): the
+// optimized bitcode in `dxil`, for assemble_dxil.
+CompileResult optimize_dxil(const std::vector<uint8_t>& module, const std::vector<std::wstring>& passes);
+
 // Whether a compiler was found (probe_dxc), and why not.
 bool dxc_available(std::string* why = nullptr);
 
