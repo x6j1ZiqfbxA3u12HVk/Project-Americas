@@ -1568,3 +1568,19 @@ loading does). Work that way.
   dispatches). Its first run was cut off with the session; result unknown — rerun it.
 * Still open: loading screen art, device slot 71 (placed UAV), mesh/geometry shaders, real
   raytracing intersection.
+
+## Transient DXC failures were recorded as refusals (2026-11-27, 01:30)
+
+* The service run started 01:10 logged 12 "refused: ... DXC: the compiler failed" in one burst
+  (between ordinary compiles), around when the previous session crashed. That text means
+  DXC's Compile call itself failed (no compile error; most likely memory), yet it went into
+  `failures.tsv` stamped with the build, and the service never tries a program its own build
+  refused: momentary failures became permanent until the next build.
+* **Now:** `CompileResult::transient` marks a failed Compile call (with its HRESULT in the
+  message); the service tries again after 5, 20 and 60 s, and if it still fails, leaves the
+  program for the next service run without recording a refusal. The 12 lines were removed from
+  `failures.tsv`; the new service (01:33, pid 14908) compiled the first of them at once.
+* Cache housekeeping, not done (asks the user first): `cache\shaders\dxil` still holds 2,071 loose
+  DXIL files (1 GB, the scheme before rt<N> folders), `rt\` (old) and `rt4\` (1.1 GB, the
+  previous translator); the runtime reads only `rt5\` and `by-source\`. Old service copies in
+  `cache\shaders\service\` and `bin\am-shaders-old*.exe` / `-pass1.exe` can go too.

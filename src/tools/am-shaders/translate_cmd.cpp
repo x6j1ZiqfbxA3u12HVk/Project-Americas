@@ -976,12 +976,30 @@ int serve(const fs::path& pack_dir, const fs::path& runtime_dir, const fs::path&
       }
       ++huge_busy;
     }
-    const host::CompileResult c = host::compile_hlsl(t.hlsl, t.entry, t.profile, huge ? std::vector<std::wstring>{L"-O0"} : std::vector<std::wstring>{});
+    // A compile the compiler could not run (not one it refused: out of memory while other
+    // compiles or a game run hold it, for one) is tried again a little later, and never counted
+    // as a refusal: a refusal is not tried again by this build.
+    host::CompileResult c;
+    for (int attempt = 0;; ++attempt) {
+      c = host::compile_hlsl(t.hlsl, t.entry, t.profile, huge ? std::vector<std::wstring>{L"-O0"} : std::vector<std::wstring>{});
+      if (c.ok || !c.transient || attempt == 3) break;
+      static constexpr DWORD kWaitMs[] = {5000, 20000, 60000};
+      say("  %s %s: DXC %s; trying again in %lu s\n", shader::hw_stage_name(at.stage), marker.c_str(), c.messages.c_str(),
+          static_cast<unsigned long>(kWaitMs[attempt] / 1000));
+      std::fflush(stdout);
+      Sleep(kWaitMs[attempt]);
+    }
     if (huge) {
       std::lock_guard<std::mutex> g(lock);
       --huge_busy;
     }
     const double took = std::chrono::duration<double>(std::chrono::steady_clock::now() - c0).count();
+    if (!c.ok && c.transient) {
+      say("  %s %s: DXC %s four times; left for the next service run (not recorded as refused)\n",
+          shader::hw_stage_name(at.stage), marker.c_str(), c.messages.c_str());
+      std::fflush(stdout);
+      return;
+    }
     if (!c.ok) return fail("DXC: " + c.messages.substr(0, 200));
     const auto write = [&](const fs::path& f) {
       std::ofstream(f, std::ios::binary).write(reinterpret_cast<const char*>(c.dxil.data()), static_cast<std::streamsize>(c.dxil.size()));

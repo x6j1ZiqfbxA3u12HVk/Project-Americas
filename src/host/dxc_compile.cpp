@@ -7,6 +7,7 @@
 #include <dxcapi.h>
 #include <wrl/client.h>
 
+#include <cstdio>
 #include <mutex>
 
 #include "core/text.h"
@@ -76,8 +77,12 @@ CompileResult compile_hlsl(std::string_view source, std::string_view entry, std:
   if (!level) args.push_back(L"-O3");
   DxcBuffer buffer{source.data(), source.size(), DXC_CP_UTF8};
   ComPtr<IDxcResult> result;
-  if (FAILED(compiler->Compile(&buffer, args.data(), static_cast<UINT32>(args.size()), nullptr, IID_PPV_ARGS(&result)))) {
-    r.messages = "the compiler failed";
+  if (const HRESULT hr = compiler->Compile(&buffer, args.data(), static_cast<UINT32>(args.size()), nullptr, IID_PPV_ARGS(&result));
+      FAILED(hr)) {
+    char text[64];
+    std::snprintf(text, sizeof text, "the compiler failed (0x%08lX)", static_cast<unsigned long>(hr));
+    r.messages = text;
+    r.transient = true;
     return r;
   }
   ComPtr<IDxcBlobUtf8> errors;

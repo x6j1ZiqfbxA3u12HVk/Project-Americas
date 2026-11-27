@@ -13,6 +13,9 @@ struct CompileResult {
   bool ok = false;
   std::vector<uint8_t> dxil;  // the signed container, ready for D3D12
   std::string messages;       // errors and warnings
+  // The compiler could not run the compile at all (its Compile call failed: out of memory, for
+  // one), as opposed to refusing the source: worth trying again later.
+  bool transient = false;
 };
 
 // `profile` like "cs_6_6". Thread-safe: each call makes its own compiler object.
