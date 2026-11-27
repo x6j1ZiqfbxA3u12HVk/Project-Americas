@@ -1900,3 +1900,21 @@ cannot be built. What a console mesh program does (from the reference furthest a
   program (gpu_runner has graphics draws; add a mesh one), then a game run.
 * Geometry (GS 195) and ES (195): not looked at yet; the ES/GS pairs are the old geometry
   pipeline, rarer than mesh.
+
+## Giant 24ea: the chained form (2026-11-27, ~08:15)
+
+* With the typed-load fixes 24ea is 277 K DXIL instructions (like 3db4's 262 K), but its DXC
+  compile took 58 min (7.7 GB) and AMD's driver passed **20 GB in 86 s** (stopped). It is in the
+  structurer's chained form (nested it would pass DXC's bracket limit): one merge point has 716
+  predecessors, 9,829 phis in all. With per-lane branches that is divergent control flow the
+  driver must restructure (quadratic in the merge's width).
+* **Trying (commit a13362f):** programs in the chained form branch on the wave
+  (`CfgBlock::cond_wave`, `WaveActiveAnyTrue` of the mask test; only chained programs change).
+  Experiment running unattended: `tools\step3\bench-24ea-r6g.cmd` (DXC then the driver build,
+  capped at 20 GB); results in `cache\shaders\bench\r6g-24ea\log.txt` and `driver-full.txt`.
+  If the driver still blows up, next ideas: fewer exits per merge point (funnel the branches to
+  a merge point through one exit per region), or the chain's merge regions as a loop over
+  `am_go` (one join instead of one per chain).
+* The translator-6 24ea DXIL (no wave branches) is installed in `dxil\rt6` for now (key
+  bd0ba232..): the runtime would hand it to the driver, which on a 16 GB PC needs a big page
+  file. The service will rebuild 24ea with the wave branches when it next starts (stale check).
