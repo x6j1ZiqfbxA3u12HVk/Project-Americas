@@ -1662,3 +1662,7 @@ list slots from 59 up are two later than in older titles).
   DXIL): **the driver passed 26 GB of commit and was stopped unfinished** (commit limit here 34 GB).
   These far-jump giants are too large for AMD's compiler on a 16 GB PC; the way on is smaller
   DXIL (translator output per instruction), or a much larger page file for a one-time build.
+* **Again with a 48 GB page file (commit limit 63.9 GB):** the driver building `3db4...` grew
+  slowly to 4 GB over 6 minutes, then jumped past 49 GB within two minutes and was stopped. No page
+  file size makes this practical. The fix has to be smaller DXIL for the far-jump giants (the
+  translator's output per instruction), or keeping them out of the driver some other way.
