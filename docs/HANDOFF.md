@@ -2176,3 +2176,23 @@ session scratchpad, `peak24.ps1`: run a copy `am_tests_drv.exe` so builds can go
 
 Also open: the game run's memory (one large driver build at a time, and only with headroom
 under the cap), mesh pipelines refused (0x80070057).
+
+## 24ea: the one-time prebuild fails; it is one giant loop (2026-11-27, ~21:40)
+
+* **Installed:** our compiler's 24ea (goto form, wave branches, DXC's LLVM passes; 2.85 MB of
+  DXIL) in `dxil\rt6` under the service's key (`tools\step3\install_dxil.py` with the DXC-form
+  HLSL for the key, so the service keeps it). DXC's chained-form DXIL that was there is kept in
+  `cache\shaders\bench\24ea-dxc-installed\`. Either one crashes a game run that reaches 24ea
+  (the driver passes the run's 24 GB cap).
+* **Prebuild** (`tools\step3\prebuild-24ea-ours.ps1`, cap 42 GB, page file: commit limit 63.9
+  GB): the driver's first phase rose steadily to 23.2 GB in four minutes and fell to 11.8 GB;
+  the second went from 19 GB past 42 GB in under 30 s. No page file makes that practical.
+* **Why:** 13,838 of 24ea's 13,890 blocks (98.5 % of its code) are one strongly connected
+  region: an outer loop around everything (a command interpreter's shape), its handlers joining
+  at blocks of 568 and 1,365 predecessors. So it cannot be cut into parts that run once each in
+  order; a split needs a GPU-driven loop of dispatches (ExecuteIndirect with counts the parts
+  write, state and LDS saved between parts), which the runtime does not have yet.
+* **Ways on (the user's call):** (a) the runtime skips dispatches of programs the driver cannot
+  build (a list; 24ea on it) so a game run gets past it and shows what comes next, results
+  missing; (b) the GPU-driven split; (c) find which part of the second phase explodes (machine
+  code generation: register allocation over one loop of 400 K instructions) and shrink that.
