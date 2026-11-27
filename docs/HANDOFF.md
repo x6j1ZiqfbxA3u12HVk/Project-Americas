@@ -2111,12 +2111,18 @@ messages, and what was done after:
   compared) and names the build on the GPU when it resets (`hung-dxc` / `hung-ours`).
   **Run the GPU comparison only when the user is away from the PC**, in a fresh state folder.
 
+* **Skip-optimization flag: AMD's driver ignores it.** 20 ordinary compute programs from ours,
+  each built fresh (`AM_DXIL_NONCE` renames the producer so the driver's cache does not answer):
+  85.8 s without, 89.8 s with DXIL's bit 0 (`AM_DXIL_SKIP_OPT=1`; present in the module's
+  metadata, accepted by the validator), same memory. Measure with
+  `AM_PIPELINE_MEMORY=<dir> AM_PIPELINE_MEMORY_COUNT=20 am_tests d3d12x_driver_pipeline_memory`
+  (forward slashes in the path when run from bash).
+
 **Next:**
-1. The giants in AMD's driver (24ea, 3db4, 0849), the main concern. Not tried yet: DXIL's
-   "skip optimization" shader flag (bit 0, which the validator does not check; DXC sets it at
-   -Od) on our module, to see whether the driver compiles it with less; then splitting a giant
-   (its far jumps pick among sub-programs) or finding which driver pass grows (time a few
-   sizes of 3db4-like programs). Cap memory well below 46 GB while the user works.
+1. The giants in AMD's driver (24ea, 3db4, 0849), the main concern. Left: splitting a giant
+   (its far jumps pick among sub-programs: separate pipelines, or passes with the registers
+   saved between them) or finding which driver pass grows (time a few sizes of 3db4-like
+   programs). Cap memory well below 46 GB while the user works.
 2. The GPU comparison again (user away): compute, then a mesh and a VS/PS draw comparison.
 3. Service: DXC for programs that nest (faster in the driver), ours for the rest
    (`AM_SHADERS_OURS`); the giants only once the driver takes them.

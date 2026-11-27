@@ -737,7 +737,7 @@ bool Module::finish(std::string& error) {
 
 void Module::entry_metadata() {
   // Drivers read the producer's name: AMD's compiler crashes on a module without one.
-  named_metadata("llvm.ident", {md_node({md_string("Project Americas DXIL writer")})});
+  named_metadata("llvm.ident", {md_node({md_string(producer_)})});
   named_metadata("dx.version", {md_node({md_u32(1), md_u32(6)})});
   // Validator 1.6: the first for shader model 6.6, so any newer validator takes the module.
   named_metadata("dx.valver", {md_node({md_u32(1), md_u32(6)})});

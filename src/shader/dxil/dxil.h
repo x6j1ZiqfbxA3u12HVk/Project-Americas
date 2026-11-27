@@ -283,8 +283,12 @@ class Module {
   void add_flags(uint64_t f) { flags_ |= f; }
   // After finish(): other flags (the ones the validator computed, when ours differ).
   void set_flags(uint64_t f);
+  // Before finish(): the producer's name (llvm.ident). Measurements change it to have the
+  // driver build a module afresh (it caches builds by their bytes).
+  void set_producer(std::string_view name) { producer_ = name; }
 
  private:
+  std::string producer_ = "Project Americas DXIL writer";
   Type intern(TypeInfo t);
   Value constant(ValueKind k, Type t, uint64_t bits);
   Value add_value(ValueKind k, Type t, uint64_t bits);

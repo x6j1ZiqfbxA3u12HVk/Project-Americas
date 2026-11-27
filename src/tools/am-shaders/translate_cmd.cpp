@@ -151,9 +151,18 @@ int translate(const std::string& wanted, const fs::path& pack_dir, const fs::pat
             shader::dxil::Module m;
             // AM_SHADERS_REGS_IN_MEMORY=1: the register arrays in memory (giants).
             const bool regs = GetEnvironmentVariableA("AM_SHADERS_REGS_IN_MEMORY", nullptr, 0) != 0;
+            // Driver measurements: AM_DXIL_NONCE=<text> renames the producer (a fresh build, not
+            // the driver's cached one); AM_DXIL_SKIP_OPT=1 sets DXIL's skip-optimization flag
+            // (bit 0, as DXC's -Od), which the validator does not check.
+            char nonce[64] = {};
+            if (GetEnvironmentVariableA("AM_DXIL_NONCE", nonce, sizeof nonce) && nonce[0]) {
+              m.set_producer(std::string("Project Americas DXIL writer ") + nonce);
+            }
+            const bool skip_opt = GetEnvironmentVariableA("AM_DXIL_SKIP_OPT", nullptr, 0) != 0;
             if (!shader::dxil::compile_hlsl(t.hlsl, t.entry, m, r.messages, t.profile, regs) || !m.finish(r.messages)) {
               r.messages = "ours: " + r.messages;
             } else {
+              if (skip_opt) m.set_flags(m.shader_flags() | 1u);
               r = host::assemble_dxil(shader::dxil::write_bitcode(m));
               uint64_t flags = 0;
               if (!r.ok && shader::dxil::validator_flags(r.messages, flags)) {
