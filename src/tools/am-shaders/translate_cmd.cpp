@@ -842,12 +842,16 @@ int serve(const fs::path& pack_dir, const fs::path& runtime_dir, const fs::path&
       if (key.size() < 3 || key.compare(key.size() - 3, 3, "-o3") != 0) unoptimized.insert(narrow(f.path().stem().wstring()));
     }
   }
-  // Under `lock`: whether `m` needs compiling: no DXIL yet, DXIL compiled unoptimized, or DXIL
-  // from before the guards for a program that can loop.
+  // Programs compiled from an older translation: the translator changed what they become (its
+  // version did not), found in the background (below) and compiled again when idle.
+  std::vector<std::string> stale;
+  std::set<std::string> stale_set;
+  // Under `lock`: whether `m` needs compiling: no DXIL yet, DXIL compiled unoptimized or from an
+  // older translation, or DXIL from before the guards for a program that can loop.
   const auto needs = [&](const std::string& m) {
     std::error_code e;
     if (!fs::exists(out_dir / widen(m + ".dxil"), e)) return true;
-    if (unoptimized.count(m)) return true;
+    if (unoptimized.count(m) || stale_set.count(m)) return true;
     const auto it = where.find(m);
     return it != where.end() && it->second.loops && !guarded.count(m);
   };
@@ -910,6 +914,47 @@ int serve(const fs::path& pack_dir, const fs::path& runtime_dir, const fs::path&
                     std::to_string(upgrades.size()) + " to compile again with the runaway guards").c_str()
                  : "on demand: what the game asks for", jobs);
   std::fflush(stdout);
+
+  // Which compiled programs the translator now makes differently: each one translated again and
+  // its source key compared with the one its DXIL was made from (.src). A translator change
+  // thus rebuilds only the programs it changes, without a new version and a rebuild of all.
+  if (everything) {
+    std::thread([&] {
+      SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
+      std::vector<std::pair<std::string, Location>> made;
+      {
+        std::lock_guard<std::mutex> g(lock);
+        std::error_code e;
+        for (const auto& [m, at] : where) {
+          if (fs::exists(out_dir / widen(m + ".dxil"), e)) made.emplace_back(m, at);
+        }
+      }
+      size_t found = 0;
+      for (const auto& [m, at] : made) {
+        std::string stored;
+        std::ifstream(out_dir / widen(m + ".src")) >> stored;
+        if (stored.empty()) continue;  // compiled before keys were kept: left as it is
+        fs::path file;
+        {
+          std::lock_guard<std::mutex> g(lock);
+          file = files[at.file];
+        }
+        std::string error;
+        const auto shader = load(file, error);
+        if (!shader) continue;
+        const shader::NativeBlob& b = shader->shader.blobs[at.blob];
+        const shader::Translation t = shader::translate(input_of(shader->bytes, b, b.programs[at.program]), shader::Binding::Runtime);
+        if (!t.ok) continue;
+        const std::string key = source_key(t) + (t.hlsl.size() > (1u << 20) ? "-o3" : "");
+        if (key == stored) continue;
+        std::lock_guard<std::mutex> g(lock);
+        if (stale_set.insert(m).second) stale.push_back(m);
+        ++found;
+      }
+      say("serve: %zu of %zu compiled programs come from an older translation: compiled again when idle\n", found, made.size());
+      std::fflush(stdout);
+    }).detach();
+  }
 
   std::deque<std::string> urgent;  // what the game waits for, oldest first
   std::set<std::string> taken;     // compiled, compiling, failed or unknown this session
@@ -1134,10 +1179,11 @@ int serve(const fs::path& pack_dir, const fs::path& runtime_dir, const fs::path&
     recent.emplace_back(now, at.code_size);
     if (recent.size() > 40) recent.pop_front();
     uint64_t left_code = 0, recent_code = 0;
-    const size_t left = urgent.size() + bulk.size() + upgrades.size() + deferred_huge.size();
+    const size_t left = urgent.size() + bulk.size() + stale.size() + upgrades.size() + deferred_huge.size();
     for (const std::string& m : urgent) left_code += where[m].code_size;
     for (const std::string& m : bulk) left_code += where[m].code_size;
     for (const std::string& m : upgrades) left_code += where[m].code_size;
+    for (const std::string& m : stale) left_code += where[m].code_size;
     for (const auto& d : deferred_huge) left_code += where[d.first].code_size;
     for (const auto& r : recent) recent_code += r.second;
     const double window = std::chrono::duration<double>(now - recent.front().first).count();
@@ -1184,6 +1230,11 @@ int serve(const fs::path& pack_dir, const fs::path& runtime_dir, const fs::path&
           while (marker.empty() && idle_room && !bulk.empty()) {
             std::string m = bulk.back();
             bulk.pop_back();
+            if (taken.insert(m).second) marker = m, idle_item = true;
+          }
+          while (marker.empty() && idle_room && !stale.empty()) {
+            std::string m = stale.back();
+            stale.pop_back();
             if (taken.insert(m).second) marker = m, idle_item = true;
           }
           while (marker.empty() && idle_room && !upgrades.empty()) {

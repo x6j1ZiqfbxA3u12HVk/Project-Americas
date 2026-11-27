@@ -122,6 +122,7 @@ struct Ctx {
   // The pixel shader exports depth (MRTZ): AmOut gains SV_Depth.
   bool depth_export = false;
   bool uses_lod = false;     // image_get_lod: the level-of-detail helpers
+  bool uses_typed = false;   // typed buffer loads: kTypedHelpers (only then, so other programs' source stays the same)
   bool uses_movrel = false;  // v_movrel*: am_nv bounds the indexed VGPRs
   // Descriptor lookups still valid in this block, by first SGPR (T#s, S#s), and every one made.
   std::set<uint32_t> live_images, live_samplers, image_vars, sampler_vars;
@@ -1809,9 +1810,12 @@ const std::unordered_map<std::string, Handler>& table() {
               for (int k = 0; k < 4; ++k) val += (k ? ", " : "") + (k < n ? "v[" + num(vd + k) + "]" : std::string("0u"));
               c.line("  am_fmt_store(p, lim, am_fmt_info(" + fmt + "), " + num(n) + "u, " + val + "));");
             } else {
-              c.line("  uint4 r = am_fmt_load(p, lim, am_fmt_info(" + fmt + "), rs.w);");
+              // Each output decodes only the channel the V#'s destination select names for it (a
+              // load of one channel carried four decoders before).
+              c.uses_typed = true;
+              c.line("  uint info = am_fmt_info(" + fmt + "); uint4 raw = am_fmt_raw(p, info);");
               std::vector<std::pair<uint32_t, std::string>> w;
-              for (int k = 0; k < n; ++k) w.emplace_back(vd + k, "r[" + num(k) + "]");
+              for (int k = 0; k < n; ++k) w.emplace_back(vd + k, "am_fmt_out(raw, info, (rs.w >> " + num(3 * k) + "u) & 7u, lim)");
               c.vwrites(w);
             }
             c.line("}");
@@ -2970,6 +2974,43 @@ void am_fmt_store(uint64_t p, uint lim, uint info, uint n, uint4 val) {
 }
 )";
 
+// Typed buffer loads, one output at a time (only programs with typed loads get these): the
+// element's dwords in one load, then for each output the one channel its destination select
+// names, converted by the format's type. No branches, no vector indexed by a value.
+const char* kTypedHelpers = R"(
+uint4 am_fmt_raw(uint64_t p, uint info) {
+  uint eb = am_fmt_bytes(info);
+  uint4 q = am_load4(p & ~uint64_t(3));
+  return uint4(select(eb < 4u, q.x >> (uint(p & 3u) * 8u), q.x), select(eb >= 8u, q.y, 0u), select(eb >= 12u, q.z, 0u),
+               select(eb >= 16u, q.w, 0u));
+}
+// Channel k of the element (its bits from bit o of raw), as the shader sees it.
+uint am_fmt_ch(uint4 raw, uint info, uint k, uint o) {
+  uint t = info & 7u, w = am_fmt_width(info, k);
+  uint m = select(w >= 32u, 0xFFFFFFFFu, (1u << w) - 1u);
+  uint dw = select(o < 32u, raw.x, select(o < 64u, raw.y, select(o < 96u, raw.z, raw.w)));
+  uint x = (dw >> (o & 31u)) & m;
+  int sx = int(x << (32u - w)) >> (32u - w);
+  bool sgn = (t & 1u) != 0u;  // snorm, sscaled, sint
+  float f = float(select(sgn, sx, int(x)));  // norm and scaled channels are under 32 bits
+  float d = float(select(sgn, m >> 1, m));
+  float n = select(f == d, 1.0f, f / d);  // the largest value is exactly 1 (fast division is not exact)
+  uint fl = select(w == 32u, x, asuint(f16tof32(x << (15u - min(w, 15u)))));  // half, or the unsigned 11/10-bit floats
+  uint r = select(t <= 1u, asuint(select(t == 1u, max(n, -1.0f), n)),
+           select(t <= 3u, asuint(f), select(t == 4u, x, select(t == 5u, asuint(sx), fl))));
+  return select(k >= ((info >> 3) & 7u), select(k == 3u, am_fmt_one(info), 0u), r);
+}
+// One output: `sel` is the V#'s destination select for it (0, 1, or channel X..W as 4..7); out
+// of the buffer (or no format) it reads 0.
+uint am_fmt_out(uint4 raw, uint info, uint sel, uint lim) {
+  uint k = sel & 3u, w0 = am_fmt_width(info, 0u), w1 = am_fmt_width(info, 1u), w2 = am_fmt_width(info, 2u);
+  uint o = select(k == 0u, 0u, select(k == 1u, w0, select(k == 2u, w0 + w1, w0 + w1 + w2)));
+  uint v = select(sel >= 4u, am_fmt_ch(raw, info, k, o), select(sel == 1u, am_fmt_one(info), 0u));
+  uint eb = am_fmt_bytes(info);
+  return select(or(eb == 0u, eb > lim), 0u, v);
+}
+)";
+
 // The unified buffer formats (gfx10): bits 0-2 the type (unorm, snorm, uscaled, sscaled, uint,
 // sint, float), 3-5 the channels, then six bits of width a channel, from bit 0 of the element up.
 std::string format_table() {
@@ -3634,6 +3675,7 @@ Translation finish_graphics(const TranslateInput& in, const Ctx& c, Translation 
   h += binding == Binding::Runtime ? kRuntimeBinding : kTestBinding;
   h += format_table();
   h += kBufferHelpers;
+  if (c.uses_typed) h += kTypedHelpers;
   if (c.uses_images) {
     if (!vs) h += "#define AM_DX(x) ddx_fine(x)\n#define AM_DY(x) ddy_fine(x)\n";
     h += kImageHelpers;
@@ -3925,6 +3967,7 @@ Translation translate(const TranslateInput& in, Binding binding) {
   h += binding == Binding::Runtime ? kRuntimeBinding : kTestBinding;
   h += format_table();
   h += kBufferHelpers;
+  if (c.uses_typed) h += kTypedHelpers;
   if (c.uses_images) {
     h += "#define AM_DX(x) ((QuadReadAcrossX(x) - (x)) * select((am_lane & 1u) != 0u, -1.0f, 1.0f))\n"
          "#define AM_DY(x) ((QuadReadAcrossY(x) - (x)) * select((am_lane & 2u) != 0u, -1.0f, 1.0f))\n";
