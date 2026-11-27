@@ -1811,3 +1811,48 @@ list slots from 59 up are two later than in older titles).
   of 3db4 to the end (capped at 45 GB), `tools\step3\driver-3db4-full.ps1`, log
   `cache\shaders\bench\r6-3db4\driver-full.txt` (peak private bytes, system commit at the peak,
   time).
+
+## The giants fit: typed loads lean, V# work done once, wave branches (2026-11-27, ~07:00)
+
+Measured on giant 3db4 (AMD RX 9060 XT, 16 GB PC; `tools\step3\driver-3db4-*.ps1`, logs in
+`cache\shaders\bench\r6*-3db4\`):
+
+| translator | DXIL instructions | DXC | driver build |
+|---|---|---|---|
+| 6 (05:50) | 956 K | 591 s | stopped at 45 GB private (system commit 57 GB), unfinished after 13 min |
+| + one channel per output | 523 K | 423 s | stopped at 24 GB |
+| + V# parameters where the V# is written | 302 K | 298 s | **done: 263 s, peak 13.7 GB** |
+| + uniform window index | 302 K | 256 s | done: 204 s, peak 13.7 GB |
+| + wave branches (>32,768 instructions) | see below | | |
+
+* **Answer to "does a 48 GB page file do it?"** For the 05:50 output, no: past 45 GB and
+  still going. Now the giant builds, but 13.7 GB for one pipeline is still heavy for a 16 GB PC.
+* **One channel per output:** every one of the giants' typed loads is `buffer_load_format_x`
+  (3db4: 3,281; 24ea: 1,890), each read one channel but decoded all four.
+* **V# parameters once (`am_tb<r>`, `am_typed`):** all of 3db4's typed loads read V# s[12:15],
+  written 7 times; the base, range, format and per-output channel layout are computed after
+  each instruction that writes those SGPRs, not at each of the 3,281 loads. A load is now its
+  address, one page-table entry, one Load4 and a one-channel conversion (~70 DXIL instructions;
+  the software floor). The window index is uniform (one buffer, one allocation): no per-lane
+  loop in the driver; this cut the driver's time, not its memory.
+* **Wave branches (`Ctx::wave_branches`, programs over `kWaveBranchesFrom` = 32,768
+  instructions):** with lanes as threads, a mask test (execz, vccz, a mask operation's SCC) is
+  each lane's own branch: divergent control flow the host compiler must turn back into masks;
+  for 17,000 blocks that is what the driver's memory goes on (suspected; measuring). For the
+  largest programs the branch is taken on the wave, `WaveActiveAnyTrue(test)`, exactly the
+  console's semantics; masks stay per-lane values. All 28 translator tests pass with it forced
+  on for every program.
+* **Only changed programs are rebuilt:** the typed helpers are included only by programs with
+  typed loads, wave branches only in programs over the threshold; every other program's
+  source is byte-identical. The service's stale check (06:54): 2,515 of 10,505 compiled
+  programs changed (the ones with typed loads, `tbuffer` too), recompiled as idle work after
+  the 1,846 not compiled yet.
+* **Still to do for speed (would change every program, so not tonight):** raw memory loads
+  and stores (`am_load`/`am_store`) index the window with `NonUniformResourceIndex`, which makes
+  AMD's driver loop over lanes at every access. Where the address's base is scalar (SGPR base,
+  `saddr`, a V#), the window is uniform and the loop can go. Next time translator output may
+  change for everything anyway, do this with it.
+* **Native typed views** (the hardware converts formats) remain the cleaner design for typed
+  loads, but D3D12 caps a typed buffer view at 2^27 elements: large windows need a chain of
+  views plus a lookup table. Worth it only if typed-load-heavy programs show up as slow on the
+  GPU.
