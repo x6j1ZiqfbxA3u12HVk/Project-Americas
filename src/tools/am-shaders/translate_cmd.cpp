@@ -128,9 +128,10 @@ int translate(const std::string& wanted, const fs::path& pack_dir, const fs::pat
           fs::create_directories(out_dir, ec);
           const fs::path hlsl = out_dir / widen(wanted + ".hlsl");
           std::ofstream(hlsl, std::ios::binary) << t.hlsl;
-          std::printf("%s: %s, %s form, %s, %zu KiB of HLSL, nesting %d (%s)\n", wanted.c_str(), shader::hw_stage_name(pr.stage),
-                      !t.structured ? "dispatcher" : chained ? "chained structured" : "structured",
-                      t.lanes ? "lanes as threads" : "the wave's masks", t.hlsl.size() >> 10, deepest, narrow(hlsl.wstring()).c_str());
+          std::printf("%s: %s, %s form, %s, %zu KiB of HLSL, nesting %d (nested form %d) (%s)\n", wanted.c_str(),
+                      shader::hw_stage_name(pr.stage), !t.structured ? "dispatcher" : chained ? "chained structured" : "structured",
+                      t.lanes ? "lanes as threads" : "the wave's masks", t.hlsl.size() >> 10, deepest, t.nested_depth,
+                      narrow(hlsl.wstring()).c_str());
           std::fflush(stdout);
           // AM_SHADERS_O0=1: unoptimized over 1 MiB, as the service once did (to compare what the driver does).
           const bool huge = t.hlsl.size() > (1u << 20) && GetEnvironmentVariableA("AM_SHADERS_O0", nullptr, 0);

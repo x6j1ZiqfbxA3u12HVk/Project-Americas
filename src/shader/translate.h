@@ -75,6 +75,7 @@ struct Translation {
   uint32_t vgpr_count = 0;           // VGPRs the HLSL keeps per lane
   bool structured = false;           // nested ifs and loops (else one loop over a switch)
   bool lanes = false;                // lanes as threads (else the wave's masks: see translate.cpp)
+  int nested_depth = 0;              // the nested structured form's bracket depth (chains past 200)
   std::string failure;               // the first reason it failed
   std::map<std::string, int> unsupported;  // instruction names (or reasons) and how often
 };

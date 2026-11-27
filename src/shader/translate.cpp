@@ -1351,7 +1351,12 @@ const std::unordered_map<std::string, Handler>& table() {
 
     // -- lanes --
     t["v_readfirstlane_b32"] = [](Ctx& c) {
-      c.line(c.sdst(c.f(Field::VDST)) + " = WaveReadLaneAt(" + vsrc(c, 0) + ", am_first_active());");
+      // Pixel shaders with lanes as threads: HLSL's own first-lane read. Their helper-lane test
+      // (IsHelperLane), quad reads (s_wqm) and a ballot feeding WaveReadLaneAt together crash
+      // AMD's compiler (amdxc64, a null read in its LDS-atomic code; reproduced with
+      // d3d12x_graphics_pipeline_from_files).
+      if (c.lane && c.input->stage == HwStage::Ps) c.line(c.sdst(c.f(Field::VDST)) + " = WaveReadLaneFirst(" + vsrc(c, 0) + ");");
+      else c.line(c.sdst(c.f(Field::VDST)) + " = WaveReadLaneAt(" + vsrc(c, 0) + ", am_first_active());");
       return true;
     };
     t["v_readlane_b32"] = [](Ctx& c) {
@@ -4100,14 +4105,16 @@ Translation translate(const TranslateInput& in, Binding binding) {
   // DXC refuses more than 256 nested brackets: structured code nested deeper (programs with
   // many far jumps) is made again with chains (see the Structurer), and only if that is still
   // too deep takes the dispatcher. Programs that fit keep their output unchanged.
-  const auto too_deep = [](const std::string& text) {
+  const auto depth_of = [](const std::string& text) {
     int depth = 0, deepest = 0;
     for (const char ch : text) {
       if (ch == '{' || ch == '(') deepest = std::max(deepest, ++depth);
       else if (ch == '}' || ch == ')') --depth;
     }
-    return deepest > 200;
+    return deepest;
   };
+  const auto too_deep = [&](const std::string& text) { return depth_of(text) > 200; };
+  if (tr.structured) tr.nested_depth = depth_of(body);
   if (tr.structured && too_deep(body)) {
     std::string chained;
     bool chained_br = false;

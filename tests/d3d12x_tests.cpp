@@ -779,3 +779,52 @@ TEST_CASE(d3d12x_driver_pipeline_memory) {
   made.clear();
   std::printf("    released: commit %.0f MiB, GPU local %.0f MiB\n", commit(), video(DXGI_MEMORY_SEGMENT_GROUP_LOCAL));
 }
+
+// A graphics pipeline from two DXIL files (AM_PIPELINE_VS, AM_PIPELINE_PS) with the translated
+// programs' root signature, its vertex inputs float4s named in AM_PIPELINE_LAYOUT (comma
+// separated semantics, index 0), one R8G8B8A8 target: to reproduce a pipeline the driver's
+// compiler fails on, outside a game run. Without the variables the test does nothing.
+TEST_CASE(d3d12x_graphics_pipeline_from_files) {
+  using namespace am;
+  char vs_path[1024] = {}, ps_path[1024] = {}, layout_text[512] = {};
+  if (!GetEnvironmentVariableA("AM_PIPELINE_VS", vs_path, sizeof vs_path) || !GetEnvironmentVariableA("AM_PIPELINE_PS", ps_path, sizeof ps_path)) {
+    return;
+  }
+  GetEnvironmentVariableA("AM_PIPELINE_LAYOUT", layout_text, sizeof layout_text);
+  rt::present::HostGpu* gpu = rt::present::host_gpu();
+  if (!gpu) return;
+  const auto read = [](const char* p) {
+    std::ifstream in(p, std::ios::binary);
+    return std::vector<uint8_t>((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+  };
+  const std::vector<uint8_t> vs = read(vs_path), ps = read(ps_path);
+  std::vector<std::string> names;
+  for (std::string rest = layout_text; !rest.empty();) {
+    const size_t comma = rest.find(',');
+    names.push_back(rest.substr(0, comma));
+    rest = comma == std::string::npos ? std::string() : rest.substr(comma + 1);
+  }
+  std::vector<D3D12_INPUT_ELEMENT_DESC> elements;
+  for (size_t k = 0; k < names.size(); ++k) {
+    elements.push_back({names[k].c_str(), 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, static_cast<UINT>(16 * k),
+                        D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0});
+  }
+  D3D12_GRAPHICS_PIPELINE_STATE_DESC d{};
+  d.pRootSignature = translated_graphics_root_signature();
+  d.VS = {vs.data(), vs.size()};
+  d.PS = {ps.data(), ps.size()};
+  d.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+  d.SampleMask = UINT_MAX;
+  d.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+  d.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+  d.RasterizerState.DepthClipEnable = TRUE;
+  d.InputLayout = {elements.data(), static_cast<UINT>(elements.size())};
+  d.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+  d.NumRenderTargets = 1;
+  d.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+  d.SampleDesc.Count = 1;
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> pso;
+  const HRESULT hr = gpu->device->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(&pso));
+  std::printf("    pipeline from %s + %s: 0x%08lx\n", vs_path, ps_path, static_cast<unsigned long>(hr));
+  CHECK(SUCCEEDED(hr));
+}

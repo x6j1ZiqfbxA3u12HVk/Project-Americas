@@ -238,6 +238,22 @@ ID3D12PipelineState* cached_graphics_pipeline(const D3D12_GRAPHICS_PIPELINE_STAT
       return pso;
     }
   }
+  // The programs this thread hands the driver, kept until its next build: when the driver's
+  // compiler crashes the process, the crashing thread's files name the pipeline.
+  if (!c.file.empty()) {
+    const fs::path dir = c.file.parent_path() / L"building";
+    std::error_code ec;
+    fs::create_directories(dir, ec);
+    const std::wstring tid = std::to_wstring(GetCurrentThreadId());
+    for (const auto& [stage, code] : {std::pair{L"vs", desc.VS}, {L"ps", desc.PS}, {L"gs", desc.GS}}) {
+      const fs::path f = dir / (tid + L"-" + stage + L".dxil");
+      if (code.pShaderBytecode) {
+        std::ofstream(f, std::ios::binary).write(static_cast<const char*>(code.pShaderBytecode), static_cast<std::streamsize>(code.BytecodeLength));
+      } else {
+        fs::remove(f, ec);
+      }
+    }
+  }
   HRESULT hr = E_FAIL;
   ID3D12PipelineState* pso = compile("graphics", desc.VS.BytecodeLength + desc.PS.BytecodeLength + desc.GS.BytecodeLength, [&] {
     ID3D12PipelineState* p = nullptr;
