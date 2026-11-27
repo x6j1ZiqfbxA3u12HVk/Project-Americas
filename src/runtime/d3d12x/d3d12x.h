@@ -79,6 +79,8 @@ HRESULT create_derived_pipeline(const void* base, UINT count, const void* desc, 
 std::string describe_pipeline(const void* pipeline);
 // A compute pipeline's program marker ("" for others).
 std::string compute_marker_of(const void* pipeline);
+// A compute pipeline's group size (from its program's DXIL, once made); false when not known.
+bool compute_group_size(const void* pipeline, uint32_t out[3]);
 
 // xg.cpp: xg_xs.dll, the console's texture layout library.
 HRESULT WINAPI xg_suggest_swizzle_mode(const D3D12_RESOURCE_DESC* desc, UINT flags, UINT* layout);

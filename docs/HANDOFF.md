@@ -1635,3 +1635,24 @@ loading does). Work that way.
   over 3 minutes, plus `waiting for the large-compile slot` for giants the game waits on. In the
   build after 02:43; the service running then (pid 12512) does not have it and was left alone,
   so the far-jump giants keep the time they already had (34 min at 03:17).
+
+## Unimplemented console calls, batch (2026-11-27, ~03:30)
+
+Named from the furthest reference's method tables (this title uses its "newer" list layout:
+list slots from 59 up are two later than in older titles).
+* **List 80 DispatchX:** with initiator flag 0x20 the counts are threads, not groups. We took
+  them as groups, so the structure builder's dispatches (flags 0x8020) ran up to 64 times their
+  groups and wrote past their own structures. Now groups = ceil(threads / numthreads); the group
+  size comes from the compiled DXIL (PSV0 runtime info v2: NumThreads at +36).
+* **List 28/29/30 Begin/End/ResolveQueryData:** begin/end taken; resolve writes plausible results
+  into the title's buffer after the list has run (occlusion 2^20 samples, binary 1, timestamps
+  from the GPU clock, statistics zero). **List 101** DriverHintX (0), **129** DispatchMesh (taken
+  and counted: mesh shaders are not translated).
+* **Device 39** CreateQueryHeap and **41** CreateCommandSignature return objects (were null
+  out pointers); signatures keep stride and arguments for ExecuteIndirect, which the host does
+  not run yet. **Device 61** CreateSamplerX (27-dword console description) writes a sampler
+  record. Device 74/75 register/unregister the page pool (left as probes).
+* **XG computer 6** ElementOffset (CPU texel reads; a wrong answer made the title read wild
+  memory in the reference) and **9** CopyFromSubresource, both on the same addressing the
+  uploads use (`texture_element_offset`). **SetName** (slot 6) on root signatures and pipelines.
+* Not done: command allocator slot 9, ExecuteIndirect itself, mesh shaders.

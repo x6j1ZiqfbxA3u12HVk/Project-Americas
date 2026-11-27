@@ -37,6 +37,10 @@ void count_host_memory(HostMemoryKind kind, ID3D12Resource* resource);
 std::string host_memory_counts();
 // Called once a frame (PresentX): dropped textures are released some frames later.
 void bindings_frame_ended();
+// Where element (x, y) of a subresource lies in a texture's memory, as uploads read it (the 4 KiB
+// standard swizzle for that mode, row by row in our layout for the others, mip tails placed).
+struct TextureLayout;
+uint64_t texture_element_offset(const TextureLayout& layout, uint32_t subresource, uint32_t x, uint32_t y);
 // Records the table's upkeep into `list`, before its draws.
 void flush_bindings(ID3D12GraphicsCommandList* list);
 // Textures of another format over a render target's memory (the title views a target's bytes

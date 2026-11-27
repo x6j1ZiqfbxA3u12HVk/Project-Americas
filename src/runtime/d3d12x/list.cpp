@@ -482,7 +482,21 @@ void dispatch(HostList& h, ID3D12GraphicsCommandList* list, const Command& c) {
   }
   // Large dispatches are named (the GPU ran some for seconds, and lost the device): D3D12 takes
   // at most 65,535 groups a dimension, the console more; those are skipped, not sent.
-  const uint64_t gx = static_cast<uint32_t>(c.a[0]), gy = static_cast<uint32_t>(c.a[1]), gz = static_cast<uint32_t>(c.a[2]);
+  uint64_t gx = static_cast<uint32_t>(c.a[0]), gy = static_cast<uint32_t>(c.a[1]), gz = static_cast<uint32_t>(c.a[2]);
+  if (c.op == 80 && (c.a[3] & 0x20)) {
+    // Counted in threads: the groups that hold them.
+    uint32_t size[3];
+    if (compute_group_size(h.pipeline, size)) {
+      gx = (gx + size[0] - 1) / size[0];
+      gy = (gy + size[1] - 1) / size[1];
+      gz = (gz + size[2] - 1) / size[2];
+    } else {
+      static std::atomic<int> told{0};
+      if (told.fetch_add(1, std::memory_order_relaxed) < 4) {
+        logf("gpu: a dispatch counted in threads, group size not known (%s): taken as groups", compute_marker_of(h.pipeline).substr(0, 16).c_str());
+      }
+    }
+  }
   const bool too_large = gx > 65535 || gy > 65535 || gz > 65535;
   if (too_large || gx * gy * gz > (uint64_t{1} << 20)) {
     static std::atomic<int> told{0};
@@ -649,6 +663,7 @@ void forward(CommandList* l, const Command& c) {
     case kDrawInstanced:
     case kDrawIndexedInstanced:
     case kDispatch:
+    case 80:
     case kClearUavUint:
     case kClearUavFloat:
     case kClearRenderTargetView:
@@ -780,7 +795,8 @@ void forward(CommandList* l, const Command& c) {
     case kSetStencilRef: list->OMSetStencilRef(static_cast<UINT>(c.a[0])); return;
     case kDrawInstanced:
     case kDrawIndexedInstanced: draw(h, list, c); return;
-    case kDispatch: dispatch(h, list, c); return;
+    case kDispatch:
+    case 80: dispatch(h, list, c); return;
     case kClearUavUint:
     case kClearUavFloat: clear_uav(h, list, c, l->rec); return;
     // Vertex and index buffers in place: title memory at its host GPU address (null when the
@@ -905,10 +921,13 @@ Method rec_method() {
   return {S, op_name(S), reinterpret_cast<void*>(&record<S>)};
 }
 
-// Slot 80: Dispatch(x, y, z, dispatch initiator flags), what the BVH builder calls when its
-// list has no room for the dispatch packet it would write itself. Recorded as a Dispatch.
-uint64_t WINAPI dispatch_with_initiator(CommandList* self, uint64_t x, uint64_t y, uint64_t z, uint64_t /*initiator*/) {
-  return record<kDispatch>(self, x & 0xFFFFFFFF, y & 0xFFFFFFFF, z & 0xFFFFFFFF, 0, 0, 0, 0);
+// Slot 80: DispatchX(x, y, z, dispatch initiator flags), what the BVH builder calls when its
+// list has no room for the dispatch packet it would write itself. With flag 0x20 the counts are
+// threads, not groups (the dispatch runs the groups that hold them).
+constexpr uint16_t kDispatchX = 80;
+constexpr uint64_t kThreadCounts = 0x20;
+uint64_t WINAPI dispatch_with_initiator(CommandList* self, uint64_t x, uint64_t y, uint64_t z, uint64_t initiator) {
+  return record<kDispatchX>(self, x & 0xFFFFFFFF, y & 0xFFFFFFFF, z & 0xFFFFFFFF, initiator & 0xFFFFFFFF, 0, 0, 0);
 }
 
 // Slots 85 and 86: CopyTextureRegionX(dst, x, y, z, src, box, flags) and CopyResourceX(dst,
@@ -944,6 +963,9 @@ std::vector<Method> list_methods() {
       // State the host has no use for yet, taken quietly: 75 (pixel shader state), 126 (shading
       // rate), 131 and 132 (pipeline syncs; host barriers order our work), 142.
       rec_method<75>(), rec_method<126>(), rec_method<131>(), rec_method<132>(), rec_method<142>(),
+      // BeginQuery / EndQuery (28, 29; queries are answered when resolved, 30), DriverHintX (101,
+      // answers 0), DispatchMesh (129: mesh shaders are not translated yet; taken and counted).
+      rec_method<28>(), rec_method<29>(), rec_method<30>(), rec_method<101>(), rec_method<129>(),
   };
   return m;
 }
@@ -1121,6 +1143,30 @@ void wait_for_values(const Recording& r) {
 
 void collect_writes(const Recording& r, std::vector<ValueWrite>& out) {
   for (const Command& c : r.commands) {
+    if (c.op == 30) {
+      // ResolveQueryData(heap, type, first, count, buffer, offset): nothing is measured on the host;
+      // each query gets a plausible result once the list has run. Occlusion (0): a million
+      // samples passed; binary occlusion (1): visible, so nothing is culled by a query;
+      // timestamps (2): the GPU clock then; pipeline statistics (3, 88 bytes): zeros; others
+      // (16 bytes): zeros.
+      const uint32_t type = static_cast<uint32_t>(c.a[1]), count = static_cast<uint32_t>(c.a[3]);
+      D3D12_RESOURCE_DESC d{};
+      uint64_t base = 0;
+      if (!resource_memory(reinterpret_cast<const void*>(c.a[4]), &d, &base) || !base || count > 65536) continue;
+      const uint64_t bytes = type == 3 ? 88 : type <= 2 ? 8 : 16;
+      for (uint32_t k = 0; k < count; ++k) {
+        const uint64_t at = base + c.a[5] + k * bytes;
+        for (uint64_t piece = 0; piece < bytes; piece += 8) {
+          ValueWrite w;
+          w.address = at + piece;
+          w.bytes = 8;
+          w.value = piece ? 0 : type == 0 ? (1u << 20) : type == 1 ? 1 : 0;
+          w.flags = type == 2 && !piece ? 1 : 0;  // 1: the GPU timestamp
+          out.push_back(w);
+        }
+      }
+      continue;
+    }
     if ((c.op != kWriteValue32 && c.op != kWriteValue64) || c.a[0] < 0x10000) continue;
     ValueWrite w;
     w.address = c.a[0];
@@ -1170,6 +1216,12 @@ std::string describe_clear(const Recording& r, const Command& c) {
 const char* op_name(uint16_t op) {
   switch (op) {
     case kClose: return "Close";
+    case 28: return "BeginQuery";
+    case 29: return "EndQuery";
+    case 30: return "ResolveQueryData";
+    case 80: return "DispatchX";
+    case 101: return "DriverHintX";
+    case 129: return "DispatchMesh";
     case 26: return "ResourceBarrier";
     case kDrawInstanced: return "DrawInstanced";
     case kDrawIndexedInstanced: return "DrawIndexedInstanced";

@@ -797,6 +797,19 @@ bool texture_from_descriptor(const uint32_t w[8], D3D12_RESOURCE_DESC& desc, uin
 
 }  // namespace
 
+uint64_t texture_element_offset(const TextureLayout& l, uint32_t subresource, uint32_t x, uint32_t y) {
+  if (subresource >= l.subresources.size()) return 0;
+  const SubresourceLayout& s = l.subresources[subresource];
+  const int log2_bytes = element_log2(l.element_bytes);
+  const bool swizzled = l.swizzle_mode == kSw4kS && log2_bytes >= 0;
+  if (s.in_tail) {
+    const uint32_t ex = s.tail_x + x, ey = s.tail_y + y;
+    return s.offset + (swizzled ? offset_4k_s(log2_bytes, ex, ey, l.block_width) : (uint64_t{ey} * l.block_width + ex) * l.element_bytes);
+  }
+  if (swizzled) return s.offset + offset_4k_s(log2_bytes, x, y, s.row_pitch / l.element_bytes);
+  return s.offset + uint64_t{y} * s.row_pitch + uint64_t{x} * l.element_bytes;
+}
+
 void bind_texture_view(const D3D12_RESOURCE_DESC& resource, const D3D12_SHADER_RESOURCE_VIEW_DESC& view, uint64_t address,
                        uint32_t words[8], ID3D12Resource* host) {
   std::memset(words, 0, 32);

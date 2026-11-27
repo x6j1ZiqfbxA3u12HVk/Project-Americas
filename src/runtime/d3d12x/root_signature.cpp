@@ -198,8 +198,10 @@ struct RootSignature : Object {
   std::vector<uint8_t> bytes;  // as created from
 };
 
+HRESULT WINAPI root_signature_set_name(Object*, const wchar_t*) { return S_OK; }
+
 const Kind& root_signature_kind() {
-  static const Kind k("root signature", 16, {});
+  static const Kind k("root signature", 16, {{6, "SetName", reinterpret_cast<void*>(&root_signature_set_name)}});
   return k;
 }
 

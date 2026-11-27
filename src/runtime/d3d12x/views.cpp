@@ -131,6 +131,17 @@ void WINAPI create_sampler(Object* self, const D3D12_SAMPLER_DESC* desc, uint64_
   write_record(dest, ViewKind::Sampler, desc ? static_cast<uint32_t>(desc->Filter) : 0, 0);
 }
 
+// Device slot 61: CreateSamplerX(console description, destination). The console's description
+// is 27 dwords: flags, then magnification, minification and mip filters (1-3), ... Shaders
+// build their samplers' words themselves (bindings.cpp); the record keeps the filter, as
+// CreateSampler's does: linear magnification, minification and mips as D3D12 numbers them.
+void WINAPI create_sampler_x(Object* self, const uint32_t* desc, uint64_t dest) {
+  trace(self, 61, "CreateSamplerX", reinterpret_cast<uint64_t>(desc), dest, 0);
+  uint32_t filter = 0;
+  if (desc) filter = (desc[3] == 2 ? 0x1u : 0u) | (desc[1] == 1 ? 0x4u : 0u) | (desc[2] == 1 ? 0x10u : 0u);
+  write_record(dest, ViewKind::Sampler, filter, 0);
+}
+
 // Slot 23: CopyDescriptors(dest ranges, source ranges, heap type). A null size array means
 // ranges of one descriptor.
 void WINAPI copy_descriptors(Object*, UINT dest_count, const uint64_t* dest_starts, const UINT* dest_sizes, UINT src_count,
@@ -294,6 +305,7 @@ void add_view_methods(std::vector<Method>& out) {
       {20, "CreateRenderTargetView", reinterpret_cast<void*>(&create_rtv)},
       {21, "CreateDepthStencilView", reinterpret_cast<void*>(&create_dsv)},
       {22, "CreateSampler", reinterpret_cast<void*>(&create_sampler)},
+      {61, "CreateSamplerX", reinterpret_cast<void*>(&create_sampler_x)},
       {23, "CopyDescriptors", reinterpret_cast<void*>(&copy_descriptors)},
       {24, "CopyDescriptorsSimple", reinterpret_cast<void*>(&copy_descriptors_simple)},
       {25, "GetResourceAllocationInfo", reinterpret_cast<void*>(&get_resource_allocation_info)},

@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <vector>
 
 #include "runtime/d3d12x/object.h"
 #include "runtime/d3d12x/d3d12x.h"
@@ -193,6 +194,50 @@ void WINAPI create_uav_x(Device*, const D3D12_RESOURCE_DESC* resource, const uin
   write_shader_view(dest, resource, v, address);
 }
 
+// Slot 39: CreateQueryHeap(description, riid, out). Queries are answered when resolved
+// (ResolveQueryData writes plausible results); the heap is an object the title holds.
+struct QueryHeap : Object {
+  D3D12_QUERY_HEAP_DESC desc{};
+};
+const Kind& query_heap_kind() {
+  static const Kind k("query heap", 16, {});
+  return k;
+}
+HRESULT WINAPI create_query_heap(Device*, const D3D12_QUERY_HEAP_DESC* desc, const GUID* /*riid*/, void** out) {
+  if (!out) return E_POINTER;
+  auto* h = make_object<QueryHeap>(query_heap_kind());
+  if (desc) h->desc = *desc;
+  *out = h;
+  return S_OK;
+}
+
+// Slot 41: CreateCommandSignature(description, root signature, riid, out): the record layout of
+// indirect execution (ExecuteIndirect), kept for when the host runs it.
+struct CommandSignature : Object {
+  uint32_t stride = 0;
+  std::vector<D3D12_INDIRECT_ARGUMENT_DESC> arguments;
+};
+const Kind& command_signature_kind() {
+  static const Kind k("command signature", 16, {});
+  return k;
+}
+HRESULT WINAPI create_command_signature(Device*, const D3D12_COMMAND_SIGNATURE_DESC* desc, Object* /*root*/, const GUID* /*riid*/,
+                                        void** out) {
+  if (!out) return E_POINTER;
+  if (!desc || (desc->NumArgumentDescs && !desc->pArgumentDescs)) return E_INVALIDARG;
+  auto* s = make_object<CommandSignature>(command_signature_kind());
+  s->stride = desc->ByteStride;
+  s->arguments.assign(desc->pArgumentDescs, desc->pArgumentDescs + desc->NumArgumentDescs);
+  static std::atomic<int> told{0};
+  if (told.fetch_add(1, std::memory_order_relaxed) < 8) {
+    std::string kinds;
+    for (const auto& a : s->arguments) kinds += " " + std::to_string(a.Type);
+    logf("d3d12x: command signature: stride %u, arguments%s", s->stride, kinds.c_str());
+  }
+  *out = s;
+  return S_OK;
+}
+
 // Slot 127: committed resource creation, shaped like D3D12's CreateCommittedResource3: (heap
 // properties, heap flags, description, initial barrier layout, clear value, protected session,
 // castable format count, castable formats, riid, out). The game asks for ID3D12Resource.
@@ -222,6 +267,8 @@ std::vector<Method> device_methods() {
       {67, "CreatePipelineX (67)", reinterpret_cast<void*>(&create_pipeline_67)},
       {70, "CreateShaderResourceViewX", reinterpret_cast<void*>(&create_view_x)},
       {71, "CreateUnorderedAccessViewX", reinterpret_cast<void*>(&create_uav_x)},
+      {39, "CreateQueryHeap", reinterpret_cast<void*>(&create_query_heap)},
+      {41, "CreateCommandSignature", reinterpret_cast<void*>(&create_command_signature)},
       {73, "CreateCommandListX", reinterpret_cast<void*>(&create_command_list_x)},
       {86, "CreatePipelineState", reinterpret_cast<void*>(&create_pipeline_state)},
       {127, "CreateCommittedResourceX", reinterpret_cast<void*>(&create_committed_resource_x)},

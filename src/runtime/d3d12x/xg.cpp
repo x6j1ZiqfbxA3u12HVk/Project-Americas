@@ -164,6 +164,46 @@ HRESULT WINAPI copy_into_subresource(TextureComputer* self, void* memory, UINT p
   return S_OK;
 }
 
+// Slot 6: ElementOffset(plane, mip, x, y, z or slice, sample, &bit position): an element's byte
+// offset from the texture's start (the game reads texels on the CPU through it); 0 outside.
+uint64_t WINAPI element_offset(TextureComputer* self, UINT plane, UINT mip, uint64_t x, UINT y, UINT z, UINT /*sample*/, UINT* bit) {
+  if (bit) *bit = 0;
+  const TextureLayout& l = self->layout;
+  if (plane != 0 || mip >= l.mips) return 0;
+  const bool three_d = self->desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+  const uint32_t layer = three_d ? 0 : z;
+  const uint32_t sub = mip + l.mips * layer;
+  if (sub >= l.subresources.size()) return 0;
+  const SubresourceLayout& s = l.subresources[sub];
+  if (x >= s.width_elements || y >= s.rows) return 0;
+  uint64_t at = texture_element_offset(l, sub, static_cast<uint32_t>(x), y);
+  if (three_d) at += uint64_t{z} * s.row_pitch * s.padded_rows;
+  return at;
+}
+
+// Slot 9: CopyFromSubresource(linear data, row pitch, slice pitch, texture memory, plane,
+// subresource): slot 8's reverse, texture layout to linear rows.
+HRESULT WINAPI copy_from_subresource(TextureComputer* self, void* linear, UINT row_pitch, UINT slice_pitch, const void* memory,
+                                     UINT plane, UINT subresource) {
+  trace(self, 9, "CopyFromSubresource", reinterpret_cast<uint64_t>(linear), subresource, reinterpret_cast<uint64_t>(memory));
+  const TextureLayout& l = self->layout;
+  if (!memory || !linear || plane != 0 || subresource >= l.subresources.size()) return E_INVALIDARG;
+  const SubresourceLayout& s = l.subresources[subresource];
+  const uint32_t eb = l.element_bytes;
+  const auto* from = static_cast<const uint8_t*>(memory);
+  auto* to = static_cast<uint8_t*>(linear);
+  const uint64_t slice_bytes = uint64_t{s.row_pitch} * s.padded_rows;
+  for (uint32_t z = 0; z < s.depth; ++z) {
+    for (uint32_t y = 0; y < s.rows; ++y) {
+      for (uint32_t x = 0; x < s.width_elements; ++x) {
+        const uint64_t at = texture_element_offset(l, subresource, x, y) + z * slice_bytes;
+        std::memcpy(to + uint64_t{z} * slice_pitch + uint64_t{y} * row_pitch + uint64_t{x} * eb, from + at, eb);
+      }
+    }
+  }
+  return S_OK;
+}
+
 // Slot 10: GetResourceTiling(&tiles, &packed mips, &tile shape, &tiling count, first tiling,
 // tilings), D3D12's without the resource (the UI texture streamer maps a texture's 64 KiB
 // tiles from it). Over our layout: the standard 64 KiB tile shapes by element size; a mip is
@@ -236,7 +276,9 @@ const Kind& computer_kind() {
                           {0, "AddRef", reinterpret_cast<void*>(&add_ref)},
                           {1, "Release", reinterpret_cast<void*>(&release)},
                           {2, "GetResourceLayout", reinterpret_cast<void*>(&get_resource_layout)},
+                          {6, "ElementOffset", reinterpret_cast<void*>(&element_offset)},
                           {8, "CopyIntoSubresource", reinterpret_cast<void*>(&copy_into_subresource)},
+                          {9, "CopyFromSubresource", reinterpret_cast<void*>(&copy_from_subresource)},
                           {10, "GetResourceTiling", reinterpret_cast<void*>(&get_resource_tiling)},
                       });
   return k;

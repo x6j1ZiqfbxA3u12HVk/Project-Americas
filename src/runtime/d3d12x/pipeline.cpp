@@ -103,6 +103,7 @@ struct PipelineState : Object {
   std::atomic<uint64_t> compute_wait_since{0};  // the first dispatch that waited for it (its tick)
   std::atomic<uint64_t> compute_missing_at{0};  // its program was not precompiled at this tick
   std::atomic<bool> compute_urgent{false};  // a dispatch waited: moved to the front once
+  std::atomic<uint32_t> compute_threads[3] = {0, 0, 0};  // its program's group size (DXIL's PSV0), 0: not known
   uint32_t console_programs = 0;  // slot 57: GPU programs given by address
   std::string console_name;       // slot 57: the saved blocks' file, and the programs' markers
   std::unique_ptr<ConsolePipeline> console;
@@ -116,8 +117,10 @@ struct PipelineState;
 ID3D12PipelineState* console_host_pipeline(PipelineState* owner, ConsolePipeline& c, const DXGI_FORMAT* targets, uint32_t count,
                                            DXGI_FORMAT depth, bool rect_list);
 
+HRESULT WINAPI pipeline_set_name(Object*, const wchar_t*) { return S_OK; }
+
 const Kind& pipeline_kind() {
-  static const Kind k("pipeline state", 16, {});
+  static const Kind k("pipeline state", 16, {{6, "SetName", reinterpret_cast<void*>(&pipeline_set_name)}});
   return k;
 }
 
@@ -315,6 +318,27 @@ std::shared_ptr<MadeCompute> made_compute(const std::string& marker) {
 // translated root signature, made by the pipeline maker; dispatches wait until it is there. A
 // pipeline a dispatch waits for is queued again at the front (the job that runs second finds it
 // made and does nothing).
+// A compute program's group size from its DXIL: the PSV0 part's runtime info, version 2 and later
+// (48 bytes or more), holds NumThreadsX/Y/Z at +36.
+bool dxil_group_size(const std::vector<uint8_t>& dxil, uint32_t out[3]) {
+  const auto u32 = [&](size_t at) -> uint32_t {
+    uint32_t v = 0;
+    if (at + 4 <= dxil.size()) std::memcpy(&v, dxil.data() + at, 4);
+    return v;
+  };
+  if (dxil.size() < 32 || std::memcmp(dxil.data(), "DXBC", 4) != 0) return false;
+  const uint32_t parts = u32(28);
+  for (uint32_t k = 0; k < parts && k < 64; ++k) {
+    const uint32_t at = u32(32 + 4 * k);
+    if (at + 12 > dxil.size() || std::memcmp(dxil.data() + at, "PSV0", 4) != 0) continue;
+    const uint32_t info = at + 8, info_size = u32(info);
+    if (info_size < 48) return false;
+    for (int i = 0; i < 3; ++i) out[i] = u32(info + 4 + 36 + 4 * i);
+    return out[0] && out[1] && out[2];
+  }
+  return false;
+}
+
 void make_host_compute(PipelineState* p, present::HostGpu* gpu, bool large_lane) {
   const std::string& marker = p->compute_marker;
   std::vector<uint8_t> code;
@@ -325,6 +349,9 @@ void make_host_compute(PipelineState* p, present::HostGpu* gpu, bool large_lane)
     p->compute_done = true;
     release(p);
     return;
+  }
+  if (uint32_t g[3]; dxil_group_size(code, g)) {
+    for (int i = 0; i < 3; ++i) p->compute_threads[i] = g[i];
   }
   if (code.size() > kLargeDxil && !large_lane) {
     large_pipeline_maker().add([p, gpu] { make_host_compute(p, gpu, true); });
@@ -398,6 +425,14 @@ void log_first_bytes(const char* how, const void* desc, const PipelineState* p) 
 std::string compute_pipeline_counts() {
   return std::to_string(g_compute_made.load()) + " made, " + std::to_string(g_compute_missing.load()) + " not precompiled, " +
          std::to_string(g_compute_refused.load()) + " refused, of " + std::to_string(g_compute_queued.load()) + " queued";
+}
+
+bool compute_group_size(const void* object, uint32_t out[3]) {
+  Object* o = object_of_kind(object, pipeline_kind());
+  if (!o || !static_cast<const PipelineState*>(o)->compute) return false;
+  const auto* p = static_cast<const PipelineState*>(o);
+  for (int i = 0; i < 3; ++i) out[i] = p->compute_threads[i];
+  return out[0] && out[1] && out[2];
 }
 
 std::string compute_marker_of(const void* object) {
