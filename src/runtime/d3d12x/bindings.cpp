@@ -1,5 +1,6 @@
 #include "runtime/d3d12x/bindings.h"
 
+#include <dxgi1_4.h>
 #include <wrl/client.h>
 
 #include <algorithm>
@@ -250,6 +251,7 @@ struct Bindings {
   };
   std::vector<Evicted> evicted;
   uint64_t frames = 0, evictions = 0;
+  uint64_t made_since_check = 0, budget_drops = 0;  // the video memory budget (add_texture)
   const void* recording = nullptr;  // the list being flushed into
   const void* readback_list = nullptr;
 
@@ -923,6 +925,34 @@ void add_texture(Bindings* b, const D3D12_RESOURCE_DESC& resource, const D3D12_S
       return;
     }
   }
+  // A budget for our copies of the title's textures: they are a second copy of title memory,
+  // and on a 16 GB PC the title's own pages and unbounded copies did not fit (video memory
+  // counts toward the process's commit). Past 60 % of the GPU's local budget, the oldest tenth of
+  // the textures is dropped (as below); a shader that still uses one asks for it again.
+  if (++b->made_since_check >= 32) {
+    b->made_since_check = 0;
+    present::HostGpu* gpu = present::host_gpu();
+    Microsoft::WRL::ComPtr<IDXGIAdapter3> a3;
+    DXGI_QUERY_VIDEO_MEMORY_INFO local{};
+    if (gpu && SUCCEEDED(gpu->adapter.As(&a3)) && SUCCEEDED(a3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &local)) &&
+        local.CurrentUsage > local.Budget / 10 * 6 && b->textures.size() > 64) {
+      const size_t drop = b->textures.size() / 10;
+      for (size_t k = 0; k < drop; ++k) {
+        Texture& old = b->textures[k];
+        const uint32_t view_index = old.view;
+        std::erase_if(b->images, [view_index](const shader::ImageBinding& i) { return i.srv == view_index; });
+        b->evicted.push_back({b->frames, 0, std::move(old.resource), view_index});
+      }
+      b->textures.erase(b->textures.begin(), b->textures.begin() + static_cast<std::ptrdiff_t>(drop));
+      b->budget_drops += drop;
+      b->table_dirty = true;
+      static std::atomic<int> told{0};
+      if (told.fetch_add(1, std::memory_order_relaxed) < 8) {
+        logf("bindings: video memory %s of %s: the oldest %zu textures dropped", format_bytes(local.CurrentUsage).c_str(),
+             format_bytes(local.Budget).c_str(), drop);
+      }
+    }
+  }
   // Textures the new one's memory overlaps, unless they start where it starts (the same
   // texture viewed with another mip count or format: dropping those made them replace each other
   // over and over): the title has put something else there, they are dropped.
@@ -1084,6 +1114,7 @@ std::string host_memory_counts() {
     uint64_t in_flight = 0;
     for (const auto& r : bindings().retired) in_flight += r.bytes;
     text = "textures alive " + std::to_string(bindings().textures.size()) + ", dropped " + std::to_string(bindings().evictions) +
+           " (for the budget " + std::to_string(bindings().budget_drops) + ")" +
            " (" + std::to_string(bindings().evicted.size()) + " not yet released), uploads in flight " + format_bytes(in_flight) +
            " (deferred " + std::to_string(bindings().uploads_deferred) + " times); ";
   }

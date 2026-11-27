@@ -1515,3 +1515,34 @@ loading does). Work that way.
   --timeout 1200` (a console window the user can watch; the service it starts then gets a window
   of its own) and watch its commit: end it past ~24 GB on this 16 GB PC (one run reached 36 GB
   and the system 63 GB of commit).
+
+## Memory on a 16 GB PC; shaders on demand (2026-11-27, night)
+
+* **How the user wants shaders handled:** translate once, keep forever, compile on demand. The
+  runtime lists what a run needs (wanted-first.txt); `am-shaders serve` compiles that, most
+  needed first, and nothing else (`serve <jobs> all` restores the old "everything when idle").
+  Don't make changes that force recompiling programs the game has not asked for.
+* **When stuck, look at how the reference furthest along did it** (it reaches the game world);
+  if their method is smart, use the same method in our own code; if not, work it out. It found
+  this session: list slots 85/86 are CopyTextureRegionX/CopyResourceX; device slots 70/71 create
+  SRV/UAV views of placed memory `(resource desc, view desc, handle)`; BVH node pointers are the
+  node's address in 8-byte units with the kind in the low 3 bits (0-3 triangle, 4 box of f16
+  bounds, 5 box of f32 bounds; a box answers its hit children nearest first, then -1); and they
+  too release write guards before opening memory for the GPU, and keep a pipeline library.
+* **GPU windows:** D3D12 refuses OpenExistingHeapFromAddress for an allocation with any
+  read-only page (the texture write watch makes some). Watches are released first now; the
+  2.1 GiB allocation opens (window 3). OpenExistingHeapFromAddress1 (device 13) can open a
+  sub-range instead, if whole allocations ever become a problem.
+* **Pipeline library** (`cache\d3d12\host-pipelines.bin`): the second run loaded 45 of 46
+  pipelines instead of compiling them.
+* **Memory, where it goes** (the memory line, now also from a 2 s timer while commit grows):
+  the title's own pages (7 GiB pool, touched as it streams in), our texture copies (now under a
+  budget: past 60 % of the GPU's local budget the oldest tenth is dropped), and **the driver's
+  pipelines**: during loading, with frames stalled behind 18 dispatches waiting 5 s each for
+  pipelines, commit rose about 1 GB every 2 s while textures, video memory and the title's pages
+  stayed flat; one 73 KB compute pipeline added 388 MB. Most likely scratch memory: our programs
+  keep the console's registers in arrays (v[], s[]), so large ones spill, and the driver reserves
+  scratch for every thread the GPU can run. **The fix is the translator's registers as SSA
+  values** (no register arrays): programs fit in registers, no scratch, much faster DXC compiles
+  too. That is the next big task. Until then runs end around 24 GB on this PC (the watch in the
+  test command ends them; one run with no limit reached 36 GB and took the system to 63 GB).

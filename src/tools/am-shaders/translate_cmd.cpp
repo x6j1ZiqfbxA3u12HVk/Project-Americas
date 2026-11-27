@@ -654,7 +654,8 @@ int invalidate_loops(const fs::path& pack_dir, const fs::path& runtime_dir, cons
   return 0;
 }
 
-int serve(const fs::path& pack_dir, const fs::path& runtime_dir, const fs::path& out_dir, unsigned jobs, const fs::path& log) {
+int serve(const fs::path& pack_dir, const fs::path& runtime_dir, const fs::path& out_dir, unsigned jobs, const fs::path& log,
+          bool everything) {
   SetPriorityClass(GetCurrentProcess(), BELOW_NORMAL_PRIORITY_CLASS);
   if (!log.empty()) g_serve_log = _wfsopen(log.c_str(), L"a", _SH_DENYNO);
   SetConsoleTitleW(L"Project Americas - shader service");
@@ -814,20 +815,24 @@ int serve(const fs::path& pack_dir, const fs::path& runtime_dir, const fs::path&
         at = comma + 1;
       }
     }
+    // On demand by default: only what the game asks for (wanted-first.txt) is compiled, most
+    // needed first, and kept. With `all`, the game's other pipelines' programs and the programs
+    // compiled before the runaway guards follow when nothing is waiting.
     for (const std::string& m : listed) {
-      if (where.count(m) && !fs::exists(out_dir / widen(m + ".dxil"), ec)) bulk.push_back(m);
+      if (everything && where.count(m) && !fs::exists(out_dir / widen(m + ".dxil"), ec)) bulk.push_back(m);
     }
     // Compiled before the guards and able to loop: again, after everything else.
     for (const auto& [m, at] : where) {
-      if (at.loops && !guarded.count(m) && fs::exists(out_dir / widen(m + ".dxil"), ec)) upgrades.push_back(m);
+      if (everything && at.loops && !guarded.count(m) && fs::exists(out_dir / widen(m + ".dxil"), ec)) upgrades.push_back(m);
     }
     std::sort(upgrades.begin(), upgrades.end(), [&](const std::string& a, const std::string& b) { return where[a].code_size > where[b].code_size; });
     std::sort(bulk.begin(), bulk.end(), [&](const std::string& a, const std::string& b) { return where[a].code_size > where[b].code_size; });
   }
-  say("serve: %zu programs mapped in %zu containers (%.0f s); %zu of the game's pipelines' programs not compiled yet; "
-              "%zu to compile again with the runaway guards; %u at a time\n",
-              where.size(), files.size(), std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), bulk.size(),
-              upgrades.size(), jobs);
+  say("serve: %zu programs mapped in %zu containers (%.0f s); %s; %u at a time\n", where.size(), files.size(),
+      std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(),
+      everything ? ("everything: " + std::to_string(bulk.size()) + " of the game's pipelines' programs not compiled yet, " +
+                    std::to_string(upgrades.size()) + " to compile again with the runaway guards").c_str()
+                 : "on demand: what the game asks for", jobs);
   std::fflush(stdout);
 
   std::deque<std::string> urgent;  // what the game waits for, oldest first

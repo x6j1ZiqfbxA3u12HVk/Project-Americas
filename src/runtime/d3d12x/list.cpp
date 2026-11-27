@@ -42,6 +42,7 @@
 #include "runtime/d3d12x/root_signature.h"
 #include "runtime/d3d12x/object.h"
 #include "runtime/log.h"
+#include "runtime/memory/title_memory.h"
 #include "runtime/script.h"
 #include "runtime/present/host_gpu.h"
 
@@ -1298,11 +1299,68 @@ void frame_execute(const void* list) {
   }
 }
 
+// Where memory goes: the process's commit (video memory allocations count too), the title's own
+// physical pages in use, the GPU's local and shared memory against their budgets, and what each
+// kind of host resource has made.
+void log_memory(uint64_t frame) {
+  PROCESS_MEMORY_COUNTERS_EX pm{};
+  pm.cb = sizeof pm;
+  GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pm), sizeof pm);
+  std::string gpu_text = "no GPU";
+  if (present::HostGpu* gpu = present::host_gpu()) {
+    Microsoft::WRL::ComPtr<IDXGIAdapter3> a3;
+    DXGI_QUERY_VIDEO_MEMORY_INFO local{}, shared{};
+    if (SUCCEEDED(gpu->adapter.As(&a3)) && SUCCEEDED(a3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &local)) &&
+        SUCCEEDED(a3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &shared))) {
+      gpu_text = "GPU local " + format_bytes(local.CurrentUsage) + " of " + format_bytes(local.Budget) + ", shared " +
+                 format_bytes(shared.CurrentUsage) + " of " + format_bytes(shared.Budget);
+    }
+  }
+  const mem::MemoryStats ts = mem::title_memory().stats();
+  logf("frame %llu: memory: process commit %s, working set %s; title physical pages %s in use, %s touched; %s; made: %s",
+       static_cast<unsigned long long>(frame), format_bytes(pm.PrivateUsage).c_str(), format_bytes(pm.WorkingSetSize).c_str(),
+       format_bytes(ts.physical_allocated).c_str(), format_bytes(ts.physical_committed).c_str(), gpu_text.c_str(),
+       host_memory_counts().c_str());
+}
+
 void frame_present() {
   bindings_frame_ended();
   FrameLog& f = frame_log();
+  {
+    // The memory line also from a thread of its own, every 2 s while commit grows by 1 GiB or
+    // more: during loading the title presents no frames for long stretches, and commit jumped
+    // there unseen.
+    static std::once_flag once;
+    std::call_once(once, [] {
+      std::thread([] {
+        uint64_t logged_at = 0;
+        for (;;) {
+          Sleep(2000);
+          PROCESS_MEMORY_COUNTERS_EX pm{};
+          pm.cb = sizeof pm;
+          GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pm), sizeof pm);
+          if (pm.PrivateUsage >= logged_at + (uint64_t{1} << 30)) {
+            logged_at = pm.PrivateUsage;
+            log_memory(frame_log().frame);
+          }
+        }
+      }).detach();
+    });
+  }
   std::lock_guard g(f.lock);
   ++f.frame;
+  {
+    // Commit can jump within seconds (one run went from 15 to 25 GB between two summaries): the
+    // memory line also goes out at every 2 GiB more than when it last did.
+    static uint64_t logged_at = 0;
+    PROCESS_MEMORY_COUNTERS_EX pm{};
+    pm.cb = sizeof pm;
+    GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pm), sizeof pm);
+    if (pm.PrivateUsage >= logged_at + (uint64_t{2} << 30)) {
+      logged_at = pm.PrivateUsage;
+      log_memory(f.frame);
+    }
+  }
   if (summarized(f.frame)) {
     std::string ops;
     for (int op = 0; op < kMaxSlots; ++op) {
@@ -1316,26 +1374,7 @@ void frame_present() {
          static_cast<unsigned long long>(f.frame), f.lists, f.commands, ops.c_str(),
          static_cast<unsigned long long>(g_draws_run.load()), static_cast<unsigned long long>(g_draws_skipped.load()),
          static_cast<unsigned long long>(g_dispatches_run.load()), static_cast<unsigned long long>(g_dispatches_skipped.load()));
-    {
-      // Where memory goes: the process's commit (one run reached 35 GB), the GPU's local and
-      // shared (system) memory in use against their budgets.
-      PROCESS_MEMORY_COUNTERS_EX pm{};
-      pm.cb = sizeof pm;
-      GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pm), sizeof pm);
-      std::string gpu_text = "no GPU";
-      if (present::HostGpu* gpu = present::host_gpu()) {
-        Microsoft::WRL::ComPtr<IDXGIAdapter3> a3;
-        DXGI_QUERY_VIDEO_MEMORY_INFO local{}, shared{};
-        if (SUCCEEDED(gpu->adapter.As(&a3)) && SUCCEEDED(a3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &local)) &&
-            SUCCEEDED(a3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &shared))) {
-          gpu_text = "GPU local " + format_bytes(local.CurrentUsage) + " of " + format_bytes(local.Budget) + ", shared " +
-                     format_bytes(shared.CurrentUsage) + " of " + format_bytes(shared.Budget);
-        }
-      }
-      logf("frame %llu: memory: process commit %s, working set %s; %s; made: %s", static_cast<unsigned long long>(f.frame),
-           format_bytes(pm.PrivateUsage).c_str(), format_bytes(pm.WorkingSetSize).c_str(), gpu_text.c_str(),
-           host_memory_counts().c_str());
-    }
+    log_memory(f.frame);
     save_pipeline_cache();  // what this run compiled, for the next one
     logf("frame %llu: %s", static_cast<unsigned long long>(f.frame), pipeline_cache_counts().c_str());
     logf("frame %llu: compute pipelines %s; copies done %llu, not done %llu; UAV clears done %llu, not done %llu",

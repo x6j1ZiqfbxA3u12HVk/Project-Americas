@@ -21,7 +21,7 @@
 //   am-shaders images [--out <dir>]
 //       Every image instruction of the corpus by its form and stage.
 //   am-shaders precompile [all] [refresh] [--out <dir>] [--raw <hlsl dir>]
-//   am-shaders serve [jobs] [--log <file>]
+//   am-shaders serve [jobs] [all] [--log <file>]
 //       The shader service, while the game runs: what it waits for first, then the rest.
 //       The programs the game's pipelines use (saved by the runtime in <cache>\shaders\runtime),
 //       or with `all` every program, translated with the runtime's binding and compiled to
@@ -288,10 +288,13 @@ int wmain(int argc, wchar_t** argv) {
     return tools::invalidate_loops(out, out.parent_path() / L"runtime",
                                    out.parent_path() / L"dxil" / (L"rt" + std::to_wstring(shader::kTranslatorVersion)), apply);
   }
-  if (command == L"serve" && positional.size() <= 1) {
-    const unsigned jobs = positional.empty() ? std::max(1u, std::thread::hardware_concurrency() - 2) : std::stoul(positional[0]);
+  if (command == L"serve" && positional.size() <= 2) {
+    // serve [jobs] [all]: on demand, or with `all` everything else too when nothing waits.
+    const bool everything = std::find(positional.begin(), positional.end(), L"all") != positional.end();
+    const bool has_jobs = !positional.empty() && positional[0] != L"all";
+    const unsigned jobs = has_jobs ? std::stoul(positional[0]) : std::max(1u, std::thread::hardware_concurrency() - 2);
     return tools::serve(out, out.parent_path() / L"runtime",
-                        out.parent_path() / L"dxil" / (L"rt" + std::to_wstring(shader::kTranslatorVersion)), jobs, log);
+                        out.parent_path() / L"dxil" / (L"rt" + std::to_wstring(shader::kTranslatorVersion)), jobs, log, everything);
   }
   if (command == L"tsurvey" && positional.size() <= 1) {
     const size_t sample = positional.empty() ? 200 : std::stoul(positional[0]);

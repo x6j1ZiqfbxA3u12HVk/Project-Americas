@@ -35,7 +35,7 @@ int invalidate_loops(const std::filesystem::path& pack_dir, const std::filesyste
                      const std::filesystem::path& out_dir, bool apply);
 int serve(const std::filesystem::path& pack_dir, const std::filesystem::path& runtime_dir, const std::filesystem::path& out_dir,
           unsigned jobs,
-          const std::filesystem::path& log = {});
+          const std::filesystem::path& log = {}, bool everything = false);
 int precompile(const std::filesystem::path& pack_dir, const std::filesystem::path& runtime_dir,
                const std::filesystem::path& out_dir, bool all, const std::filesystem::path& hlsl_dir = {},
                bool refresh = false);
