@@ -3492,6 +3492,22 @@ class Structurer {
 };
 
 // The fallback: one loop over a switch on the block's start.
+// The goto form (TranslateInput::goto_form): the blocks in order, each a label, branches gotos.
+std::string gotos(const std::vector<CfgBlock>& blocks) {
+  std::string body;
+  const auto go = [](uint32_t at) { return "goto am_block_" + num(at) + ";"; };
+  for (const CfgBlock& b : blocks) {
+    body += "am_block_" + num(b.start) + ":\n" + b.code;
+    switch (b.end) {
+      case CfgBlock::Fall: body += "      " + go(b.next) + "\n"; break;
+      case CfgBlock::Jump: body += "      " + go(b.target) + "\n"; break;
+      case CfgBlock::Cond: body += "      if (" + b.cond + ") " + go(b.target) + "\n      " + go(b.next) + "\n"; break;
+      case CfgBlock::Stop: break;
+    }
+  }
+  return body;
+}
+
 std::string dispatch(const std::vector<CfgBlock>& blocks) {
   std::string body;
   for (const CfgBlock& b : blocks) {
@@ -4105,7 +4121,12 @@ Translation translate(const TranslateInput& in, Binding binding) {
   if (!tr.unsupported.empty()) return tr;
   std::string body;
   bool uses_br = false;
-  tr.structured = Structurer(blocks).run(body, uses_br);
+  if (in.goto_form) {
+    body = gotos(blocks);
+    tr.structured = true;
+  } else {
+    tr.structured = Structurer(blocks).run(body, uses_br);
+  }
   // DXC refuses more than 256 nested brackets: structured code nested deeper (programs with
   // many far jumps) is made again with chains (see the Structurer), and only if that is still
   // too deep takes the dispatcher. Programs that fit keep their output unchanged.
@@ -4118,8 +4139,8 @@ Translation translate(const TranslateInput& in, Binding binding) {
     return deepest;
   };
   const auto too_deep = [&](const std::string& text) { return depth_of(text) > 200; };
-  if (tr.structured) tr.nested_depth = depth_of(body);
-  if (tr.structured && too_deep(body)) {
+  if (tr.structured && !in.goto_form) tr.nested_depth = depth_of(body);
+  if (tr.structured && !in.goto_form && too_deep(body)) {
     std::string chained;
     bool chained_br = false;
     tr.structured = Structurer(blocks, true).run(chained, chained_br) && !too_deep(chained);

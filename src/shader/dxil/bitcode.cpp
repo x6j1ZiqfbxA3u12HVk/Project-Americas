@@ -209,7 +209,9 @@ std::vector<uint8_t> write_bitcode(const Module& m) {
   };
   for (const auto& g : m.globals()) {
     // [type, (space << 2) | explicit type | constant, init, linkage, alignment, section, ...]
-    w.record(kModGlobalVar, {g.type, (static_cast<uint64_t>(g.space) << 2) | 2u, 0, 0, align_code(g.align), 0, 0, 0, 0, 0, 0, 0});
+    const bool constant = g.init != kNone;
+    w.record(kModGlobalVar, {g.type, (static_cast<uint64_t>(g.space) << 2) | 2u | (constant ? 1u : 0u), constant ? id[g.init] + 1u : 0u,
+                             constant ? 3u : 0u, align_code(g.align), 0, 0, 0, 0, 0, 0, 0});
   }
   for (const auto& f : m.functions()) {
     w.record(kModFunction, {f.type, 0, f.body ? 0u : 1u, 0, f.body ? 0u : attr_set(f.attr), 0, 0, 0, 0, 0, 0, 0, 0, 0, 0});
@@ -340,6 +342,7 @@ std::vector<uint8_t> write_bitcode(const Module& m) {
             push_typed(in.ops[0]);
             push(in.ops[1]);
             ops.push_back(in.code);
+            if (in.aux) ops.push_back(in.aux);
             code = kFnCmp2;
             break;
           case Op::Select:

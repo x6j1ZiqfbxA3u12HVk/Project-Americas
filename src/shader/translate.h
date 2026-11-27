@@ -68,6 +68,10 @@ struct TranslateInput {
   // primitive n; console_program.h), its user SGPRs (from s8: eight system SGPRs come first).
   // Its outputs (exp param N) are `outputs`, as a vertex shader's.
   uint32_t ms_threads = 0, ms_max_vertices = 0, ms_max_primitives = 0, ms_user_sgprs = 0;
+  // The body in the goto form: each console block a label, its branches gotos, for our own
+  // HLSL compiler (shader/dxil/hlsl.h), which keeps the console's control flow. DXC cannot take
+  // it. Off, the output is unchanged.
+  bool goto_form = false;
 };
 
 struct Translation {

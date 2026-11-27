@@ -1953,3 +1953,57 @@ cannot be built. What a console mesh program does (from the reference furthest a
 * **24ea:** its nested form is 261 deep (DXC's limit 256) and 44 MB of HLSL (the chained form
   17 MB): no way out there. Prebuilt once instead (the user's idea: a big page file for a
   one-time build), `tools\step3\prebuild-24ea.ps1`, log `cache\shaders\bench\prebuild-24ea.txt`.
+
+## Our own DXIL compiler: the goto form through it (2026-11-27, evening)
+
+**Why.** DXC is the bottleneck for the largest programs: the far-jump giants (24ea: 44 MB of
+HLSL nested 261 deep, past DXC's 256; 17 MB in the chained form, 58 min in DXC, then over 20 GB
+in AMD's driver) cannot be expressed as nested HLSL at all, and the structurer's workarounds
+(chains, dispatcher) are what blow up the driver. The furthest reference does not use DXC for
+translated shaders: its own SSA form and a DXIL (LLVM 3.7 bitcode) writer, ~37,000 lines. Ours
+follows the same idea with our own code, in three layers under `src/shader/dxil/`:
+
+* `dxil.h/.cpp` (`Module`): one entry function in blocks. Registers and locals are *variables*
+  (`variable/read/write`); `finish()` makes them SSA (pruned phis on the dominance frontier, a
+  renaming walk of the dominator tree with explicit stacks, for 100,000s of blocks). Resources,
+  cbuffers, dx.op calls, shader flags and the metadata DXIL needs. A variable read before any
+  write reads zero (the validator refuses undef operands).
+* `bitcode.cpp` (`write_bitcode`): unabbreviated LLVM 3.7 records. `host::assemble_dxil` has
+  DXC's assembler wrap them in a container and its validator sign it (no DXC compile step).
+  AMD's driver crashes on a module without `llvm.ident`, so we always name the producer.
+* `hlsl.h/.cpp` (`compile_hlsl`, ~2,400 lines): the HLSL *subset the translator writes* compiled
+  straight into a Module, one pass, functions inlined at each call. One meaning for both paths:
+  DXC for programs that nest, ours for any program, with **labels and gotos** (see hlsl.h for
+  the accepted subset; anything else is refused with its line, never guessed).
+* Translator: `TranslateInput::goto_form` writes the body as `am_block_<pc>:` labels with gotos
+  (the console's own control flow, no structurer). Off, the output is unchanged.
+
+**Testing.**
+* `dxil_own_module_runs_on_the_gpu` (IR built by hand) and `dxil_hlsl_subset_runs_on_the_gpu`
+  (HLSL with a macro, helper, loop and goto) run on the GPU.
+* `AM_DXIL=1 am_tests translate_` runs every translator test in the goto form through our
+  compiler instead of DXC (GPU results checked the same way). `AM_DXIL_DUMP=<folder>` writes
+  each refused program there as `ours-<n>.hlsl`.
+* `am_tests` now prints `CRASH <test>: exception ... at ...` with a symbolized stack.
+
+**State: 25 of 27 translator tests pass through our compiler** (all 113 pass with DXC). Fixed
+this evening: scopes in a deque (a `Local*` dangled when the scope vector grew while inlining);
+`return` reads the function's return slot after evaluating its value (an inlined call in the
+value could move `rets_`, which gave wrong results and "a value returned from a void
+function"); groupshared and static const arrays are made at first use (the validator refuses
+unused internal globals); `asuint(double, out lo, out hi)` (splitDouble).
+
+**Left, in order:**
+1. **Images** (`translate_images`): heap textures and samplers are "not yet" in hlsl.cpp
+   (Texture1D/2D/3D/Cube and arrays, RW textures, typed buffers; Sample, SampleLevel,
+   SampleGrad, SampleCmp, Load, Gather, GetDimensions, CalculateLevelOfDetail).
+2. **Irreducible flow** (`translate_irreducible_control_flow`): DXIL needs reducible control
+   flow, and the goto form keeps the console's as it is. Split nodes (copy a block entered from
+   outside a loop's header) in the translator's goto form or in Module::finish. The test's
+   `!structured` check is the structurer's; in the goto form it does not apply.
+3. The whole pack through ours: an am-shaders option (goto form + compile_hlsl + assemble),
+   coverage and speed against DXC, then the giants (24ea, 3db4, 0849) and their driver memory
+   (`tools\step3\peak.ps1`).
+4. An optimizer (what DXC's -O3 does for the driver): constant folding, dead code,
+   `select(c, x, x)`, common subexpressions, simple phis.
+5. The shader service takes ours for programs DXC cannot do, then for all once it matches.

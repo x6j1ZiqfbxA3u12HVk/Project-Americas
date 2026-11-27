@@ -182,9 +182,10 @@ Value Module::declare(std::string_view name, Type fn, Attr attr) {
   return v;
 }
 
-Value Module::global(std::string_view name, Type t, uint32_t space, uint32_t align) {
+Value Module::global(std::string_view name, Type t, uint32_t space, uint32_t align, Value init) {
+  need(init == kNone || (is_constant(init) && type_of(init) == t), "a global's initializer not a constant of its type");
   const Value v = add_value(ValueKind::Global, pointer(t, space), globals_.size());
-  globals_.push_back({std::string(name), t, space, align, v});
+  globals_.push_back({std::string(name), t, space, align, v, init});
   return v;
 }
 
@@ -271,11 +272,11 @@ Value Module::cast(Cast op, Value v, Type to) {
   return emit(Op::Cast, to, {v}, static_cast<uint8_t>(op), 0, to);
 }
 
-Value Module::cmp(Pred p, Value a, Value b) {
+Value Module::cmp(Pred p, Value a, Value b, uint32_t flags) {
   const Type t = type_of(a);
   need(t == type_of(b), "a compare of two types");
   need(static_cast<uint8_t>(p) >= 32 ? is_int(t) : is_float(t), "a compare predicate of the other kind");
-  return emit(Op::Cmp, i1_, {a, b}, static_cast<uint8_t>(p), 0, i1_);
+  return emit(Op::Cmp, i1_, {a, b}, static_cast<uint8_t>(p), static_cast<uint8_t>(p) >= 32 ? 0u : flags, i1_);
 }
 
 Value Module::select(Value c, Value a, Value b) {
@@ -505,10 +506,15 @@ Value Module::bind_cbuffer(uint32_t space, uint32_t reg, uint32_t bytes) {
 }
 
 Value Module::heap_raw_buffer(Value index, bool uav, bool non_uniform) {
-  flags_ |= kFlagHeapResources | kFlagRawBuffers;
+  flags_ |= kFlagRawBuffers;
+  return heap_handle(index, false, non_uniform, static_cast<uint32_t>(ResourceKind::RawBuffer) | (uav ? kPropsUav : 0u), 0);
+}
+
+Value Module::heap_handle(Value index, bool sampler_heap, bool non_uniform, uint32_t props0, uint32_t props1) {
+  flags_ |= sampler_heap ? kFlagHeapSamplers : kFlagHeapResources;
   const Value h = dx_call(218, "createHandleFromHeap", kNone, handle_, {i32_, i1_, i1_}, Attr::ReadNone,
-                          {index, boolean(false), boolean(non_uniform)});
-  const Value props = aggregate(res_props_, {u32(static_cast<uint32_t>(ResourceKind::RawBuffer) | (uav ? kPropsUav : 0u)), u32(0)});
+                          {index, boolean(sampler_heap), boolean(non_uniform)});
+  const Value props = aggregate(res_props_, {u32(props0), u32(props1)});
   return dx_call(216, "annotateHandle", kNone, handle_, {handle_, res_props_}, Attr::ReadNone, {h, props});
 }
 
@@ -793,9 +799,11 @@ void Module::build_ssa() {
     for (uint32_t ii : blocks_[b].insts) {
       Inst& in = insts_[ii];
       if (in.op == Op::Read) {
+        // A variable read before any write reads zero, not undef: the validator refuses
+        // instructions that read undef (a masked write keeps the register's old value).
         const Value c = cur[in.aux];
         const Value r = in.result;
-        const Value u = c != kNone ? c : undef(var_types_[in.aux]);
+        const Value u = c != kNone ? c : null(var_types_[in.aux]);
         forward_.resize(values_.size(), kNone);
         forward_[r] = u;
       } else if (in.op == Op::Write) {
@@ -806,7 +814,7 @@ void Module::build_ssa() {
     each_successor(insts_[blocks_[b].insts.back()], [&](uint32_t s) {
       for (uint32_t pi : blocks_[s].phis) {
         const uint32_t var = insts_[pi].aux;
-        const Value c = cur[var] != kNone ? cur[var] : undef(var_types_[var]);
+        const Value c = cur[var] != kNone ? cur[var] : null(var_types_[var]);
         insts_[pi].ops.push_back(c);
         insts_[pi].ops.push_back(b);
       }
@@ -849,7 +857,7 @@ void Module::build_ssa() {
         }
         if (!trivial) continue;
         const Value r = p.result;
-        const Value to = same != kNone ? same : undef(p.type);
+        const Value to = same != kNone ? same : null(p.type);
         forward_.resize(values_.size(), kNone);
         forward_[r] = to;
         again = true;

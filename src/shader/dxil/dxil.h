@@ -138,8 +138,9 @@ class Module {
 
   // Declarations and globals.
   Value declare(std::string_view name, Type fn, Attr attr);
-  // A global variable of `t` in address space `space` (3: groupshared), undefined at the start.
-  Value global(std::string_view name, Type t, uint32_t space, uint32_t align);
+  // A global variable of `t` in address space `space` (3: groupshared): undefined at the start,
+  // or with `init` (a constant) and constant (a static const array).
+  Value global(std::string_view name, Type t, uint32_t space, uint32_t align, Value init = kNone);
 
   // Metadata.
   Md md_string(std::string_view s);
@@ -171,7 +172,7 @@ class Module {
   Value ashr(Value a, Value b) { return bin(Bin::AShr, a, b); }
   Value cast(Cast op, Value v, Type to);
   Value bitcast(Value v, Type to) { return cast(Cast::Bitcast, v, to); }
-  Value cmp(Pred p, Value a, Value b);
+  Value cmp(Pred p, Value a, Value b, uint32_t flags = 0);  // flags: fast-math, for floats
   Value select(Value c, Value a, Value b);
   Value call(Value fn, const std::vector<Value>& args);  // kNone for a void function
   Value load(Type t, Value ptr, uint32_t align);
@@ -204,6 +205,8 @@ class Module {
   Value bind_raw_buffer(ResourceClass c, uint32_t space, uint32_t reg);  // (RW)ByteAddressBuffer
   Value bind_cbuffer(uint32_t space, uint32_t reg, uint32_t bytes);
   Value heap_raw_buffer(Value index, bool uav, bool non_uniform);
+  // Any heap handle, annotated with DXIL's resource properties (two dwords).
+  Value heap_handle(Value index, bool sampler_heap, bool non_uniform, uint32_t props0, uint32_t props1);
   // A raw buffer load of `mask` (1, 3, 7, 15) elements of `t` at byte `offset`: the ResRet struct.
   Value raw_load(Type t, Value handle, Value offset, uint32_t mask, uint32_t align);
   void raw_store(Value handle, Value offset, const std::vector<Value>& v, uint32_t align);
@@ -233,6 +236,7 @@ class Module {
     Type type = 0;  // the variable's type (not the pointer)
     uint32_t space = 0, align = 0;
     Value value = 0;
+    Value init = kNone;  // a constant: the global is constant and internal
   };
   struct MdInfo {
     enum Kind : uint8_t { String, Value, Node } kind = String;

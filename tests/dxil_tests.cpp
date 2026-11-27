@@ -13,6 +13,7 @@
 #include "host/dxc_compile.h"
 #include "shader/container.h"
 #include "shader/dxil/dxil.h"
+#include "shader/dxil/hlsl.h"
 #include "test.h"
 
 namespace {
@@ -145,5 +146,65 @@ TEST_CASE(dxil_own_module_runs_on_the_gpu) {
   uint32_t wrong = 0;
   for (uint32_t i = 0; i < kThreads; ++i) wrong += g.memory[i] != collatz_steps(i + 1 + kAdd);
   std::printf("    %u of %u threads wrong (thread 0: %u, wanted %u)\n", wrong, kThreads, g.memory[0], collatz_steps(1 + kAdd));
+  CHECK(wrong == 0);
+}
+
+// HLSL compiled by our own compiler (shader/dxil/hlsl.h): a macro, a helper inlined, a loop, an
+// if/else and a goto, through the tests' bindings. Checked against the CPU.
+TEST_CASE(dxil_hlsl_subset_runs_on_the_gpu) {
+  using namespace am::shader::dxil;
+  std::string why;
+  if (!am::host::dxc_available(&why)) return;
+  const char* src = R"(
+cbuffer am_args : register(b0) { uint4 am_user[8]; uint2 am_base; uint2 am_pad; };
+RWByteAddressBuffer am_memory : register(u0);
+#define AM_STEP(x) select(((x) & 1u) != 0u, 3u * (x) + 1u, (x) >> 1)
+uint am_steps(uint x) {
+  uint n = 0u;
+  [loop] for (; x != 1u; ++n) x = AM_STEP(x);
+  return n;
+}
+[numthreads(64, 1, 1)]
+[WaveSize(64)]
+void main(uint3 am_tid : SV_GroupThreadID, uint3 am_gid : SV_GroupID, uint am_flat : SV_GroupIndex) {
+  uint i = am_gid.x * 64u + am_flat;
+  uint x = am_memory.Load(i * 4u) + am_user[0].y;
+  uint r = am_steps(x);
+  if (r > 100u) r = 100u + (r & 1u);
+  else { r += 0u; }
+  am_memory.Store(i * 4u, r);
+  goto am_done;
+  am_memory.Store(i * 4u, 0u);
+am_done:
+  return;
+}
+)";
+  Module m;
+  std::string error;
+  const bool compiled = compile_hlsl(src, "main", m, error);
+  std::printf("    compiled: %s %s\n", compiled ? "yes" : "no", error.c_str());
+  CHECK(compiled);
+  if (!compiled) return;
+  const am::host::CompileResult c = assemble(m);
+  std::printf("    container: %s (%zu bytes) %s\n", c.ok ? "ok" : "refused", c.dxil.size(), c.messages.substr(0, 600).c_str());
+  std::fflush(stdout);
+  CHECK(c.ok);
+  if (!c.ok) return;
+  constexpr uint32_t kThreads = 256, kAdd = 3;
+  std::vector<uint32_t> memory(kThreads), args(40, 0);
+  for (uint32_t i = 0; i < kThreads; ++i) memory[i] = i + 1;
+  args[1] = kAdd;
+  const am::test::GpuRun g = am::test::run_compute(c.dxil, kThreads / 64, args, memory, 64);
+  if (!g.ran) {
+    std::printf("    not run: %s\n", g.why.c_str());
+    return;
+  }
+  uint32_t wrong = 0;
+  for (uint32_t i = 0; i < kThreads; ++i) {
+    uint32_t want = collatz_steps(i + 1 + kAdd);
+    if (want > 100) want = 100 + (want & 1);
+    wrong += g.memory[i] != want;
+  }
+  std::printf("    %u of %u threads wrong\n", wrong, kThreads);
   CHECK(wrong == 0);
 }

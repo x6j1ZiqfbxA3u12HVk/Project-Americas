@@ -8,6 +8,7 @@
 #include <cstring>
 #include <vector>
 
+#include "dxil_compile.h"
 #include "gpu_runner.h"
 #include "host/dxc_compile.h"
 #include "shader/image_bindings.h"
@@ -42,6 +43,8 @@ Result run(const std::vector<uint32_t>& code, std::vector<uint32_t> user = {}, s
   in.lds_bytes = 16384;
   in.cs_rsrc2 = rsrc2;
   in.cs_threads[0] = 64;
+  const bool ours = am::test::use_ours();
+  in.goto_form = ours;
   const Translation t = translate(in, Binding::Test);
   CHECK(t.ok);
   r.structured = t.structured;
@@ -55,10 +58,10 @@ Result run(const std::vector<uint32_t>& code, std::vector<uint32_t> user = {}, s
     std::printf("    skipped: %s\n", why.c_str());
     return r;
   }
-  const am::host::CompileResult c = am::host::compile_hlsl(t.hlsl, t.entry, t.profile);
+  const am::host::CompileResult c = ours ? am::test::compile_ours(t.hlsl, t.entry) : am::host::compile_hlsl(t.hlsl, t.entry, t.profile);
   CHECK(c.ok);
   if (!c.ok) {
-    std::printf("    DXC: %s\n", c.messages.substr(0, 2000).c_str());
+    std::printf("    %s: %s\n", ours ? "ours" : "DXC", c.messages.substr(0, 2000).c_str());
     return r;
   }
   std::vector<uint32_t> args(36, 0);
