@@ -1883,3 +1883,20 @@ cannot be built. What a console mesh program does (from the reference furthest a
   visible to the mesh stage, `DispatchMesh(x, 1, 1)` for list slot 129 (counted today).
 * Order: stage I/O of the mesh record (stage_io.cpp) -> translator MS emission + a GPU test that
   draws through a mesh pipeline (gpu_runner) -> runtime pipeline + DispatchMesh -> a game run.
+* **Done (07:40): the translator side.** console_program reads the mesh record (all 8,765 of the
+  game's mesh programs: 128 lanes, 128 vertices, 128 primitives, triangles, 13-17 user SGPRs);
+  stage_io gives their per-vertex outputs as a vertex shader's (per-primitive outputs, PSG1, are
+  refused for now); the translator makes `ms_6_6` programs: registers as the console starts them
+  (eight system SGPRs, s3 bits 24-27 the wave in the group, user data from s8, v5 = group id x
+  128), the console's lane (group lane & 63), `exp pos/param` -> `am_verts[lane]`, `exp prim` ->
+  `am_tris[lane]`, `s_sendmsg 9` (the output request) a no-op with the counts set up front,
+  barriers dropped in mesh programs without LDS. `am-shaders tsurvey`: all 8,765 translate
+  (8,586 lanes as threads); five examples compile with DXC. The shader service maps mesh
+  programs now and compiles the game's (restarted 07:38).
+* **Next, the runtime:** mesh pipelines (D3D12.X's pipeline stream with a mesh stage: build the
+  host stream with MS + the translated PS, the user data root constants visible to the mesh
+  stage: the graphics root signature needs a mesh-visible parameter), and list slot 129
+  DispatchMesh -> `DispatchMesh(x, 1, 1)`. Then a GPU test drawing through a translated mesh
+  program (gpu_runner has graphics draws; add a mesh one), then a game run.
+* Geometry (GS 195) and ES (195): not looked at yet; the ES/GS pairs are the old geometry
+  pipeline, rarer than mesh.
