@@ -20,6 +20,7 @@
 #include "runtime/memory/title_memory.h"
 #include "runtime/d3d12x/host.h"
 #include "host/dxc_compile.h"
+#include "runtime/d3d12x/pipeline_cache.h"
 #include "shader/translate.h"
 #include <wrl/client.h>
 #include <cstdio>
@@ -657,6 +658,50 @@ TEST_CASE(d3d12x_translated_program_uses_title_memory_in_place) {
 // (AM_PIPELINE_MEMORY_COUNT, default 12) are made into pipelines one at a time, and the process
 // commit and the GPU's memory are logged around each. Nothing runs on the GPU. Without the
 // variable the test does nothing.
+// Not a test: builds the compute pipelines of the programs named in AM_PREBUILD (comma-separated
+// markers) into the pipeline library a game run loads (AM_PREBUILD_CACHE: the cache folder), as
+// the runtime describes them, one at a time with nothing else running, and saves it. For programs
+// whose pipelines the driver needs too much memory for next to a game run (13 MB of DXIL).
+TEST_CASE(d3d12x_prebuild_compute_pipelines) {
+  using namespace am;
+  char markers[4096] = {}, cache[1024] = {};
+  if (!GetEnvironmentVariableA("AM_PREBUILD", markers, sizeof markers) ||
+      !GetEnvironmentVariableA("AM_PREBUILD_CACHE", cache, sizeof cache)) {
+    return;
+  }
+  std::setvbuf(stdout, nullptr, _IONBF, 0);
+  if (!rt::present::host_gpu()) return;
+  ID3D12RootSignature* root = translated_root_signature();
+  CHECK(root != nullptr);
+  if (!root) return;
+  set_pipeline_cache_dir(cache);
+  const std::filesystem::path dxil_dir = std::filesystem::path(cache) / "shaders" / "dxil" / ("rt" + std::to_string(shader::kTranslatorVersion));
+  std::string list = markers;
+  for (size_t at = 0; at < list.size();) {
+    const size_t comma = std::min(list.find(',', at), list.size());
+    const std::string m = list.substr(at, comma - at);
+    at = comma + 1;
+    if (m.empty()) continue;
+    std::ifstream in(dxil_dir / (m + ".dxil"), std::ios::binary);
+    std::vector<uint8_t> code((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    if (code.empty()) {
+      std::printf("    %s: no DXIL\n", m.c_str());
+      continue;
+    }
+    D3D12_COMPUTE_PIPELINE_STATE_DESC d{};
+    d.pRootSignature = root;
+    d.CS = {code.data(), code.size()};
+    const ULONGLONG t0 = GetTickCount64();
+    std::printf("    %s: %zu KiB of DXIL: building...\n", m.substr(0, 16).c_str(), code.size() >> 10);
+    ID3D12PipelineState* pso = cached_compute_pipeline(d);
+    std::printf("    %s: %s in %.0f s\n", m.substr(0, 16).c_str(), pso ? "built (or found)" : "FAILED", (GetTickCount64() - t0) / 1000.0);
+    if (pso) {
+      save_pipeline_cache();
+      pso->Release();
+    }
+  }
+}
+
 TEST_CASE(d3d12x_driver_pipeline_memory) {
   using namespace am;
   char dir[1024] = {}, count_text[32] = {};

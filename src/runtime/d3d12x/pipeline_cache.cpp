@@ -49,6 +49,11 @@ Cache& cache() {
   return *c;
 }
 
+fs::path& cache_dir_override() {
+  static fs::path* const p = new fs::path;
+  return *p;
+}
+
 // Under the cache's lock: the library, opened from its file once (or empty).
 ID3D12PipelineLibrary* library() {
   Cache& c = cache();
@@ -56,11 +61,12 @@ ID3D12PipelineLibrary* library() {
   c.tried = true;
   present::HostGpu* gpu = present::host_gpu();
   TitleProcess* p = process();
-  if (!gpu || !p || p->cache_dir().empty()) return nullptr;
+  const fs::path cache_dir = !cache_dir_override().empty() ? cache_dir_override() : p ? p->cache_dir() : fs::path();
+  if (!gpu || cache_dir.empty()) return nullptr;
   ComPtr<ID3D12Device1> device;
   if (FAILED(gpu->device.As(&device))) return nullptr;
   std::error_code ec;
-  const fs::path dir = p->cache_dir() / L"d3d12";
+  const fs::path dir = cache_dir / L"d3d12";
   fs::create_directories(dir, ec);
   c.file = dir / L"host-pipelines.bin";
   {
@@ -245,6 +251,8 @@ ID3D12PipelineState* cached_graphics_pipeline(const D3D12_GRAPHICS_PIPELINE_STAT
   }
   return pso;
 }
+
+void set_pipeline_cache_dir(const fs::path& dir) { cache_dir_override() = dir; }
 
 void save_pipeline_cache() {
   Cache& c = cache();

@@ -1656,3 +1656,9 @@ list slots from 59 up are two later than in older titles).
   memory in the reference) and **9** CopyFromSubresource, both on the same addressing the
   uploads use (`texture_element_offset`). **SetName** (slot 6) on root signatures and pipelines.
 * Not done: command allocator slot 9, ExecuteIndirect itself, mesh shaders.
+* **Prebuilding giant pipelines** (`AM_PREBUILD=<markers> AM_PREBUILD_CACHE=C:\Project Americas\cache
+  am_tests d3d12x_prebuild_compute_pipelines`; the runtime's pipeline description, saved into
+  `cache\d3d12\host-pipelines.bin` for game runs to load). Tried on `3db4...` (13 MB of optimized
+  DXIL): **the driver passed 26 GB of commit and was stopped unfinished** (commit limit here 34 GB).
+  These far-jump giants are too large for AMD's compiler on a 16 GB PC; the way on is smaller
+  DXIL (translator output per instruction), or a much larger page file for a one-time build.
