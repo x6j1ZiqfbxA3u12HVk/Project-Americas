@@ -38,7 +38,7 @@ struct GpuMemory {
   bool started = false, usable = false;
   ComPtr<ID3D12Device3> device;
   ComPtr<ID3D12DescriptorHeap> heap;
-  ComPtr<ID3D12RootSignature> root, graphics_root;
+  ComPtr<ID3D12RootSignature> root, graphics_root, mesh_root;
   ComPtr<ID3D12Resource> table;   // default heap, R32 entries
   // Uploads of entries the GPU may still copy from, each with the fence value after the lists
   // that copy them (kPending until those are submitted).
@@ -132,6 +132,23 @@ struct GpuMemory {
     if (FAILED(D3D12SerializeVersionedRootSignature(&rd, &blob, &errors)) ||
         FAILED(device->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&graphics_root)))) {
       return fail("no graphics root signature for translated programs");
+    }
+    // Mesh pipelines: the mesh stage's user data (up to 32 SGPRs: s0-s19 at b0, s20-s31 at b1),
+    // the pixel stage's at b0, the binding table.
+    D3D12_ROOT_PARAMETER1 mesh[4]{};
+    mesh[0].ParameterType = mesh[1].ParameterType = mesh[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    mesh[0].Constants = {0, 0, kUserDataConstants};
+    mesh[1].Constants = {1, 0, kMeshUserDataConstants - kUserDataConstants};
+    mesh[2].Constants = {0, 0, kUserDataConstants};
+    mesh[0].ShaderVisibility = mesh[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_MESH;
+    mesh[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    mesh[3] = params[1];  // the binding table, u0, every stage
+    rd.Desc_1_1 = {4, mesh, 0, nullptr,
+                   D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED | D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED};
+    blob.Reset();
+    if (FAILED(D3D12SerializeVersionedRootSignature(&rd, &blob, &errors)) ||
+        FAILED(device->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&mesh_root)))) {
+      logf("gpu memory: no mesh root signature (mesh pipelines are not made)");
     }
     windows.emplace_back();  // window numbers start at 1: entry 0 means none
     usable = true;
@@ -397,6 +414,12 @@ ID3D12RootSignature* translated_graphics_root_signature() {
   std::lock_guard g(memory().lock);
   GpuMemory* m = ready();
   return m ? m->graphics_root.Get() : nullptr;
+}
+
+ID3D12RootSignature* translated_mesh_root_signature() {
+  std::lock_guard g(memory().lock);
+  GpuMemory* m = ready();
+  return m ? m->mesh_root.Get() : nullptr;
 }
 
 D3D12_GPU_VIRTUAL_ADDRESS host_gpu_address(uint64_t address, uint64_t size) {

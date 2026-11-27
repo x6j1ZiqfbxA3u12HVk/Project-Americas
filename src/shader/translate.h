@@ -45,7 +45,11 @@ struct StageInput {
 struct StageOutput {
   std::string semantic;
   uint32_t semantic_index = 0;
+  uint32_t components = 4;  // mesh: the output's width (its signature mask's highest component + 1)
 };
+// A mesh program's outputs are declared at their own widths (packed) when as float4s they would
+// pass D3D12's 32 KiB of mesh outputs: more than this many rows a vertex.
+constexpr size_t kMeshFloat4Rows = 16;
 
 struct TranslateInput {
   std::span<const uint32_t> code;

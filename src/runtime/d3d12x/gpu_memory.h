@@ -44,6 +44,10 @@ ID3D12RootSignature* translated_root_signature();
 // user data at root parameter 0, the pixel stage's at 1 (both b0, 20 constants, each visible to
 // its stage), the binding table at 2.
 ID3D12RootSignature* translated_graphics_root_signature();
+// Mesh pipelines: the mesh stage's user data at root parameters 0 (b0, the first 20 SGPRs) and 1
+// (b1, the next 12), the pixel stage's at 2 (b0), the binding table at 3.
+constexpr uint32_t kMeshUserDataConstants = 32;
+ID3D12RootSignature* translated_mesh_root_signature();
 // The host GPU address of title memory [address, address + size): in a window of its own
 // allocation, or in the committed page pool where its pages lie in a row there; 0 when neither
 // (vertex and index buffers bind it in place).

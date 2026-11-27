@@ -133,7 +133,11 @@ bool read_stage_io(std::span<const uint8_t> container, const NativeBlob& blob, c
       if (e.system_value == 0) params.push_back(e);
     }
     std::sort(params.begin(), params.end(), [](const Element& a, const Element& b) { return a.reg < b.reg; });
-    for (const Element& e : params) in.outputs.push_back({e.semantic, e.index});
+    for (const Element& e : params) {
+      const uint32_t m = e.mask & 0xF;
+      const uint32_t width = (m & 8) ? 4 : (m & 4) ? 3 : (m & 2) ? 2 : 1;
+      in.outputs.push_back({e.semantic, e.index, m ? width : 4u});
+    }
     return true;
   }
   return true;  // other stages have no interface here

@@ -68,6 +68,7 @@ struct ConsolePipeline {
   D3D12_BLEND_DESC blend_desc{};
   std::mutex lock;
   bool failed = false;  // a stage or layout we cannot make: not tried again
+  bool mesh = false;    // a mesh program and a pixel shader: drawn with DispatchMesh
   // Its programs were not all precompiled when last tried: looked for again from this tick on
   // (am-shaders serve compiles what draws wait for while the game runs).
   uint64_t retry_at = 0;
@@ -433,6 +434,15 @@ bool compute_group_size(const void* object, uint32_t out[3]) {
   const auto* p = static_cast<const PipelineState*>(o);
   for (int i = 0; i < 3; ++i) out[i] = p->compute_threads[i];
   return out[0] && out[1] && out[2];
+}
+
+bool pipeline_is_mesh(const void* object) {
+  Object* o = object_of_kind(object, pipeline_kind());
+  if (!o) return false;
+  const auto* p = static_cast<const PipelineState*>(o);
+  if (!p->console) return false;
+  std::lock_guard g(p->console->lock);
+  return p->console->mesh;
 }
 
 std::string compute_marker_of(const void* object) {
@@ -1040,6 +1050,85 @@ PipelineMaker& graphics_pipeline_maker() {
   return *m;
 }
 
+// A mesh pipeline (c.lock held): the mesh program and the pixel shader as a pipeline-state stream
+// with the mesh root signature, made on the graphics pipeline maker like the others. `key` is the
+// draw's targets (then rect list, depth format), as console_host_pipeline's.
+#pragma warning(push)
+#pragma warning(disable : 4324)  // padded to pointer alignment: what a pipeline-state stream needs
+template <D3D12_PIPELINE_STATE_SUBOBJECT_TYPE T, typename V>
+struct alignas(void*) StreamPart {
+  D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type = T;
+  V value{};
+};
+struct MeshStream {
+  StreamPart<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, ID3D12RootSignature*> root;
+  StreamPart<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, D3D12_SHADER_BYTECODE> ms;
+  StreamPart<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, D3D12_SHADER_BYTECODE> ps;
+  StreamPart<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, D3D12_BLEND_DESC> blend;
+  StreamPart<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, UINT> sample_mask;
+  StreamPart<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, D3D12_RASTERIZER_DESC> rasterizer;
+  StreamPart<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, D3D12_DEPTH_STENCIL_DESC> depth;
+  StreamPart<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, D3D12_RT_FORMAT_ARRAY> targets;
+  StreamPart<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT, DXGI_FORMAT> depth_format;
+  StreamPart<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, DXGI_SAMPLE_DESC> samples;
+};
+#pragma warning(pop)
+
+ID3D12PipelineState* console_mesh_pipeline(PipelineState* owner, ConsolePipeline& c, std::vector<uint8_t> ms, std::vector<uint8_t> ps,
+                                           const std::vector<uint32_t>& key, DXGI_FORMAT depth) {
+  ID3D12RootSignature* root = translated_mesh_root_signature();
+  if (!root) {
+    c.failed = true;
+    return nullptr;
+  }
+  struct Job {
+    MeshStream s;
+    std::vector<uint8_t> ms, ps;
+    std::vector<uint32_t> key;
+  };
+  auto job = std::make_shared<Job>();
+  job->ms = std::move(ms);
+  job->ps = std::move(ps);
+  job->key = key;
+  MeshStream& s = job->s;
+  s.root.value = root;
+  s.ms.value = {job->ms.data(), job->ms.size()};
+  s.ps.value = job->ps.empty() ? D3D12_SHADER_BYTECODE{} : D3D12_SHADER_BYTECODE{job->ps.data(), job->ps.size()};
+  s.blend.value.IndependentBlendEnable = TRUE;
+  for (int k = 0; k < 8; ++k) s.blend.value.RenderTarget[k] = blend_of(c.blend[k]);
+  if (c.has_blend_desc) s.blend.value = c.blend_desc;
+  s.sample_mask.value = UINT_MAX;
+  s.rasterizer.value = {D3D12_FILL_MODE_SOLID, D3D12_CULL_MODE_NONE, FALSE, 0, 0.0f, 0.0f, TRUE, FALSE, FALSE, 0,
+                        D3D12_CONSERVATIVE_RASTERIZATION_MODE_OFF};
+  s.depth.value = {};  // depth testing stays off until the depth registers are read, as for the others
+  s.targets.value.NumRenderTargets = static_cast<UINT>(key.size() - 2);
+  for (size_t k = 0; k + 2 < key.size(); ++k) s.targets.value.RTFormats[k] = static_cast<DXGI_FORMAT>(key[k]);
+  s.depth_format.value = depth;
+  s.samples.value = {1, 0};
+  c.making.insert(key);
+  add_ref(owner);  // kept alive until its pipeline is made
+  ConsolePipeline* cp = &c;
+  graphics_pipeline_maker().add([owner, cp, job] {
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> pso;
+    present::HostGpu* gpu = present::host_gpu();
+    Microsoft::WRL::ComPtr<ID3D12Device2> device;
+    HRESULT hr = E_FAIL;
+    if (gpu && SUCCEEDED(gpu->device.As(&device))) {
+      const D3D12_PIPELINE_STATE_STREAM_DESC desc{sizeof job->s, &job->s};
+      hr = device->CreatePipelineState(&desc, IID_PPV_ARGS(&pso));
+    }
+    static std::atomic<int> told{0};
+    if (told.fetch_add(1, std::memory_order_relaxed) < 32) logf("gpu: host pipeline for a mesh pipeline: %s (0x%08x)", pso ? "made" : "FAILED", static_cast<unsigned>(hr));
+    {
+      std::lock_guard g(cp->lock);
+      cp->made[job->key] = pso;
+      cp->making.erase(job->key);
+    }
+    release(owner);
+  });
+  return nullptr;
+}
+
 ID3D12PipelineState* console_host_pipeline(PipelineState* owner, ConsolePipeline& c, const DXGI_FORMAT* targets, uint32_t count,
                                            DXGI_FORMAT depth, bool rect_list) {
   std::lock_guard g(c.lock);
@@ -1050,7 +1139,7 @@ ID3D12PipelineState* console_host_pipeline(PipelineState* owner, ConsolePipeline
   key.push_back(depth);  // last: the depth view's format (the pipeline must match the bound views)
   if (auto it = c.made.find(key); it != c.made.end()) return it->second.Get();
   if (c.making.count(key)) return nullptr;
-  std::vector<uint8_t> vs, ps;
+  std::vector<uint8_t> vs, ps, ms;
   for (const std::string& m : c.markers) {
     std::vector<uint8_t> code;
     if (!load_precompiled(m, code)) {
@@ -1061,10 +1150,19 @@ ID3D12PipelineState* console_host_pipeline(PipelineState* owner, ConsolePipeline
     const int kind = dxil_kind(code);
     if (kind == 1 && vs.empty()) vs = std::move(code);
     else if (kind == 0 && ps.empty()) ps = std::move(code);
+    else if (kind == 13 && ms.empty()) ms = std::move(code);
     else {
-      c.failed = true;  // a stage we do not make yet (mesh, geometry, ...)
+      c.failed = true;  // a stage we do not make yet (amplification, geometry, ...)
       return nullptr;
     }
+  }
+  if (!ms.empty()) {
+    if (!vs.empty()) {
+      c.failed = true;
+      return nullptr;
+    }
+    c.mesh = true;
+    return console_mesh_pipeline(owner, c, std::move(ms), std::move(ps), key, depth);
   }
   if (vs.empty() || !c.layout_ok) {
     c.failed = true;

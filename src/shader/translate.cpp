@@ -1674,6 +1674,10 @@ const std::unordered_map<std::string, Handler>& table() {
       std::string body;
       for (uint32_t k = 0; k < 4; ++k) {
         if (!((en >> k) & 1u) && !(compr && stage != HwStage::Ps && k < 2)) continue;
+        if (stage == HwStage::Ms && tgt >= 32 && 1 + c.input->outputs.size() > kMeshFloat4Rows &&
+            k >= c.input->outputs[tgt - 32].components) {
+          continue;  // past the output's width (declared narrow)
+        }
         std::string value;
         if (compr && stage == HwStage::Ps) {
           const uint32_t r = src[k / 2];
@@ -4161,9 +4165,13 @@ Translation translate(const TranslateInput& in, Binding binding) {
       return tr;
     }
     tr.profile = "ms_6_6";
+    if (binding == Binding::Runtime && 8 + in.ms_user_sgprs > 20) h += "cbuffer am_args_hi : register(b1) { uint4 am_user_hi[3]; };\n";
     h += "struct AmMeshVert {\n  float4 pos : SV_Position;\n";
+    const bool packed = 1 + in.outputs.size() > kMeshFloat4Rows;
     for (size_t k = 0; k < in.outputs.size(); ++k) {
-      h += "  float4 o" + num(static_cast<uint32_t>(k)) + " : " + in.outputs[k].semantic + num(in.outputs[k].semantic_index) + ";\n";
+      const uint32_t w = packed ? std::clamp<uint32_t>(in.outputs[k].components, 1, 4) : 4;
+      h += std::string("  float") + (w > 1 ? num(w) : std::string()) + " o" + num(static_cast<uint32_t>(k)) + " : " +
+           in.outputs[k].semantic + num(in.outputs[k].semantic_index) + ";\n";
     }
     h += "};\n";
     h += "\n[outputtopology(\"triangle\")]\n[numthreads(" + num(tx) + ", 1, 1)]\n";
@@ -4189,10 +4197,14 @@ Translation translate(const TranslateInput& in, Binding binding) {
   for (const uint32_t r : c.image_vars) h += "  AmImage am_im_" + num(r) + " = (AmImage)0;\n";
   for (const uint32_t r : c.sampler_vars) h += "  AmSampler am_sm_" + num(r) + " = (AmSampler)0;\n";
   if (mesh) {
-    // Eight system SGPRs, then the user data from s8: s3 bits 24-27 the wave's index in the
-    // group; v5 the group's id times the group's size (max of lanes, vertices, primitives).
-    const uint32_t mu = binding == Binding::Runtime ? std::min(in.ms_user_sgprs, 20u) : in.ms_user_sgprs;
-    for (uint32_t i = 0; i < mu; ++i) h += "  s[" + num(8 + i) + "] = am_user[" + num(i / 4) + "][" + num(i % 4) + "];\n";
+    // Eight system SGPRs, then the user data from s8 (the runtime's root constants are the SGPRs
+    // from s0, user data at s8 on: s0-s19 at b0, s20-s31 at b1): s3 bits 24-27 the wave's index
+    // in the group; v5 the group's id times the group's size (max of lanes, vertices, primitives).
+    const uint32_t last = std::min(8 + in.ms_user_sgprs, 32u);
+    for (uint32_t i = 0; i < last; ++i) {
+      if (binding == Binding::Runtime && i >= 20) h += "  s[" + num(i) + "] = am_user_hi[" + num((i - 20) / 4) + "][" + num((i - 20) % 4) + "];\n";
+      else h += "  s[" + num(i) + "] = am_user[" + num(i / 4) + "][" + num(i % 4) + "];\n";
+    }
     h += "  s[3] = (am_flat >> " + num(c.wave64 ? 6 : 5) + "u) << 24;\n";
     const uint32_t stride = std::max({in.ms_threads, in.ms_max_vertices, in.ms_max_primitives});
     if (nv > 5) h += "  v[5] = am_gid.x * " + num(stride) + "u;\n";

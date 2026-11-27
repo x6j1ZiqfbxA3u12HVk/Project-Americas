@@ -96,6 +96,7 @@ struct HostList {
   uint64_t args[kParams] = {};
   std::vector<uint32_t> constants[kParams];
   bool bound = false;  // the translated root signature and heap are set in the host list
+  bool mesh_bound = false;  // that root signature is the mesh pipelines' (else the graphics one)
   bool heaps_set = false;  // the shader and sampler heaps, the page table and bindings flushed
   bool compute_bound = false;  // the translated compute root signature and table are set
   // Compute state, kept apart from graphics as D3D12 does.
@@ -231,6 +232,7 @@ ID3D12GraphicsCommandList* host_begin(CommandList* l) {
   h.ready = false;
   h.states.clear();
   h.bound = false;
+  h.mesh_bound = false;
   h.heaps_set = false;
   h.compute_bound = false;
   h.flushed = false;
@@ -625,7 +627,7 @@ void draw(HostList& h, ID3D12GraphicsCommandList* list, const Command& c) {
     ++g_draws_skipped;
     return;
   }
-  if (!h.bound) {
+  if (!h.bound || h.mesh_bound) {
     const D3D12_GPU_VIRTUAL_ADDRESS table = set_heaps(h, list);
     if (!table) {
       ++g_draws_skipped;
@@ -634,6 +636,7 @@ void draw(HostList& h, ID3D12GraphicsCommandList* list, const Command& c) {
     list->SetGraphicsRootSignature(translated_graphics_root_signature());
     list->SetGraphicsRootUnorderedAccessView(2, table);
     h.bound = true;
+    h.mesh_bound = false;
   }
   uint32_t vs[kUserDataConstants] = {}, ps[kUserDataConstants] = {};
   user_data_sgprs(*rs, D3D12_SHADER_VISIBILITY_VERTEX, h.args, h.constants, vs, kUserDataConstants);
@@ -656,6 +659,51 @@ void draw(HostList& h, ID3D12GraphicsCommandList* list, const Command& c) {
   ++g_draws_run;
 }
 
+// DispatchMesh (list slot 129): a mesh pipeline's draw. The mesh root signature, the mesh stage's
+// user data (32 SGPRs: root parameters 0 and 1), the pixel stage's (2), the binding table (3).
+// The console numbers mesh groups in x only: the groups go as DispatchMesh(x * y * z, 1, 1).
+void mesh_draw(HostList& h, ID3D12GraphicsCommandList* list, const Command& c) {
+  const void* rs_object = nullptr;
+  ID3D12PipelineState* pso = host_pipeline(h.pipeline, &rs_object, h.targets, h.target_count, h.depth_format, false);
+  const RootSignatureDesc* rs = root_signature_desc(h.root_signature ? h.root_signature : rs_object);
+  Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList6> list6;
+  ID3D12RootSignature* root = translated_mesh_root_signature();
+  if (!pso || !rs || !root || !pipeline_is_mesh(h.pipeline) || FAILED(list->QueryInterface(IID_PPV_ARGS(&list6)))) {
+    ++g_draws_skipped;
+    return;
+  }
+  if (!h.bound || !h.mesh_bound) {
+    const D3D12_GPU_VIRTUAL_ADDRESS table = set_heaps(h, list);
+    if (!table) {
+      ++g_draws_skipped;
+      return;
+    }
+    list->SetGraphicsRootSignature(root);
+    list->SetGraphicsRootUnorderedAccessView(3, table);
+    h.bound = true;
+    h.mesh_bound = true;
+  }
+  uint32_t ms[kMeshUserDataConstants] = {}, ps[kUserDataConstants] = {};
+  user_data_sgprs(*rs, D3D12_SHADER_VISIBILITY_MESH, h.args, h.constants, ms, kMeshUserDataConstants);
+  user_data_sgprs(*rs, D3D12_SHADER_VISIBILITY_PIXEL, h.args, h.constants, ps, kUserDataConstants);
+  list->SetPipelineState(pso);
+  list->SetGraphicsRoot32BitConstants(0, kUserDataConstants, ms, 0);
+  list->SetGraphicsRoot32BitConstants(1, kMeshUserDataConstants - kUserDataConstants, ms + kUserDataConstants, 0);
+  list->SetGraphicsRoot32BitConstants(2, kUserDataConstants, ps, 0);
+  static std::atomic<int> told{0};
+  if (told.fetch_add(1, std::memory_order_relaxed) < 8) {
+    logf("gpu: DispatchMesh(%llu, %llu, %llu) %s", static_cast<unsigned long long>(c.a[0]), static_cast<unsigned long long>(c.a[1]),
+         static_cast<unsigned long long>(c.a[2]), describe_pipeline(h.pipeline).c_str());
+  }
+  const uint64_t groups = std::max<uint64_t>(c.a[0], 1) * std::max<uint64_t>(c.a[1], 1) * std::max<uint64_t>(c.a[2], 1);
+  if (c.a[0] == 0 || groups > 65535) {  // nothing to draw, or past the host's limit for one dimension
+    ++g_draws_skipped;
+    return;
+  }
+  list6->DispatchMesh(static_cast<UINT>(groups), 1, 1);
+  ++g_draws_run;
+}
+
 // The host call for a command, made as the title makes the console one.
 void forward(CommandList* l, const Command& c) {
   if (track(l->host, l->rec, c)) return;
@@ -664,6 +712,7 @@ void forward(CommandList* l, const Command& c) {
     case kDrawIndexedInstanced:
     case kDispatch:
     case 80:
+    case 129:  // DispatchMesh
     case kClearUavUint:
     case kClearUavFloat:
     case kClearRenderTargetView:
@@ -797,6 +846,7 @@ void forward(CommandList* l, const Command& c) {
     case kDrawIndexedInstanced: draw(h, list, c); return;
     case kDispatch:
     case 80: dispatch(h, list, c); return;
+    case 129: mesh_draw(h, list, c); return;
     case kClearUavUint:
     case kClearUavFloat: clear_uav(h, list, c, l->rec); return;
     // Vertex and index buffers in place: title memory at its host GPU address (null when the
