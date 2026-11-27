@@ -836,6 +836,18 @@ uint64_t WINAPI record(CommandList* self, uint64_t a1, uint64_t a2, uint64_t a3,
   Command c;
   c.op = static_cast<uint16_t>(S);
   c.a[0] = a1, c.a[1] = a2, c.a[2] = a3, c.a[3] = a4, c.a[4] = a5, c.a[5] = a6, c.a[6] = a7;
+  if constexpr (S == kExecuteIndirect) {
+    // Not run on the host yet: how often the title asks, and with what (signature, max count,
+    // argument buffer, offset, count buffer, offset).
+    static std::atomic<uint64_t> calls{0};
+    const uint64_t n = calls.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n <= 8 || (n & (n - 1)) == 0) {
+      logf("d3d12x: ExecuteIndirect #%llu (not run on the host yet): signature %llx, max %llu, arguments %llx +%llx, count %llx +%llx",
+           static_cast<unsigned long long>(n), static_cast<unsigned long long>(a1), static_cast<unsigned long long>(a2),
+           static_cast<unsigned long long>(a3), static_cast<unsigned long long>(a4), static_cast<unsigned long long>(a5),
+           static_cast<unsigned long long>(a6));
+    }
+  }
   if constexpr (S == 75 || S == 126 || S == 131 || S == 132 || S == 142) {
     // Taken quietly; their first calls are logged (one may write a value the title waits for).
     static std::atomic<int> told{0};
