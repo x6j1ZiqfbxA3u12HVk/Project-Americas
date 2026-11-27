@@ -37,6 +37,8 @@
 #include "runtime/d3d12x/d3d12x.h"
 #include "runtime/d3d12x/gpu_memory.h"
 #include "runtime/d3d12x/host.h"
+#include "runtime/host_patch.h"
+#include "runtime/process.h"
 #include "runtime/d3d12x/pipeline_cache.h"
 #include "runtime/hle/xmem.h"
 #include "runtime/d3d12x/root_signature.h"
@@ -1323,6 +1325,117 @@ void log_memory(uint64_t frame) {
        host_memory_counts().c_str());
 }
 
+// Who commits the ~16 MiB blocks that make commit run away during loading: once commit grows,
+// VirtualAlloc is watched in every loaded module (the driver's included) and the stacks of the
+// first commits of 15-17 MiB are logged.
+using VirtualAllocFn = LPVOID(WINAPI*)(LPVOID, SIZE_T, DWORD, DWORD);
+VirtualAllocFn g_virtual_alloc = nullptr;
+
+LPVOID WINAPI watched_virtual_alloc(LPVOID address, SIZE_T size, DWORD type, DWORD protect) {
+  LPVOID r = g_virtual_alloc(address, size, type, protect);
+  if ((type & MEM_COMMIT) && size >= (15u << 20) && size <= (17u << 20)) {
+    static std::atomic<int> told{0};
+    if (told.fetch_add(1, std::memory_order_relaxed) < 6) {
+      void* frames[14] = {};
+      const USHORT got = RtlCaptureStackBackTrace(1, 14, frames, nullptr);
+      std::string text;
+      for (USHORT k = 0; k < got; ++k) {
+        text += " " + (process() ? process()->describe_address(reinterpret_cast<uint64_t>(frames[k])) : std::string("?"));
+      }
+      logf("memory: VirtualAlloc commit of %s (protect 0x%lx) from%s", format_bytes(size).c_str(), protect, text.c_str());
+    }
+  }
+  return r;
+}
+
+// The same for heap blocks (malloc and HeapAlloc of ~16 MiB are served by the heap straight from
+// the kernel, without VirtualAlloc).
+using HeapAllocFn = PVOID(NTAPI*)(PVOID, ULONG, SIZE_T);
+HeapAllocFn g_heap_alloc = nullptr;
+
+PVOID NTAPI watched_heap_alloc(PVOID heap, ULONG flags, SIZE_T size) {
+  PVOID r = g_heap_alloc(heap, flags, size);
+  if (size >= (15u << 20) && size <= (17u << 20)) {
+    static std::atomic<int> told{0};
+    if (told.fetch_add(1, std::memory_order_relaxed) < 6) {
+      void* frames[14] = {};
+      const USHORT got = RtlCaptureStackBackTrace(1, 14, frames, nullptr);
+      std::string text;
+      for (USHORT k = 0; k < got; ++k) {
+        text += " " + (process() ? process()->describe_address(reinterpret_cast<uint64_t>(frames[k])) : std::string("?"));
+      }
+      logf("memory: heap block of %s from%s", format_bytes(size).c_str(), text.c_str());
+    }
+  }
+  return r;
+}
+
+void watch_large_commits() {
+  // AMERICAS_WATCH_COMMITS=1 (diagnosis): it costs a check on every heap allocation.
+  if (!GetEnvironmentVariableA("AMERICAS_WATCH_COMMITS", nullptr, 0)) return;
+  static std::once_flag heap_once;
+  std::call_once(heap_once, [] {
+    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    void* original = ntdll ? reinterpret_cast<void*>(GetProcAddress(ntdll, "RtlAllocateHeap")) : nullptr;
+    if (!original) return;
+    g_heap_alloc = reinterpret_cast<HeapAllocFn>(original);
+    const size_t patched = patch_loaded_imports(original, reinterpret_cast<void*>(&watched_heap_alloc));
+    logf("memory: watching heap blocks of ~16 MiB in %zu import slots", patched);
+  });
+  static std::once_flag once;
+  std::call_once(once, [] {
+    HMODULE base = GetModuleHandleW(L"kernelbase.dll");
+    void* original = base ? reinterpret_cast<void*>(GetProcAddress(base, "VirtualAlloc")) : nullptr;
+    if (!original) return;
+    g_virtual_alloc = reinterpret_cast<VirtualAllocFn>(original);
+    const size_t patched = patch_loaded_imports(original, reinterpret_cast<void*>(&watched_virtual_alloc));
+    logf("memory: watching VirtualAlloc commits of ~16 MiB in %zu import slots", patched);
+  });
+}
+
+// Where commit grew since the last call: the process's committed private memory by allocation
+// (VirtualQuery over the whole address space), the allocations that grew most and how many are
+// new. Commit that rises while the working set stays flat is committed and never touched: this
+// names the allocations doing it (their size and protection tell a driver heap from ours).
+void log_commit_growth() {
+  static std::unordered_map<uint64_t, uint64_t> last;
+  std::unordered_map<uint64_t, uint64_t> now;
+  std::unordered_map<uint64_t, uint32_t> protect;
+  MEMORY_BASIC_INFORMATION m;
+  for (uint64_t at = 0x10000; VirtualQuery(reinterpret_cast<void*>(at), &m, sizeof m) == sizeof m;) {
+    if (m.State == MEM_COMMIT && m.Type == MEM_PRIVATE) {
+      const uint64_t base = reinterpret_cast<uint64_t>(m.AllocationBase);
+      now[base] += m.RegionSize;
+      protect[base] = m.Protect;
+    }
+    const uint64_t next = reinterpret_cast<uint64_t>(m.BaseAddress) + m.RegionSize;
+    if (next <= at) break;
+    at = next;
+  }
+  std::vector<std::pair<int64_t, uint64_t>> grew;
+  uint64_t fresh = 0, fresh_bytes = 0;
+  for (const auto& [base, bytes] : now) {
+    const auto it = last.find(base);
+    const uint64_t before = it == last.end() ? 0 : it->second;
+    if (it == last.end()) ++fresh, fresh_bytes += bytes;
+    if (bytes > before) grew.emplace_back(static_cast<int64_t>(bytes - before), base);
+  }
+  std::sort(grew.begin(), grew.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+  std::string text;
+  for (size_t k = 0; k < grew.size() && k < 8; ++k) {
+    char line[128];
+    std::snprintf(line, sizeof line, "%s0x%llx +%s (now %s, protect 0x%x)", k ? "; " : "", static_cast<unsigned long long>(grew[k].second),
+                  format_bytes(static_cast<uint64_t>(grew[k].first)).c_str(), format_bytes(now[grew[k].second]).c_str(),
+                  protect[grew[k].second]);
+    text += line;
+  }
+  if (!last.empty()) {
+    logf("memory: commit grew most in %s; %llu allocations new since the last look (%s)", text.c_str(),
+         static_cast<unsigned long long>(fresh), format_bytes(fresh_bytes).c_str());
+  }
+  last = std::move(now);
+}
+
 void frame_present() {
   bindings_frame_ended();
   FrameLog& f = frame_log();
@@ -1342,6 +1455,8 @@ void frame_present() {
           if (pm.PrivateUsage >= logged_at + (uint64_t{1} << 30)) {
             logged_at = pm.PrivateUsage;
             log_memory(frame_log().frame);
+            log_commit_growth();
+            watch_large_commits();
           }
         }
       }).detach();

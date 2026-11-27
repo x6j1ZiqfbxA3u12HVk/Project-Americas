@@ -1599,3 +1599,26 @@ loading does). Work that way.
   GPU address at +40, destination descriptor), the twin of slot 70: buffers get a V# over the
   range, textures the view slot 70 would make. The call site shows it: Flags 0x20004 (UAV) in the
   resource description, the view description's +40 the address.
+
+## The commit runaway: unoptimized giants in AMD's driver compiler (2026-11-27, 02:30)
+
+* **Found:** during loading commit rose ~1.7 GB every 2 s with the working set flat. The memory
+  timer now walks the address space when commit grows (`memory: commit grew most in ...`): ~100
+  new private 15.8 MiB blocks every 2 s. With `AMERICAS_WATCH_COMMITS=1` (imports of
+  RtlAllocateHeap and VirtualAlloc in every loaded module watched) the stacks name
+  **amdxc64.dll**: AMD's shader compiler, building our pipelines.
+* **Why:** programs over 1 MiB of HLSL were compiled with `-O0` (to halve DXC's time); the game
+  asks for several (1.4-2.2 MB of DXIL). Measured on one (`ca8f...`) with the pipeline test
+  (`AM_PIPELINE_MEMORY=<dir> am_tests d3d12x_driver_pipeline_memory`; `AM_PIPELINE_MEMORY_BELOW=
+  <KiB>` limits sizes): **-O0 DXIL (2.27 MB): the driver passed 20 GB and never finished;
+  -O3 DXIL (1.2 MB, DXC 55 s instead of 27): 6.8 GB at its peak, 80 s, 87 MB kept.** Game-sized
+  pipelines (50-200 KB) cost the driver little (+-90 MB) but 4-8 s each.
+* **Fix:** the service compiles everything optimized. Existing DXIL over 1 MiB whose .src key
+  lacks "-o3" counts as unoptimized: compiled again, the game's requests first, then before the
+  guard upgrades. The runtime builds a pipeline over 1 MiB of DXIL alone (both driver slots).
+* **The smarter method, for later:** the reference furthest along does not use DXC for
+  translated shaders at all: its own SSA form, an optimizer and an LLVM-bitcode (DXIL) writer
+  (~37,000 lines in all). That removes DXC's minutes per program and hands the driver clean
+  code. A big task; worth it once the game runs.
+* Next: a game run once the game's giants are optimized (watch `waited for:` in the service
+  window), to see loading past the old 24 GB wall.

@@ -128,10 +128,15 @@ int translate(const std::string& wanted, const fs::path& pack_dir, const fs::pat
                       !t.structured ? "dispatcher" : chained ? "chained structured" : "structured", t.hlsl.size() >> 10,
                       deepest, narrow(hlsl.wstring()).c_str());
           std::fflush(stdout);
-          const bool huge = t.hlsl.size() > (1u << 20);
+          // AM_SHADERS_O0=1: unoptimized over 1 MiB, as the service once did (to compare what the driver does).
+          const bool huge = t.hlsl.size() > (1u << 20) && GetEnvironmentVariableA("AM_SHADERS_O0", nullptr, 0);
           const auto c0 = std::chrono::steady_clock::now();
           const host::CompileResult r =
               host::compile_hlsl(t.hlsl, t.entry, t.profile, huge ? std::vector<std::wstring>{L"-O0"} : std::vector<std::wstring>{});
+          if (r.ok) {
+            std::ofstream(out_dir / widen(wanted + ".dxil"), std::ios::binary)
+                .write(reinterpret_cast<const char*>(r.dxil.data()), static_cast<std::streamsize>(r.dxil.size()));
+          }
           std::printf("%s: %s in %.1f s (%zu bytes of DXIL)\n", wanted.c_str(), r.ok ? "compiled" : "compile failed",
                       std::chrono::duration<double>(std::chrono::steady_clock::now() - c0).count(), r.dxil.size());
           if (!r.ok) std::printf("%s\n", r.messages.substr(0, 2000).c_str());
@@ -821,11 +826,27 @@ int serve(const fs::path& pack_dir, const fs::path& runtime_dir, const fs::path&
     }
     for (std::thread& t : workers) t.join();
   };
-  // Under `lock`: whether `m` needs compiling: no DXIL yet, or DXIL from before the guards for
-  // a program that can loop.
+  // DXIL compiled unoptimized (-O0, once used for programs over 1 MiB of HLSL to halve DXC's
+  // time): AMD's driver compiler takes over 20 GB on such DXIL when the game makes a pipeline
+  // from it (the optimized build of the same program: 6.8 GB at its peak, 87 MB kept). Every
+  // compile is optimized now; these are compiled again, the game's first. An optimized large
+  // program's .src key ends in "-o3"; large DXIL whose key does not was compiled at -O0.
+  std::set<std::string> unoptimized;
+  {
+    std::error_code e;
+    for (const auto& f : fs::directory_iterator(out_dir, e)) {
+      if (f.path().extension() != L".dxil" || f.file_size(e) < (1u << 20)) continue;
+      std::string key;
+      std::ifstream(fs::path(f.path()).replace_extension(L".src")) >> key;
+      if (key.size() < 3 || key.compare(key.size() - 3, 3, "-o3") != 0) unoptimized.insert(narrow(f.path().stem().wstring()));
+    }
+  }
+  // Under `lock`: whether `m` needs compiling: no DXIL yet, DXIL compiled unoptimized, or DXIL
+  // from before the guards for a program that can loop.
   const auto needs = [&](const std::string& m) {
     std::error_code e;
     if (!fs::exists(out_dir / widen(m + ".dxil"), e)) return true;
+    if (unoptimized.count(m)) return true;
     const auto it = where.find(m);
     return it != where.end() && it->second.loops && !guarded.count(m);
   };
@@ -876,6 +897,10 @@ int serve(const fs::path& pack_dir, const fs::path& runtime_dir, const fs::path&
       if (everything && at.loops && !guarded.count(m) && fs::exists(out_dir / widen(m + ".dxil"), ec)) upgrades.push_back(m);
     }
     std::sort(upgrades.begin(), upgrades.end(), [&](const std::string& a, const std::string& b) { return where[a].code_size > where[b].code_size; });
+    // Unoptimized DXIL goes before the guard upgrades (the queue is taken from its back).
+    for (const std::string& m : unoptimized) {
+      if (everything && where.count(m) && std::find(upgrades.begin(), upgrades.end(), m) == upgrades.end()) upgrades.push_back(m);
+    }
     std::sort(bulk.begin(), bulk.end(), [&](const std::string& a, const std::string& b) { return where[a].code_size > where[b].code_size; });
   }
   say("serve: %zu programs mapped in %zu containers (%.0f s); %s; %u at a time\n", where.size(), files.size(),
@@ -1000,7 +1025,8 @@ int serve(const fs::path& pack_dir, const fs::path& runtime_dir, const fs::path&
     // (two of about 80,000 instructions ran past 45 minutes at 3 GB each): refused until such
     // programs get a better form, so they do not hold the large-compile slot.
     if (!t.structured && t.hlsl.size() > (1u << 20)) return fail("dispatcher form over 1 MiB of HLSL (DXC takes hours)");
-    const std::string key = source_key(t);
+    // Large programs' keys say they were compiled optimized: a stored -O0 build is never reused.
+    const std::string key = source_key(t) + (t.hlsl.size() > (1u << 20) ? "-o3" : "");
     const fs::path stored = by_source / widen(key + ".dxil");
     if (fs::exists(stored, ec)) {
       fs::copy_file(stored, out_dir / widen(marker + ".dxil"), fs::copy_options::overwrite_existing, ec);
@@ -1012,8 +1038,8 @@ int serve(const fs::path& pack_dir, const fs::path& runtime_dir, const fs::path&
       return;
     }
     const auto c0 = std::chrono::steady_clock::now();
-    // The largest programs (over 1 MiB of HLSL take DXC minutes) unoptimized: twice as fast to
-    // compile, and the driver optimizes the DXIL again when it makes the pipeline.
+    // Programs over 1 MiB of HLSL take DXC minutes and 3-4 GB; they are compiled optimized all the
+    // same (see `unoptimized`: the driver cannot cope with unoptimized ones).
     const bool huge = t.hlsl.size() > (1u << 20);
     // DXC takes 3-4 GB for the largest: one more starts only while there is room for it (one
     // always may), so the service fits next to a game run and uses the cores when there is none.
@@ -1031,7 +1057,7 @@ int serve(const fs::path& pack_dir, const fs::path& runtime_dir, const fs::path&
     // as a refusal: a refusal is not tried again by this build.
     host::CompileResult c;
     for (int attempt = 0;; ++attempt) {
-      c = host::compile_hlsl(t.hlsl, t.entry, t.profile, huge ? std::vector<std::wstring>{L"-O0"} : std::vector<std::wstring>{});
+      c = host::compile_hlsl(t.hlsl, t.entry, t.profile);
       if (c.ok || !c.transient || attempt == 3) break;
       static constexpr DWORD kWaitMs[] = {5000, 20000, 60000};
       say("  %s %s: DXC %s; trying again in %lu s\n", shader::hw_stage_name(at.stage), marker.c_str(), c.messages.c_str(),
@@ -1063,6 +1089,7 @@ int serve(const fs::path& pack_dir, const fs::path& runtime_dir, const fs::path&
     std::ofstream(out_dir / widen(marker + ".src")) << key;
     ++compiled;
     std::lock_guard<std::mutex> g(lock);
+    unoptimized.erase(marker);
     guarded.insert(marker);
     guarded_out << marker << '\n' << std::flush;
     // Progress: what is left and when it should be done, from the pace of the last 40 compiles

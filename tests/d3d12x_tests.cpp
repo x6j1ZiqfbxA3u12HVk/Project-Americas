@@ -686,8 +686,13 @@ TEST_CASE(d3d12x_driver_pipeline_memory) {
   };
   std::vector<std::pair<uintmax_t, std::filesystem::path>> files;
   std::error_code ec;
+  // AM_PIPELINE_MEMORY_BELOW=<KiB>: only DXIL smaller than that (the sizes a game run makes).
+  char below_text[32] = {};
+  const uintmax_t below = GetEnvironmentVariableA("AM_PIPELINE_MEMORY_BELOW", below_text, sizeof below_text)
+                              ? std::strtoull(below_text, nullptr, 10) * 1024
+                              : UINTMAX_MAX;
   for (const auto& e : std::filesystem::directory_iterator(dir, ec)) {
-    if (e.path().extension() == ".dxil") files.emplace_back(e.file_size(ec), e.path());
+    if (e.path().extension() == ".dxil" && e.file_size(ec) < below) files.emplace_back(e.file_size(ec), e.path());
   }
   std::sort(files.begin(), files.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
   const auto commit = [] {
@@ -703,6 +708,7 @@ TEST_CASE(d3d12x_driver_pipeline_memory) {
     if (a3) a3->QueryVideoMemoryInfo(0, group, &i);
     return static_cast<double>(i.CurrentUsage) / (1 << 20);
   };
+  std::setvbuf(stdout, nullptr, _IONBF, 0);  // each line as it comes: a run may be ended by its memory
   std::printf("    start: commit %.0f MiB, GPU local %.0f MiB, shared %.0f MiB\n", commit(), video(DXGI_MEMORY_SEGMENT_GROUP_LOCAL),
               video(DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL));
   std::vector<Microsoft::WRL::ComPtr<ID3D12PipelineState>> made;

@@ -136,13 +136,23 @@ uint64_t commit_now() {
 
 template <typename Make>
 ID3D12PipelineState* compile(const char* what, uint64_t code_bytes, Make make) {
-  compiles().acquire();
+  // A large program (over 1 MiB of DXIL: about 7 GB of driver memory at its peak) compiles alone:
+  // it takes both slots, one large one at a time so two cannot each hold one and wait.
+  static std::mutex large;
+  const bool alone = code_bytes > (1u << 20);
+  if (alone) {
+    std::lock_guard g(large);
+    compiles().acquire();
+    compiles().acquire();
+  } else {
+    compiles().acquire();
+  }
   const uint64_t before = commit_now();
   const ULONGLONG start = GetTickCount64();
   ID3D12PipelineState* pso = make();
   const ULONGLONG took = GetTickCount64() - start;
   const int64_t added = static_cast<int64_t>(commit_now()) - static_cast<int64_t>(before);
-  compiles().release();
+  compiles().release(alone ? 2 : 1);
   static std::atomic<int> told{0};
   if ((took > 2000 || added > (int64_t{256} << 20)) && told.fetch_add(1, std::memory_order_relaxed) < 32) {
     logf("gpu: the driver compiled a %s pipeline (%s of DXIL) in %llu ms; process commit %s%s since", what,
