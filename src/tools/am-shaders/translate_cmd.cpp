@@ -199,6 +199,7 @@ int translation_survey(const fs::path& pack_dir, const fs::path& out_json, size_
   SetPriorityClass(GetCurrentProcess(), BELOW_NORMAL_PRIORITY_CLASS);
   std::mutex lock;
   std::map<std::string, uint64_t> missing, stages_total, stages_ok, stages_structured, stages_lanes;  // missing: programs blocked by it
+  std::map<std::string, uint64_t> mesh_shapes;  // mesh programs by their record's limits
   std::map<std::string, uint64_t> first_missing;
   std::vector<std::pair<std::string, shader::Translation>> to_compile;
   std::atomic<size_t> next{0};
@@ -214,6 +215,12 @@ int translation_survey(const fs::path& pack_dir, const fs::path& out_json, size_
             shader::Translation t = shader::translate(input_of(shader->bytes, b, p), shader::Binding::Test);
             std::lock_guard<std::mutex> g(lock);
             ++stages_total[shader::hw_stage_name(p.stage)];
+            if (p.stage == shader::HwStage::Ms) {
+              char key[96];
+              std::snprintf(key, sizeof key, "lanes %u, vertices %u, primitives %u, topology %u, user SGPRs %u", p.ms_threads,
+                            p.ms_max_vertices, p.ms_max_primitives, p.ms_topology, p.ms_user_sgprs);
+              ++mesh_shapes[key];
+            }
             if (t.ok) {
               ++stages_ok[shader::hw_stage_name(p.stage)];
               if (t.structured) ++stages_structured[shader::hw_stage_name(p.stage)];
@@ -303,6 +310,15 @@ int translation_survey(const fs::path& pack_dir, const fs::path& out_json, size_
                 static_cast<unsigned long long>(stages_structured[k]), static_cast<unsigned long long>(stages_lanes[k]));
   }
   std::printf("DXC: %llu of %zu compiled\n", static_cast<unsigned long long>(compiled.load()), to_compile.size());
+  if (!mesh_shapes.empty()) {
+    std::vector<std::pair<uint64_t, std::string>> shapes;
+    for (const auto& [k, n] : mesh_shapes) shapes.emplace_back(n, k);
+    std::sort(shapes.rbegin(), shapes.rend());
+    std::printf("mesh programs by their limits:\n");
+    for (size_t k = 0; k < shapes.size() && k < 15; ++k) {
+      std::printf("  %6llu  %s\n", static_cast<unsigned long long>(shapes[k].first), shapes[k].second.c_str());
+    }
+  }
   std::sort(slowest.rbegin(), slowest.rend());
   for (size_t i = 0; i < slowest.size() && i < 8; ++i) std::printf("  %7.1f s  %s\n", slowest[i].first, slowest[i].second.c_str());
   std::printf("most blocking (programs held up by each):\n");

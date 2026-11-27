@@ -100,6 +100,19 @@ bool read_blob(std::span<const uint8_t> blob, NativeBlob& out, std::string& erro
         return false;
       }
     }
+    if (s.stage == HwStage::Ms) {
+      // E + 0x18c + 16: SPI_SHADER_PGM_RSRC2_GS; E + 0x448: u16 lanes, u16 maximum vertices, u16
+      // maximum primitives, u8 user SGPRs, u8 output topology (2: triangles).
+      const uint64_t e = record + kRecordSize;
+      uint64_t info = 0;  // left 0 when the record is shorter (the program's other stages still load)
+      read(p, e + 0x18c + 16, prog.ms_rsrc2);
+      read(p, e + 0x448, info);
+      prog.ms_threads = static_cast<uint32_t>(info & 0xFFFF);
+      prog.ms_max_vertices = static_cast<uint32_t>((info >> 16) & 0xFFFF);
+      prog.ms_max_primitives = static_cast<uint32_t>((info >> 32) & 0xFFFF);
+      prog.ms_user_sgprs = static_cast<uint32_t>((info >> 48) & 0xFF);
+      prog.ms_topology = static_cast<uint32_t>((info >> 56) & 0xFF);
+    }
     prog.wave32 = (prog.flags >> 5) & 1;
     prog.vgprs = regs & 0x3FF;
     prog.sgprs = (regs >> 20) & 0xFF;

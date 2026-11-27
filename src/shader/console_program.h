@@ -16,6 +16,9 @@
 //           +0x4c    u32 LDS bytes; +0x50 u32 registers: bits 0-9 VGPRs, 20-27 SGPRs
 //   stage data follows the record (inputs, outputs, export patches; read by the translator).
 //   Compute: +0x54+0x24 u32 COMPUTE_PGM_RSRC2, +0x54+0x28 u32 x3 thread-group size.
+//   Mesh: +0x54+0xc8 outputs as a vertex shader's (param bit 7: per primitive), +0x54+0x18c
+//   eight registers (SPI_SHADER_PGM_RSRC2_GS the fifth), +0x54+0x448 u16 lanes, u16 most
+//   vertices, u16 most primitives, u8 user SGPRs, u8 topology.
 //
 // A vertex shader can carry two blobs (for use with and without a geometry shader).
 
@@ -43,6 +46,10 @@ struct NativeProgram {
   // thread-group size, from the stage data after the record (record + 0x54 + 0x24 / + 0x28).
   uint32_t cs_rsrc2 = 0;
   uint32_t cs_threads[3] = {0, 0, 0};
+  // Mesh only (stage data E + 0x18c + 16, E + 0x448): SPI_SHADER_PGM_RSRC2_GS, the group's
+  // lanes, the most vertices and primitives it outputs, its user SGPRs, its topology (2
+  // triangles). Lane n exports vertex n and primitive n.
+  uint32_t ms_rsrc2 = 0, ms_threads = 0, ms_max_vertices = 0, ms_max_primitives = 0, ms_user_sgprs = 0, ms_topology = 0;
 };
 
 struct NativeBlob {
