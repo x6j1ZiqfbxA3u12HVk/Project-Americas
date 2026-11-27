@@ -2316,20 +2316,20 @@ void am_store(uint64_t a, uint x) {
   w.Store(am_at(e, a), x);
 }
 // Scalar loads: the address is the wave's, so the window index is uniform (no per-lane loop in
-// the driver), and two or four dwords come in one load while they stay in one 64 KiB page.
+// the driver), and two or four dwords come in one load: a window maps a whole allocation, so a
+// group that runs into the next 64 KiB page of the same allocation reads on in the same window
+// (and past the window's end a raw load reads zero).
 uint am_sload(uint64_t a) {
   uint e = am_entry(a);
   RWByteAddressBuffer w = ResourceDescriptorHeap[am_win(e)];
   return w.Load(am_at(e, a));
 }
 uint2 am_sload2(uint64_t a) {
-  if ((uint(a) & 0xFFFFu) > 0xFFF8u) return uint2(am_sload(a), am_sload(a + 4u));
   uint e = am_entry(a);
   RWByteAddressBuffer w = ResourceDescriptorHeap[am_win(e)];
   return w.Load2(am_at(e, a));
 }
 uint4 am_sload4(uint64_t a) {
-  if ((uint(a) & 0xFFFFu) > 0xFFF0u) return uint4(am_sload(a), am_sload(a + 4u), am_sload(a + 8u), am_sload(a + 12u));
   uint e = am_entry(a);
   RWByteAddressBuffer w = ResourceDescriptorHeap[am_win(e)];
   return w.Load4(am_at(e, a));
@@ -2391,13 +2391,15 @@ uint am_bind_hash2(uint h) {
 }
 uint4 am_bind_slot(uint at, uint4 a, uint4 b) {
   uint4 v = am_bindings.Load4(at + 32u);
-  return (v.w != 0u && all(am_bindings.Load4(at) == a) && all(am_bindings.Load4(at + 16u) == b)) ? v : uint4(0u, 0u, 0u, 0u);
+  // and()/select(): no short-circuit branches (HLSL 2021's && and ?: branch).
+  return select(and(v.w != 0u, and(all(am_bindings.Load4(at) == a), all(am_bindings.Load4(at + 16u) == b))), v, uint4(0u, 0u, 0u, 0u));
 }
 uint4 am_bind_find(uint table, uint cap, uint size, uint4 a, uint4 b) {
   if (cap == 0u) return uint4(0u, 0u, 0u, 0u);
   uint h = am_bind_hash(a, b);
   uint4 v = am_bind_slot(table + (h & (cap - 1u)) * size, a, b);
-  if (v.w == 0u) v = am_bind_slot(table + (am_bind_hash2(h) & (cap - 1u)) * size, a, b);
+  uint4 second = am_bind_slot(table + (am_bind_hash2(h) & (cap - 1u)) * size, a, b);
+  v = select(v.w == 0u, second, v);
   return v;
 }
 // A descriptor the table lacks: queued once a wave for the host.
@@ -2747,7 +2749,7 @@ void am_buffer_address(uint4 rs, uint index, uint offset, uint soffset, out uint
   uint64_t at = uint64_t(index) * stride + offset;
   p = base + at + soffset;
   uint64_t range = stride == 0u ? uint64_t(records) : uint64_t(records) * stride;
-  lim = at >= range ? 0u : uint(min(range - at, uint64_t(16)));
+  lim = select(at >= range, 0u, uint(min(range - at, uint64_t(16))));
 }
 
 uint am_fmt_info(uint f) { return f < 78u ? am_formats[f] : 0u; }

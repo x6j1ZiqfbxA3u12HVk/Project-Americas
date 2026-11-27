@@ -1694,3 +1694,15 @@ list slots from 59 up are two later than in older titles).
   all zeros.
 * **`ca8f...` after rounds 1+2:** branches 17,632 -> 9,494; **driver peak 6.8 -> 3.4 GB**, build
   80 -> 37 s; DXC 55 -> 23 s; DXIL size unchanged. Next: the far-jump giant `3db4...` with this.
+
+## Step 3, round 3: helpers without branches (2026-11-27, ~05:20)
+
+* `am_sload2`/`am_sload4` no longer split a group that crosses a 64 KiB page: a window maps a whole
+  allocation, so the group reads on in the same window (past the window's end a raw load reads 0).
+* The bindings lookup (`am_bind_slot`/`am_bind_find`) reads both probes and picks with `select()`
+  and `and()`; the buffer bound (`lim`) uses `select()`. HLSL 2021's `&&`, `||` and `?:` branch.
+* **`ca8f...` after rounds 1-3:** branches 9,494 -> 5,925 (17,632 at the start); instructions
+  157 K -> 118 K; **DXIL 1,203 -> 853 KiB**; DXC 23 -> 17 s; driver build 37 -> 25 s, peak about
+  2.0 GB of private bytes (sampled from the test process every 250 ms).
+* Measuring tip: the driver caches pipelines by DXIL, so a second build of the same DXIL takes a
+  few ms and shows nothing; compare fresh DXIL only.
