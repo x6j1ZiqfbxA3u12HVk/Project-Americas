@@ -1823,7 +1823,8 @@ Measured on giant 3db4 (AMD RX 9060 XT, 16 GB PC; `tools\step3\driver-3db4-*.ps1
 | + one channel per output | 523 K | 423 s | stopped at 24 GB |
 | + V# parameters where the V# is written | 302 K | 298 s | **done: 263 s, peak 13.7 GB** |
 | + uniform window index | 302 K | 256 s | done: 204 s, peak 13.7 GB |
-| + wave branches (>32,768 instructions) | see below | | |
+| + wave branches (>32,768 instructions) | (2.4 MB DXIL) | 148 s | done: 317 s, peak 15.7 GB: worse, taken out |
+| + one dword per output, 32-bit offsets | **262 K** | 246 s | **done: 167 s, peak 7.6 GB** |
 
 * **Answer to "does a 48 GB page file do it?"** For the 05:50 output, no: past 45 GB and
   still going. Now the giant builds, but 13.7 GB for one pipeline is still heavy for a 16 GB PC.
@@ -1835,13 +1836,13 @@ Measured on giant 3db4 (AMD RX 9060 XT, 16 GB PC; `tools\step3\driver-3db4-*.ps1
   address, one page-table entry, one Load4 and a one-channel conversion (~70 DXIL instructions;
   the software floor). The window index is uniform (one buffer, one allocation): no per-lane
   loop in the driver; this cut the driver's time, not its memory.
-* **Wave branches (`Ctx::wave_branches`, programs over `kWaveBranchesFrom` = 32,768
-  instructions):** with lanes as threads, a mask test (execz, vccz, a mask operation's SCC) is
-  each lane's own branch: divergent control flow the host compiler must turn back into masks;
-  for 17,000 blocks that is what the driver's memory goes on (suspected; measuring). For the
-  largest programs the branch is taken on the wave, `WaveActiveAnyTrue(test)`, exactly the
-  console's semantics; masks stay per-lane values. All 28 translator tests pass with it forced
-  on for every program.
+* **Wave branches were tried and taken out:** branching on the wave (`WaveActiveAnyTrue` of the
+  mask test, the console's exact semantics) for programs over 32,768 instructions made the
+  driver worse (15.7 GB, 317 s; larger DXIL). The per-lane branches are not the driver's cost;
+  its memory follows the instruction count.
+* **One dword per output, 32-bit offsets:** a typed load reads only the dword its channel is in
+  (was a 16-byte load and selects) and computes its offset in 32 bits (the console's buffer
+  offsets are 32-bit). 3db4: 262 K instructions, 34 non-uniform handles (was ~3,400).
 * **Only changed programs are rebuilt:** the typed helpers are included only by programs with
   typed loads, wave branches only in programs over the threshold; every other program's
   source is byte-identical. The service's stale check (06:54): 2,515 of 10,505 compiled
@@ -1856,3 +1857,29 @@ Measured on giant 3db4 (AMD RX 9060 XT, 16 GB PC; `tools\step3\driver-3db4-*.ps1
   loads, but D3D12 caps a typed buffer view at 2^27 elements: large windows need a chain of
   views plus a lookup table. Worth it only if typed-load-heavy programs show up as slow on the
   GPU.
+* **Prebuilt:** 3db4's final DXIL is installed in `dxil\rt6` (with its .src key, a by-source
+  copy and a guarded.txt line, `tools\step3\install_dxil.py`) and its pipeline built into the
+  pipeline library (`AM_PREBUILD=<marker> AM_PREBUILD_CACHE=C:\Project Americas\cache am_tests
+  d3d12x_prebuild_compute_pipelines`): a game run loads it instead of building it. (AMD's
+  library entry is small: the compiled code lives in the driver's own disk cache.) 24ea: its
+  DXC compile of the chained form (17 MB HLSL, nesting 60) takes 7.7 GB and over 15 minutes;
+  install and prebuild it the same way once `cache\shaders\bench\r6f-24ea\log.txt` says compiled.
+
+## Next: mesh and geometry shaders (step 4)
+
+The game's pipelines name 18,665 programs; about 5,750 are stages the translator does not
+take: mesh (8,765 in the corpus), geometry (195), ES (195). Every pipeline with one of them
+cannot be built. What a console mesh program does (from the reference furthest along):
+* `s_sendmsg` with message 9 (GS_ALLOC_REQ, counts in M0) asks for its outputs; each lane then
+  exports one vertex (`exp pos`, `exp param`) and one primitive (`exp prim`: three 10-bit vertex
+  indices, bit 31 culls it). Limits from the program's record: vertices and primitives <= 256,
+  threads <= 128, triangles.
+* Host form: `ms_6_6`, `[outputtopology("triangle")] [numthreads(n, 1, 1)]`, outputs `out vertices`
+  (the record's maxima) and `out indices uint3`; `SetMeshOutputCounts(max vertices, max
+  primitives)` at the start (primitives past the program's count culled: written as 0,0,0);
+  `exp pos/param` -> `verts[lane]`, `exp prim` -> `tris[lane]`. A barrier on the path only the
+  allocating lane takes must go (it would hang the host).
+* Runtime: mesh pipelines (stream with MS + the title's PS, no input layout), the user data
+  visible to the mesh stage, `DispatchMesh(x, 1, 1)` for list slot 129 (counted today).
+* Order: stage I/O of the mesh record (stage_io.cpp) -> translator MS emission + a GPU test that
+  draws through a mesh pipeline (gpu_runner) -> runtime pipeline + DispatchMesh -> a game run.
