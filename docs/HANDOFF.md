@@ -2076,3 +2076,47 @@ DXC's on the GPU (compute, VS/PS draw). Before the service uses it: (1) a GPU co
 programs, ours against DXC's (compute: same inputs, compare memory; mesh: a DispatchMesh draw
 test); (2) irreducible flow; (3) an optimizer pass (constant propagation, dead code) for the
 driver's sake and exact flags; (4) the shader service compiling with ours, the giants first.
+
+## Our compiler: optimizer, full survey, driver cost, GPU comparison (2026-11-27, late night)
+
+The session that did this ran out of weekly usage mid-run; its results, from its console and
+messages, and what was done after:
+
+* **Optimizer** (`Module::optimize`, commit 3130f3a): folding, identities, small diamonds as
+  selects, block merging, dead code. 24ea's DXIL 52 MB -> 7.2 MB; 3db4 84,000 blocks -> 25,000.
+  Irreducible programs take the structured or dispatcher form (ours takes those too).
+* **Full corpus survey** (`cache\shaders\bench\ours-survey-full.txt`, all 26,084 programs):
+  **97.3 % compiled by ours and validated** (25,388); pixel 99.9 %, vertex 100 %. Refused: 289
+  mesh programs over 32 KiB of outputs (DXC refuses them too), 195 GS + 195 ES (not translated
+  yet), 10 + 4 untranslated (a source operand, image_sample_o), 3 "Loop must have break" (a loop
+  with no exit: the goto form's runaway guards, below, give every loop one), 25 pixel shaders
+  whose flags the validator corrects (bit 12, tiled resources: its flags are taken). Slowest in
+  ours after the optimizer: 112 s (15ca..., 1.7 MB of HLSL), 93 s, 85 s; 24ea 42 s.
+* **AMD's driver building our DXIL:**
+  - 20 ordinary compute programs: **116 s from ours against 54 s from DXC's** (memory fine).
+    Ours is not ready to replace DXC for programs that nest; it is for what DXC cannot do.
+  - **24ea from ours (optimized) still passes 46 GB in the driver** (stopped after 29 min, where
+    DXC's chained form also failed). The driver's cost is not the CFG form alone.
+  - Registers kept in memory (`registers_in_memory`, an opaque zero index): worse on 24ea and
+    3db4. Left in as an option, off.
+* **GPU comparison, DXC against ours** (`translate_ours_matches_dxc_on_game_programs`,
+  `tools\compare-ours.cmd`): unoptimized, 115 compute programs of 1 container in 20: 47
+  bit-identical, 1 equal to float rounding, **none differ**, 42 too big for the test (>512 KiB),
+  **25 hung the GPU**; optimized: 16 done (6 same, 7 big, 3 hung) when the user stopped it. **Each
+  hang resets the display driver: the user's screen went black while working.** The record did
+  not say which build hung (random inputs can keep a loop going in either).
+* **Fixed now (97c0ef1):** the goto form had no runaway guard (the structured form's loops have
+  `AM_SPIN_LIMIT`); every backward goto (every cycle takes one) now has it. The comparison test
+  cuts runaway loops short in both builds (16,384 passes, marked in the dump: `runaway`, not
+  compared) and names the build on the GPU when it resets (`hung-dxc` / `hung-ours`).
+  **Run the GPU comparison only when the user is away from the PC**, in a fresh state folder.
+
+**Next:**
+1. The giants in AMD's driver (24ea, 3db4, 0849), the main concern. Not tried yet: DXIL's
+   "skip optimization" shader flag (bit 0, which the validator does not check; DXC sets it at
+   -Od) on our module, to see whether the driver compiles it with less; then splitting a giant
+   (its far jumps pick among sub-programs) or finding which driver pass grows (time a few
+   sizes of 3db4-like programs). Cap memory well below 46 GB while the user works.
+2. The GPU comparison again (user away): compute, then a mesh and a VS/PS draw comparison.
+3. Service: DXC for programs that nest (faster in the driver), ours for the rest
+   (`AM_SHADERS_OURS`); the giants only once the driver takes them.
