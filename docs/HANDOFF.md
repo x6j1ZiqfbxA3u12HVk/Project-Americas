@@ -1666,3 +1666,21 @@ list slots from 59 up are two later than in older titles).
   slowly to 4 GB over 6 minutes, then jumped past 49 GB within two minutes and was stopped. No page
   file size makes this practical. The fix has to be smaller DXIL for the far-jump giants (the
   translator's output per instruction), or keeping them out of the driver some other way.
+
+## Step 3, round 1: lean memory access (2026-11-27, ~05:30)
+
+* **What the giants are made of** (`3db4...` DXIL disassembled): 1.82 M instructions in 316,743
+  basic blocks; 17 % branches, 11 % compares, 33,648 raw buffer loads and as many descriptor-handle
+  creations. The giant is mostly scalar code (s_or/s_add/s_and/s_mul, 10,183 scalar loads).
+* **Cause found:** every title-memory access (`am_load`/`am_store`) had two early-return branches and
+  picked its window with `NonUniformResourceIndex`, which makes AMD's driver wrap each access in a
+  per-lane loop. The reference furthest along (and its 16 GB fork) does memory access with no
+  branches: the page index is clamped, a page without memory reads through a null view.
+* **Now:** a null raw UAV at the heap's top slot (`shader::kNullMemoryView` = 65535; texture views
+  start below it); `am_entry` clamps instead of returning, a page without a window selects the null
+  view; scalar loads (`s_load_dword*`, `s_buffer_load_dword*`) use `am_sload/2/4` with a uniform
+  index, 2 or 4 dwords per load within a 64 KiB page. No version bump: existing DXIL keeps working.
+* **Measured on `ca8f...`** (1.5 MB HLSL, game-requested): branches 17,632 -> 12,009; DXC 55 s -> 23 s;
+  driver pipeline build 80 s -> 50 s, **peak 6.8 GB -> 4.5 GB**; DXIL +5 %.
+* Next rounds: the per-instruction `if (AM_ACT)` guards on vector writes, flags (scc) written and
+  never read, the chained form's `am_br` unwinding; then the far-jump giants in the driver again.

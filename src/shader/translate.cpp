@@ -1681,7 +1681,16 @@ const std::unordered_map<std::string, Handler>& table() {
                                    " + uint64_t(int64_t(" + std::to_string(imm) + "))" +
                                    (so == 125 ? std::string() : " + uint64_t(" + c.src(so) + ")");
           c.line("{ uint64_t p = " + addr + ";");
-          for (int k = 0; k < n; ++k) c.line("  " + c.sdst(d + k) + " = am_load(p + " + num(4 * k) + ");");
+          if (n == 1) {
+            c.line("  " + c.sdst(d) + " = am_sload(p);");
+          } else if (n == 2) {
+            c.line("  uint2 q = am_sload2(p); " + c.sdst(d) + " = q.x; " + c.sdst(d + 1) + " = q.y;");
+          } else {
+            for (int g = 0; g < n; g += 4) {
+              c.line("  { uint4 q = am_sload4(p + " + num(4 * g) + "); " + c.sdst(d + g) + " = q.x; " + c.sdst(d + g + 1) + " = q.y; " +
+                     c.sdst(d + g + 2) + " = q.z; " + c.sdst(d + g + 3) + " = q.w; }");
+            }
+          }
           c.line("}");
           return true;
         };
@@ -2236,6 +2245,9 @@ RWByteAddressBuffer am_bindings : register(u2);  // image_bindings.h
 cbuffer am_args : register(b0) { uint4 am_user[8]; uint2 am_base; uint2 am_pad; };
 uint am_offset(uint64_t a) { return uint(a - am_u64(am_base.x, am_base.y)); }
 uint am_load(uint64_t a) { return am_memory.Load(am_offset(a)); }
+uint am_sload(uint64_t a) { return am_memory.Load(am_offset(a)); }
+uint2 am_sload2(uint64_t a) { return am_memory.Load2(am_offset(a)); }
+uint4 am_sload4(uint64_t a) { return am_memory.Load4(am_offset(a)); }
 void am_store(uint64_t a, uint x) { am_memory.Store(am_offset(a), x); }
 // 32-bit atomics by number (swap, cmpswap, add, sub, smin, umin, smax, umax, and, or, xor);
 // the value before. cmpswap writes x where the memory equals `cmp`.
@@ -2279,28 +2291,48 @@ void am_store_masked(uint64_t a, uint x, uint m) {
 const char* kRuntimeBinding = R"(
 cbuffer am_args : register(b0) { uint4 am_user[5]; };
 RWByteAddressBuffer am_bindings : register(u0);  // image_bindings.h, kept by the runtime
+// Title memory: the page table (slot 0) gives each 64 KiB page its window and page in it. No
+// branches (they made the driver's compiler run out of memory on the largest programs): an
+// address past 40 bits takes the table's last entry, which is never filled, and a page without
+// a window reads and writes the null view (AM_NULL_VIEW: zeros, writes dropped).
 uint am_entry(uint64_t a) {
-  if ((a >> 40) != 0) return 0u;
   ByteAddressBuffer t = ResourceDescriptorHeap[0];
-  return t.Load(uint(a >> 16) * 4u);
+  return t.Load(((a >> 40) != 0 ? 0xFFFFFFu : uint(a >> 16)) * 4u);
 }
+uint am_win(uint e) { return e == 0u ? AM_NULL_VIEW : (e >> 16); }
 uint am_at(uint e, uint64_t a) { return ((e & 0xFFFFu) << 16) | (uint(a) & 0xFFFCu); }
 uint am_load(uint64_t a) {
   uint e = am_entry(a);
-  if (e == 0u) return 0u;
-  RWByteAddressBuffer w = ResourceDescriptorHeap[NonUniformResourceIndex(e >> 16)];
+  RWByteAddressBuffer w = ResourceDescriptorHeap[NonUniformResourceIndex(am_win(e))];
   return w.Load(am_at(e, a));
 }
 void am_store(uint64_t a, uint x) {
   uint e = am_entry(a);
-  if (e == 0u) return;
-  RWByteAddressBuffer w = ResourceDescriptorHeap[NonUniformResourceIndex(e >> 16)];
+  RWByteAddressBuffer w = ResourceDescriptorHeap[NonUniformResourceIndex(am_win(e))];
   w.Store(am_at(e, a), x);
+}
+// Scalar loads: the address is the wave's, so the window index is uniform (no per-lane loop in
+// the driver), and two or four dwords come in one load while they stay in one 64 KiB page.
+uint am_sload(uint64_t a) {
+  uint e = am_entry(a);
+  RWByteAddressBuffer w = ResourceDescriptorHeap[am_win(e)];
+  return w.Load(am_at(e, a));
+}
+uint2 am_sload2(uint64_t a) {
+  if ((uint(a) & 0xFFFFu) > 0xFFF8u) return uint2(am_sload(a), am_sload(a + 4u));
+  uint e = am_entry(a);
+  RWByteAddressBuffer w = ResourceDescriptorHeap[am_win(e)];
+  return w.Load2(am_at(e, a));
+}
+uint4 am_sload4(uint64_t a) {
+  if ((uint(a) & 0xFFFFu) > 0xFFF0u) return uint4(am_sload(a), am_sload(a + 4u), am_sload(a + 8u), am_sload(a + 12u));
+  uint e = am_entry(a);
+  RWByteAddressBuffer w = ResourceDescriptorHeap[am_win(e)];
+  return w.Load4(am_at(e, a));
 }
 uint am_atomic(uint op, uint64_t a, uint x, uint cmp) {
   uint e = am_entry(a), o = 0u;
-  if (e == 0u) return 0u;
-  RWByteAddressBuffer w = ResourceDescriptorHeap[NonUniformResourceIndex(e >> 16)];
+  RWByteAddressBuffer w = ResourceDescriptorHeap[NonUniformResourceIndex(am_win(e))];
   uint at = am_at(e, a);
   if (op == 0u) w.InterlockedExchange(at, x, o);
   else if (op == 1u) w.InterlockedCompareExchange(at, cmp, x, o);
@@ -2328,8 +2360,7 @@ uint am_atomic(uint op, uint64_t a, uint x, uint cmp) {
 void am_store_masked(uint64_t a, uint x, uint m) {
   if (m == 0xFFFFFFFFu) { am_store(a, x); return; }
   uint e = am_entry(a);
-  if (e == 0u) return;
-  RWByteAddressBuffer w = ResourceDescriptorHeap[NonUniformResourceIndex(e >> 16)];
+  RWByteAddressBuffer w = ResourceDescriptorHeap[NonUniformResourceIndex(am_win(e))];
   w.InterlockedAnd(am_at(e, a), ~m);
   w.InterlockedOr(am_at(e, a), x & m);
 }
@@ -3252,6 +3283,7 @@ Translation finish_graphics(const TranslateInput& in, const Ctx& c, Translation 
   std::string h;
   h += "// Translated by Project Americas' shader translator, version " + num(kTranslatorVersion) + ".\n";
   h += kHelpers;
+  h += "#define AM_NULL_VIEW " + num(kNullMemoryView) + "u\n";
   h += binding == Binding::Runtime ? kRuntimeBinding : kTestBinding;
   h += format_table();
   h += kBufferHelpers;
@@ -3507,6 +3539,7 @@ Translation translate(const TranslateInput& in, Binding binding) {
   std::string h;
   h += "// Translated by Project Americas' shader translator, version " + num(kTranslatorVersion) + ".\n";
   h += kHelpers;
+  h += "#define AM_NULL_VIEW " + num(kNullMemoryView) + "u\n";
   h += binding == Binding::Runtime ? kRuntimeBinding : kTestBinding;
   h += format_table();
   h += kBufferHelpers;

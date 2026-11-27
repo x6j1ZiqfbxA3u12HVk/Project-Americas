@@ -28,6 +28,9 @@ namespace am::shader {
 
 // Bumped whenever the output for some input changes: part of the cache key.
 constexpr uint32_t kTranslatorVersion = 5;
+// The shader-visible heap slot of a null raw UAV (reads give zero, writes are dropped): title
+// memory a page without a GPU window maps to, so memory access needs no branch.
+constexpr uint32_t kNullMemoryView = 65535;
 
 enum class Binding : uint8_t { Test, Runtime };
 

@@ -11,6 +11,7 @@
 
 #include "core/text.h"
 #include "runtime/log.h"
+#include "shader/translate.h"
 #include "runtime/memory/title_memory.h"
 #include "runtime/memory/write_watch.h"
 #include "runtime/present/host_gpu.h"
@@ -24,6 +25,7 @@ constexpr uint64_t kPage = 64 * 1024;
 constexpr uint64_t kAddressBits = 40;
 constexpr uint64_t kTableEntries = (uint64_t{1} << kAddressBits) / kPage;  // 16 Mi entries, 64 MiB
 constexpr uint32_t kHeapSize = 65536;  // windows from index 1 up, texture views from the top down
+static_assert(shader::kNullMemoryView == kHeapSize - 1, "the null view is the heap's top slot");
 
 struct Window {
   uint64_t base = 0, size = 0;
@@ -63,7 +65,7 @@ struct GpuMemory {
   std::map<uint64_t, GpuRun> gpu_runs;
   std::atomic<uint64_t> pool_mirror{0};  // the CPU address of the pool window's mirror view
   UINT step = 0;
-  uint32_t next_view = kHeapSize;  // the lowest index handed out to a texture view so far
+  uint32_t next_view = shader::kNullMemoryView;  // the lowest index handed out to a texture view so far (the null view above)
   std::vector<uint32_t> free_views;  // given back (release_view_slot), handed out first
   uint32_t pool_window = 0;  // the committed physical page pool's window, once opened
 
@@ -90,6 +92,19 @@ struct GpuMemory {
     sv.Buffer.NumElements = static_cast<UINT>(kTableEntries);
     sv.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
     device->CreateShaderResourceView(table.Get(), &sv, heap->GetCPUDescriptorHandleForHeapStart());
+    // The null view (shader::kNullMemoryView, the heap's top slot): a raw UAV over no resource, which
+    // reads zeros and drops writes. Translated programs reach title memory without a GPU window
+    // through it instead of branching around the access.
+    {
+      D3D12_UNORDERED_ACCESS_VIEW_DESC nv{};
+      nv.Format = DXGI_FORMAT_R32_TYPELESS;
+      nv.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+      nv.Buffer.NumElements = 1;
+      nv.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+      D3D12_CPU_DESCRIPTOR_HANDLE at = heap->GetCPUDescriptorHandleForHeapStart();
+      at.ptr += SIZE_T{shader::kNullMemoryView} * step;
+      device->CreateUnorderedAccessView(nullptr, nullptr, &nv, at);
+    }
 
     D3D12_ROOT_PARAMETER1 params[2]{};
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
