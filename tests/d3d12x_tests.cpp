@@ -3,8 +3,14 @@
 #include <windows.h>
 #include <d3d12.h>
 #include <dxgi.h>
+#include <dxgi1_4.h>
+#include <psapi.h>
 
+#include <algorithm>
+#include <chrono>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <vector>
 
 #include "runtime/d3d12x/commands.h"
@@ -644,4 +650,81 @@ TEST_CASE(d3d12x_translated_program_uses_title_memory_in_place) {
   CHECK(SUCCEEDED(gpu->device->GetDeviceRemovedReason()));
   CHECK(mem[0x40] == 42);  // 40 + 2, written by the GPU into the title's own pages
   VirtualFree(mem, 0, MEM_RELEASE);
+}
+
+// What the driver's pipeline compiles cost the process: with AM_PIPELINE_MEMORY set to a folder
+// of compiled programs (the shader service's dxil folder), the largest compute programs there
+// (AM_PIPELINE_MEMORY_COUNT, default 12) are made into pipelines one at a time, and the process
+// commit and the GPU's memory are logged around each. Nothing runs on the GPU. Without the
+// variable the test does nothing.
+TEST_CASE(d3d12x_driver_pipeline_memory) {
+  using namespace am;
+  char dir[1024] = {}, count_text[32] = {};
+  if (!GetEnvironmentVariableA("AM_PIPELINE_MEMORY", dir, sizeof dir)) return;
+  const size_t count = GetEnvironmentVariableA("AM_PIPELINE_MEMORY_COUNT", count_text, sizeof count_text) ? std::stoul(count_text) : 12;
+  rt::present::HostGpu* gpu = rt::present::host_gpu();
+  if (!gpu) return;
+  ID3D12RootSignature* root = translated_root_signature();
+  CHECK(root != nullptr);
+  if (!root) return;
+  // The program kind of a DXIL container: its DXIL part's version word, kind in the high half.
+  const auto kind_of = [](const std::vector<uint8_t>& b) -> int {
+    if (b.size() < 32 || std::memcmp(b.data(), "DXBC", 4) != 0) return -1;
+    uint32_t parts = 0;
+    std::memcpy(&parts, b.data() + 28, 4);
+    for (uint32_t k = 0; k < parts && 32 + 4 * k + 4 <= b.size(); ++k) {
+      uint32_t at = 0;
+      std::memcpy(&at, b.data() + 32 + 4 * k, 4);
+      if (at + 12 > b.size()) return -1;
+      if (std::memcmp(b.data() + at, "DXIL", 4) == 0) {
+        uint32_t version = 0;
+        std::memcpy(&version, b.data() + at + 8, 4);
+        return static_cast<int>(version >> 16);
+      }
+    }
+    return -1;
+  };
+  std::vector<std::pair<uintmax_t, std::filesystem::path>> files;
+  std::error_code ec;
+  for (const auto& e : std::filesystem::directory_iterator(dir, ec)) {
+    if (e.path().extension() == ".dxil") files.emplace_back(e.file_size(ec), e.path());
+  }
+  std::sort(files.begin(), files.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+  const auto commit = [] {
+    PROCESS_MEMORY_COUNTERS_EX pm{};
+    pm.cb = sizeof pm;
+    GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pm), sizeof pm);
+    return static_cast<double>(pm.PrivateUsage) / (1 << 20);
+  };
+  Microsoft::WRL::ComPtr<IDXGIAdapter3> a3;
+  gpu->adapter.As(&a3);
+  const auto video = [&](DXGI_MEMORY_SEGMENT_GROUP group) {
+    DXGI_QUERY_VIDEO_MEMORY_INFO i{};
+    if (a3) a3->QueryVideoMemoryInfo(0, group, &i);
+    return static_cast<double>(i.CurrentUsage) / (1 << 20);
+  };
+  std::printf("    start: commit %.0f MiB, GPU local %.0f MiB, shared %.0f MiB\n", commit(), video(DXGI_MEMORY_SEGMENT_GROUP_LOCAL),
+              video(DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL));
+  std::vector<Microsoft::WRL::ComPtr<ID3D12PipelineState>> made;
+  for (const auto& [size, path] : files) {
+    if (made.size() >= count) break;
+    std::ifstream in(path, std::ios::binary);
+    std::vector<uint8_t> b((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    if (kind_of(b) != 5) continue;
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
+    pd.pRootSignature = root;
+    pd.CS = {b.data(), b.size()};
+    const double before = commit(), local_before = video(DXGI_MEMORY_SEGMENT_GROUP_LOCAL);
+    const auto t0 = std::chrono::steady_clock::now();
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> pso;
+    const HRESULT hr = gpu->device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&pso));
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    std::printf("    %s: %.0f KiB of DXIL, 0x%08lx, %.0f ms, commit %+.1f MiB (now %.0f), GPU local %+.1f MiB\n",
+                path.stem().string().substr(0, 16).c_str(), size / 1024.0, static_cast<unsigned long>(hr), ms, commit() - before, commit(),
+                video(DXGI_MEMORY_SEGMENT_GROUP_LOCAL) - local_before);
+    if (SUCCEEDED(hr)) made.push_back(pso);
+  }
+  std::printf("    %zu made: commit %.0f MiB, GPU local %.0f MiB\n", made.size(), commit(), video(DXGI_MEMORY_SEGMENT_GROUP_LOCAL));
+  made.clear();
+  std::printf("    released: commit %.0f MiB, GPU local %.0f MiB\n", commit(), video(DXGI_MEMORY_SEGMENT_GROUP_LOCAL));
 }

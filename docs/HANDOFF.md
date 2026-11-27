@@ -1546,3 +1546,25 @@ loading does). Work that way.
   values** (no register arrays): programs fit in registers, no scratch, much faster DXC compiles
   too. That is the next big task. Until then runs end around 24 GB on this PC (the watch in the
   test command ends them; one run with no limit reached 36 GB and took the system to 63 GB).
+
+## Shader service idle work; register arrays are not the memory problem (2026-11-27, late)
+
+* **Service:** `am-shaders serve [jobs] [demand]`: the game's requests (wanted-first.txt) first,
+  always; when nothing waits, the rest of what its pipelines need plus guard upgrades, on all
+  workers but two (kept free for the game's next request). `demand` = requests only. Built and
+  running (process started 01:10, `cache\shaders\service\am-shaders-165e00-...exe`).
+* **The "registers as plain values" rewrite is not worth doing.** Tested: DXC already turns the
+  `s[]`/`v[]` arrays into plain values at -O3. The 73 KB compute pipeline blamed for +388 MB has
+  no `alloca` in its DXIL; a 769 KB PS converted to scalar registers compiled 10.9 s → 10.5 s,
+  same peak memory (~250 MB), same DXIL size. Not done; no translator output changed.
+* **Where stack (scratch) memory does appear:** 153 of 400 sampled DXILs have `alloca`s:
+  (a) small `[4 x i32]` helper arrays indexed by a lane-derived value (`w[x >> 5] |= ...`) —
+  find that helper and replace the dynamic index with selects; (b) the huge programs compiled
+  with `-O0` (2-3 MB DXIL, hundreds of `alloca i32`): the driver must optimize those itself.
+* **The +388 MB sample was noisy:** it overlapped opening the 2.1 GiB GPU window, and it is the
+  only pipeline logged in that run. Next: run the new test
+  `AM_PIPELINE_MEMORY=C:\Project Americas\cache\shaders\dxil\rt5 am_tests d3d12x_driver_pipeline_memory`
+  (makes the largest compute programs into pipelines, logs commit/GPU memory around each, never
+  dispatches). Its first run was cut off with the session; result unknown — rerun it.
+* Still open: loading screen art, device slot 71 (placed UAV), mesh/geometry shaders, real
+  raytracing intersection.

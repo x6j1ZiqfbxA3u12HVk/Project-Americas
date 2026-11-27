@@ -815,9 +815,9 @@ int serve(const fs::path& pack_dir, const fs::path& runtime_dir, const fs::path&
         at = comma + 1;
       }
     }
-    // On demand by default: only what the game asks for (wanted-first.txt) is compiled, most
-    // needed first, and kept. With `all`, the game's other pipelines' programs and the programs
-    // compiled before the runaway guards follow when nothing is waiting.
+    // What the game asks for (wanted-first.txt) comes first, always. When nothing waits (and
+    // not `demand`), the game's other pipelines' programs, then programs compiled before the
+    // runaway guards, on all workers but two.
     for (const std::string& m : listed) {
       if (everything && where.count(m) && !fs::exists(out_dir / widen(m + ".dxil"), ec)) bulk.push_back(m);
     }
@@ -865,6 +865,7 @@ int serve(const fs::path& pack_dir, const fs::path& runtime_dir, const fs::path&
   std::map<std::string, size_t> refusals;  // by reason (its first 60 characters)
   int busy = 0;                            // workers compiling (under `lock`)
   bool stopping = false;                   // asked to stop: workers take nothing new
+  int idle_busy = 0;                       // workers on idle work (not asked for by the game)
   int huge_busy = 0;                       // compiles of over 1 MiB of HLSL running (under `lock`)
   std::vector<std::pair<std::string, bool>> deferred_huge;  // large ones set aside (marker, waited)
   // Room for another large compile (under `lock`): none running, or 4.5 GB of RAM free.
@@ -1005,10 +1006,11 @@ int serve(const fs::path& pack_dir, const fs::path& runtime_dir, const fs::path&
     std::thread([&] {
       for (;;) {
         std::string marker;
-        bool waited = false;
+        bool waited = false, idle_item = false;
         {
           std::lock_guard<std::mutex> g(lock);
           if (stopping) return;  // asked to stop: no new work
+          idle_item = false;
           // A large program set aside, once a large-compile slot is free.
           if (!deferred_huge.empty() && huge_room()) {
             marker = deferred_huge.front().first;
@@ -1020,16 +1022,20 @@ int serve(const fs::path& pack_dir, const fs::path& runtime_dir, const fs::path&
             urgent.pop_front();
             if (taken.insert(m).second) marker = m, waited = true;
           }
-          while (marker.empty() && !bulk.empty()) {
+          // Idle work (nothing the game waits for): at most all workers but two, so two are free
+          // for the game's next request (a compile in progress cannot be stopped).
+          const bool idle_room = idle_busy + 2 < static_cast<int>(jobs) || (jobs <= 2 && idle_busy == 0);
+          while (marker.empty() && idle_room && !bulk.empty()) {
             std::string m = bulk.back();
             bulk.pop_back();
-            if (taken.insert(m).second) marker = m;
+            if (taken.insert(m).second) marker = m, idle_item = true;
           }
-          while (marker.empty() && !upgrades.empty()) {
+          while (marker.empty() && idle_room && !upgrades.empty()) {
             std::string m = upgrades.back();
             upgrades.pop_back();
-            if (taken.insert(m).second) marker = m;
+            if (taken.insert(m).second) marker = m, idle_item = true;
           }
+          if (idle_item) ++idle_busy;
           if (!marker.empty()) {
             ++busy;
             idle_told = false;
@@ -1062,6 +1068,7 @@ int serve(const fs::path& pack_dir, const fs::path& runtime_dir, const fs::path&
         }
         std::lock_guard<std::mutex> g(lock);
         --busy;
+        if (idle_item) --idle_busy;
       }
     }).detach();
   }
