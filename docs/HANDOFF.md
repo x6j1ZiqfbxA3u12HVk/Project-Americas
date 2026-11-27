@@ -1706,3 +1706,34 @@ list slots from 59 up are two later than in older titles).
   2.0 GB of private bytes (sampled from the test process every 250 ms).
 * Measuring tip: the driver caches pipelines by DXIL, so a second build of the same DXIL takes a
   few ms and shows nothing; compare fresh DXIL only.
+
+## Step 3, round 4: in progress at session end (2026-11-27, ~05:35)
+
+* **Not applied yet** (translate.cpp is unchanged since `fa77a39`). The edit script is
+  `C:\Project Americas\tools\step3\round4.py`. Its one bug: the `WaveActiveBallot(cy && AM_ACT
+  != 0u)` line with 6-space indent occurs 3 times, not 2. Set that `rep(..., 2)` to 3 and delete
+  the next `rep` (the 8-space variant), then run `python -I round4.py`, build, test, re-measure.
+* What it does: `Ctx::vwrite` emits `v[n] = select(act, e, v[n])` instead of `if (act) v[n] = e;`
+  (`guard=true` keeps the branch for the `ds_read_b32` LDS read). `act()` with DPP uses `and()`.
+  Selects replace the guarded writes in the carries, permlane, `v_mad_u64_u32` and buffer/global
+  loads. Ballots use `and(cond, act)`. Compares lg/o/u/nlg, the legacy mul/fma, cndmask,
+  cvt_i32/u32_f64, ffbh, s_flbit, s_cselect and `scc ? 1u : 0u` drop `&&`, `||` and `?:`.
+  The atomic `4u <= lim ? am_atomic(...)` stays a branch (side effect).
+* Why: in ca8f after round 3, 1,985 of 3,347 conditional branches are `AM_ACT` lane guards
+  (1,318 single guarded writes plus 887 merged runs). The ca8f HLSL still has 2,194 `||` and
+  2,540 `?:`. Check whether `merge_lane_guards` tests need updating.
+* Tools: `tools\step3\brsrc.py <file.ll>` classifies branch conditions (get the .ll with
+  `C:\VulkanSDK\1.4.363.0\Bin\dxc.exe -dumpbin x.dxil`). `tools\step3\peak.ps1 -Dir <dxil dir>`
+  runs the driver pipeline test and samples peak private bytes (fresh DXIL only; the driver
+  caches).
+* **Running at session end:**
+  * The 3db4 giant is compiling with round 3 (`cache\shaders\bench\am-shaders-r3.exe translate
+    3db4... --raw <scratchpad>\r3-3db4`). The scratchpad may vanish; rerun it into a durable
+    folder if needed, then run `peak.ps1` on it with `-StopGB 46`. That tells whether the far-jump
+    giants now fit in the driver (before: >49 GB).
+  * The old service (pid 12512, build 0243) is still compiling 24ea in the old bloated form. It
+    will need recompiling with the lean translator anyway.
+* Next: finish round 4 → measure ca8f and 3db4. If the giants fit, restart the shader service
+  with the new build and make 3db4/0849/24ea recompile (their old DXIL must be removed or
+  rekeyed; the cache cleanup needs the user's OK). Then run the game (black world, stall near
+  frame 2,786 with 8 unmet GPU waits).
