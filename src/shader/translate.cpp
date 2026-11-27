@@ -1635,7 +1635,20 @@ const std::unordered_map<std::string, Handler>& table() {
       static const char* const kChan[] = {"x", "y", "z", "w"};
       const HwStage stage = c.input->stage;
       std::string field;
-      if (stage == HwStage::Vs && tgt == 12) field = "am_o.pos";
+      if (stage == HwStage::Ms) {
+        // Lane n exports vertex n (pos, param N) and primitive n (prim: three 10-bit vertex
+        // indices, bit 31 culls it: all three 0, no area).
+        if (tgt == 20) {
+          c.touch_v(src[0]);
+          c.line("if (AM_ACT != 0u) { uint x = v[" + num(src[0]) + "]; am_tris[am_flat] = select(asint(x) < 0, uint3(0u, 0u, 0u), "
+                 "uint3(x & 0x3FFu, (x >> 10) & 0x3FFu, (x >> 20) & 0x3FFu)); }");
+          return true;
+        }
+        if (tgt == 12) field = "am_verts[am_flat].pos";
+        else if (tgt >= 32 && tgt < 64 && tgt - 32 < c.input->outputs.size()) field = "am_verts[am_flat].o" + num(tgt - 32);
+        else if (tgt == 9 || (tgt >= 13 && tgt < 16) || tgt >= 32) return true;  // null, other positions, unused params
+        else return c.fail("mesh exp to target " + num(tgt));
+      } else if (stage == HwStage::Vs && tgt == 12) field = "am_o.pos";
       else if (stage == HwStage::Vs && tgt >= 32 && tgt < 64 && tgt - 32 < c.input->outputs.size()) field = "am_o.o" + num(tgt - 32);
       else if (stage == HwStage::Ps && tgt < 8 && tgt < c.input->outputs.size()) field = "am_o.o" + num(tgt);
       else if (stage == HwStage::Ps && tgt == 8) {
@@ -1655,7 +1668,7 @@ const std::unordered_map<std::string, Handler>& table() {
       else return c.fail("exp to target " + num(tgt));
       std::string body;
       for (uint32_t k = 0; k < 4; ++k) {
-        if (!((en >> k) & 1u) && !(compr && stage == HwStage::Vs && k < 2)) continue;
+        if (!((en >> k) & 1u) && !(compr && stage != HwStage::Ps && k < 2)) continue;
         std::string value;
         if (compr && stage == HwStage::Ps) {
           const uint32_t r = src[k / 2];
@@ -1764,8 +1777,17 @@ const std::unordered_map<std::string, Handler>& table() {
       return true;
     };
     t["s_barrier"] = [](Ctx& c) {
+      // A mesh program's barriers order its output request (one lane takes that path: a
+      // barrier there would hang the host) and LDS; without LDS there is nothing to order.
+      if (c.input->stage == HwStage::Ms && c.input->lds_bytes == 0) return true;
       c.line("GroupMemoryBarrierWithGroupSync();");
       return true;
+    };
+    t["s_sendmsg"] = [](Ctx& c) {
+      // Mesh: GS_ALLOC_REQ (9), the output request: SetMeshOutputCounts with the record's maxima
+      // runs at the start, unused primitives stay culled.
+      if (c.input->stage == HwStage::Ms && (c.f(Field::SIMM16) & 0xF) == 9) return true;
+      return c.fail("s_sendmsg " + num(c.f(Field::SIMM16)));
     };
 
     // -- scalar memory --
@@ -3903,8 +3925,9 @@ Translation translate(const TranslateInput& in, Binding binding) {
   Translation tr;
   tr.wave_size = in.wave32 ? 32 : 64;
   const bool graphics = in.stage == HwStage::Vs || in.stage == HwStage::Ps;
-  if (in.stage != HwStage::Cs && !graphics) {
-    tr.failure = std::string("stage ") + hw_stage_name(in.stage) + " (compute, vertex and pixel only so far)";
+  const bool mesh = in.stage == HwStage::Ms;
+  if (in.stage != HwStage::Cs && !graphics && !mesh) {
+    tr.failure = std::string("stage ") + hw_stage_name(in.stage) + " (compute, mesh, vertex and pixel only so far)";
     tr.unsupported[tr.failure] = 1;
     return tr;
   }
@@ -3941,7 +3964,9 @@ Translation translate(const TranslateInput& in, Binding binding) {
   std::unordered_map<uint32_t, MaskKinds> kinds_at;
   {
     uint32_t init;
-    if (graphics) {
+    if (mesh) {
+      init = 8 + std::min<uint32_t>(in.ms_user_sgprs, binding == Binding::Runtime ? 20u : 32u);
+    } else if (graphics) {
       init = std::min<uint32_t>(in.user_sgprs, binding == Binding::Runtime ? 20u : 32u);
     } else {
       init = (in.cs_rsrc2 >> 1) & 31;
@@ -4118,28 +4143,66 @@ Translation translate(const TranslateInput& in, Binding binding) {
   }
   h += lane_macros(c.wave64, c.lane);
   if (c.uses_lds || in.lds_bytes) h += "groupshared uint am_lds[" + num(std::max<uint32_t>(in.lds_bytes / 4, 1)) + "];\n";
-  const uint32_t tx = std::max<uint32_t>(in.cs_threads[0], 1), ty = std::max<uint32_t>(in.cs_threads[1], 1),
-                 tz = std::max<uint32_t>(in.cs_threads[2], 1);
-  h += "\n[numthreads(" + num(tx) + ", " + num(ty) + ", " + num(tz) + ")]\n[WaveSize(" + num(tr.wave_size) + ")]\n";
-  h += "void main(uint3 am_tid : SV_GroupThreadID, uint3 am_gid : SV_GroupID, uint am_flat : SV_GroupIndex) {\n";
+  const uint32_t tx = mesh ? std::max<uint32_t>(in.ms_threads, 1) : std::max<uint32_t>(in.cs_threads[0], 1),
+                 ty = mesh ? 1 : std::max<uint32_t>(in.cs_threads[1], 1), tz = mesh ? 1 : std::max<uint32_t>(in.cs_threads[2], 1);
+  if (mesh) {
+    // A mesh program: lane n of the group writes vertex n and primitive n; the record's maxima
+    // are the outputs (a primitive the program does not export stays culled).
+    if (in.ms_threads == 0 || in.ms_threads > 128 || in.ms_max_vertices > 256 || in.ms_max_primitives > 256) {
+      tr.failure = "a mesh program beyond the host's limits";
+      tr.unsupported[tr.failure] = 1;
+      return tr;
+    }
+    tr.profile = "ms_6_6";
+    h += "struct AmMeshVert {\n  float4 pos : SV_Position;\n";
+    for (size_t k = 0; k < in.outputs.size(); ++k) {
+      h += "  float4 o" + num(static_cast<uint32_t>(k)) + " : " + in.outputs[k].semantic + num(in.outputs[k].semantic_index) + ";\n";
+    }
+    h += "};\n";
+    h += "\n[outputtopology(\"triangle\")]\n[numthreads(" + num(tx) + ", 1, 1)]\n";
+    h += "void main(uint3 am_gid : SV_GroupID, uint am_flat : SV_GroupIndex, out vertices AmMeshVert am_verts[" +
+         num(std::max<uint32_t>(in.ms_max_vertices, 1)) + "], out indices uint3 am_tris[" + num(std::max<uint32_t>(in.ms_max_primitives, 1)) +
+         "]) {\n";
+    h += "  SetMeshOutputCounts(" + num(std::max<uint32_t>(in.ms_max_vertices, 1)) + ", " + num(std::max<uint32_t>(in.ms_max_primitives, 1)) + ");\n";
+    h += "  if (am_flat < " + num(std::max<uint32_t>(in.ms_max_primitives, 1)) + "u) am_tris[am_flat] = uint3(0u, 0u, 0u);\n";
+  } else {
+    h += "\n[numthreads(" + num(tx) + ", " + num(ty) + ", " + num(tz) + ")]\n[WaveSize(" + num(tr.wave_size) + ")]\n";
+    h += "void main(uint3 am_tid : SV_GroupThreadID, uint3 am_gid : SV_GroupID, uint am_flat : SV_GroupIndex) {\n";
+  }
   h += "  uint s[128];\n  uint v[" + num(nv) + "];\n" + (c.uses_movrel ? "  const uint am_nv = " + num(nv) + "u;\n" : std::string()) + " ";
   for (uint32_t i = 0; i < 128; ++i) h += " s[" + num(i) + "] = 0u;";
   h += "\n ";
   for (uint32_t j = 0; j < nv; ++j) h += " v[" + num(j) + "] = 0u;";
   h += "\n";
-  h += "  uint am_null = 0u;\n  bool scc = false;\n  uint am_lane = WaveGetLaneIndex();\n";
+  // A mesh program's lane is the console's (the group's lane over its wave size): the host's
+  // waves need not match, the program reads no other lanes.
+  h += std::string("  uint am_null = 0u;\n  bool scc = false;\n  uint am_lane = ") +
+       (mesh ? "am_flat & " + num(c.wave64 ? 63 : 31) + "u" : std::string("WaveGetLaneIndex()")) + ";\n";
   h += "  uint am_dpp = 0u;\n  bool am_dpp_on = true;\n";
   for (const uint32_t r : c.image_vars) h += "  AmImage am_im_" + num(r) + " = (AmImage)0;\n";
   for (const uint32_t r : c.sampler_vars) h += "  AmSampler am_sm_" + num(r) + " = (AmSampler)0;\n";
-  for (uint32_t i = 0; i < (binding == Binding::Runtime ? std::min(user, 20u) : user); ++i) h += "  s[" + num(i) + "] = am_user[" + num(i / 4) + "][" + num(i % 4) + "];\n";
+  if (mesh) {
+    // Eight system SGPRs, then the user data from s8: s3 bits 24-27 the wave's index in the
+    // group; v5 the group's id times the group's size (max of lanes, vertices, primitives).
+    const uint32_t mu = binding == Binding::Runtime ? std::min(in.ms_user_sgprs, 20u) : in.ms_user_sgprs;
+    for (uint32_t i = 0; i < mu; ++i) h += "  s[" + num(8 + i) + "] = am_user[" + num(i / 4) + "][" + num(i % 4) + "];\n";
+    h += "  s[3] = (am_flat >> " + num(c.wave64 ? 6 : 5) + "u) << 24;\n";
+    const uint32_t stride = std::max({in.ms_threads, in.ms_max_vertices, in.ms_max_primitives});
+    if (nv > 5) h += "  v[5] = am_gid.x * " + num(stride) + "u;\n";
+  }
+  for (uint32_t i = 0; i < (mesh ? 0u : binding == Binding::Runtime ? std::min(user, 20u) : user); ++i) {
+    h += "  s[" + num(i) + "] = am_user[" + num(i / 4) + "][" + num(i % 4) + "];\n";
+  }
   uint32_t next_s = user;
-  for (int k = 0; k < 3; ++k) {
+  for (int k = 0; k < 3 && !mesh; ++k) {
     if ((in.cs_rsrc2 >> (7 + k)) & 1) h += "  s[" + num(next_s++) + "] = am_gid[" + num(k) + "];\n";
   }
-  if ((in.cs_rsrc2 >> 10) & 1) h += "  s[" + num(next_s++) + "] = 0u;  // thread-group info: not filled yet\n";
-  h += "  v[0] = am_tid.x;\n";
-  if (tid_comps >= 1) h += "  v[1] = am_tid.y;\n";
-  if (tid_comps >= 2) h += "  v[2] = am_tid.z;\n";
+  if (!mesh && (in.cs_rsrc2 >> 10) & 1) h += "  s[" + num(next_s++) + "] = 0u;  // thread-group info: not filled yet\n";
+  if (!mesh) {
+    h += "  v[0] = am_tid.x;\n";
+    if (tid_comps >= 1) h += "  v[1] = am_tid.y;\n";
+    if (tid_comps >= 2) h += "  v[2] = am_tid.z;\n";
+  }
   h += initial_exec(c.wave64, c.lane, false);
   for (const uint32_t r : c.typed_vs) {
     h += "  AmTyped am_tb" + num(r) + " = am_typed(uint4(s[" + num(r) + "], s[" + num(r + 1) + "], s[" + num(r + 2) + "], s[" + num(r + 3) + "]));\n";

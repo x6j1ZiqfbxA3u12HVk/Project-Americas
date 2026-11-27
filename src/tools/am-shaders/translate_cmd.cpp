@@ -74,10 +74,14 @@ std::optional<Loaded> load(const fs::path& file, std::string& error) {
 shader::TranslateInput input_of(const std::vector<uint8_t>& container, const shader::NativeBlob& b,
                                 const shader::NativeProgram& p, std::string* io_error = nullptr) {
   shader::TranslateInput in;
-  if (p.stage == shader::HwStage::Vs || p.stage == shader::HwStage::Ps) {
+  if (p.stage == shader::HwStage::Vs || p.stage == shader::HwStage::Ps || p.stage == shader::HwStage::Ms) {
     std::string why;
     if (!shader::read_stage_io(container, b, p, in, why) && io_error) *io_error = why;
   }
+  in.ms_threads = p.ms_threads;
+  in.ms_max_vertices = p.ms_max_vertices;
+  in.ms_max_primitives = p.ms_max_primitives;
+  in.ms_user_sgprs = p.ms_user_sgprs;
   const auto bytes = b.code(p);
   in.code = {reinterpret_cast<const uint32_t*>(bytes.data()), bytes.size() / 4};
   in.stage = p.stage;
@@ -200,6 +204,7 @@ int translation_survey(const fs::path& pack_dir, const fs::path& out_json, size_
   std::mutex lock;
   std::map<std::string, uint64_t> missing, stages_total, stages_ok, stages_structured, stages_lanes;  // missing: programs blocked by it
   std::map<std::string, uint64_t> mesh_shapes;  // mesh programs by their record's limits
+  std::map<std::string, std::string> mesh_examples;  // a container of each
   std::map<std::string, uint64_t> first_missing;
   std::vector<std::pair<std::string, shader::Translation>> to_compile;
   std::atomic<size_t> next{0};
@@ -219,6 +224,7 @@ int translation_survey(const fs::path& pack_dir, const fs::path& out_json, size_
               char key[96];
               std::snprintf(key, sizeof key, "lanes %u, vertices %u, primitives %u, topology %u, user SGPRs %u", p.ms_threads,
                             p.ms_max_vertices, p.ms_max_primitives, p.ms_topology, p.ms_user_sgprs);
+              if (!mesh_shapes.count(key)) mesh_examples[key] = narrow(files[i].stem().wstring());
               ++mesh_shapes[key];
             }
             if (t.ok) {
@@ -316,7 +322,8 @@ int translation_survey(const fs::path& pack_dir, const fs::path& out_json, size_
     std::sort(shapes.rbegin(), shapes.rend());
     std::printf("mesh programs by their limits:\n");
     for (size_t k = 0; k < shapes.size() && k < 15; ++k) {
-      std::printf("  %6llu  %s\n", static_cast<unsigned long long>(shapes[k].first), shapes[k].second.c_str());
+      std::printf("  %6llu  %s (e.g. %s)\n", static_cast<unsigned long long>(shapes[k].first), shapes[k].second.c_str(),
+                  mesh_examples[shapes[k].second].c_str());
     }
   }
   std::sort(slowest.rbegin(), slowest.rend());
@@ -829,7 +836,10 @@ int serve(const fs::path& pack_dir, const fs::path& runtime_dir, const fs::path&
             const shader::NativeBlob& b = shader->shader.blobs[bi];
             for (size_t pi = 0; pi < b.programs.size(); ++pi) {
               const shader::NativeProgram& pr = b.programs[pi];
-              if (pr.stage != shader::HwStage::Vs && pr.stage != shader::HwStage::Ps && pr.stage != shader::HwStage::Cs) continue;
+              if (pr.stage != shader::HwStage::Vs && pr.stage != shader::HwStage::Ps && pr.stage != shader::HwStage::Cs &&
+                  pr.stage != shader::HwStage::Ms) {
+                continue;
+              }
               const std::string marker = marker_of(b.code(pr));
               std::vector<uint32_t> code(b.code(pr).size() / 4);
               std::memcpy(code.data(), b.code(pr).data(), code.size() * 4);

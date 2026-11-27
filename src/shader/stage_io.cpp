@@ -120,6 +120,22 @@ bool read_stage_io(std::span<const uint8_t> container, const NativeBlob& blob, c
     for (size_t k = 0; k < in.outputs.size(); ++k) in.outputs[k].semantic_index = static_cast<uint32_t>(k);
     return true;
   }
+  if (program.stage == HwStage::Ms) {
+    // Per-vertex outputs as a vertex shader's parameters; per-primitive ones (PSG1) not yet.
+    for (const Element& e : read_signature(c->find("PSG1"))) {
+      if (e.system_value == 0) {
+        error = "mesh per-primitive outputs";
+        return false;
+      }
+    }
+    std::vector<Element> params;
+    for (const Element& e : osg) {
+      if (e.system_value == 0) params.push_back(e);
+    }
+    std::sort(params.begin(), params.end(), [](const Element& a, const Element& b) { return a.reg < b.reg; });
+    for (const Element& e : params) in.outputs.push_back({e.semantic, e.index});
+    return true;
+  }
   return true;  // other stages have no interface here
 }
 

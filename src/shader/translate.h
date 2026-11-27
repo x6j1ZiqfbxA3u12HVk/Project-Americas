@@ -60,6 +60,10 @@ struct TranslateInput {
   // VS: exp parameter N = outputs[N]; PS: exp mrt N = outputs[N] (an SV_Target).
   std::vector<StageOutput> outputs;
   uint32_t user_sgprs = 16;  // graphics: the user data SGPRs the binding fills (the runtime's: at most 20)
+  // Mesh: the group's lanes, the most vertices and primitives (lane n exports vertex n and
+  // primitive n; console_program.h), its user SGPRs (from s8: eight system SGPRs come first).
+  // Its outputs (exp param N) are `outputs`, as a vertex shader's.
+  uint32_t ms_threads = 0, ms_max_vertices = 0, ms_max_primitives = 0, ms_user_sgprs = 0;
 };
 
 struct Translation {
