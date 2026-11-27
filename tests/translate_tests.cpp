@@ -1305,10 +1305,13 @@ TEST_CASE(translate_ours_matches_dxc_on_game_programs) {
   }
   {
     std::ifstream in(running_file);
-    std::string name;
+    // The program and the build (dxc or ours) that was on the GPU when it reset.
+    std::string name, build;
     if (in >> name && !done.count(name)) {
-      done[name] = "hung";
-      std::ofstream(done_file, std::ios::app) << name << " hung\n";
+      in >> build;
+      const std::string result = build.empty() ? "hung" : "hung-" + build;
+      done[name] = result;
+      std::ofstream(done_file, std::ios::app) << name << ' ' << result << '\n';
     }
   }
   std::ofstream(running_file, std::ios::trunc).close();
@@ -1350,9 +1353,24 @@ TEST_CASE(translate_ours_matches_dxc_on_game_programs) {
         tin.lds_bytes = p.lds_bytes;
         tin.cs_rsrc2 = p.cs_rsrc2;
         for (int k = 0; k < 3; ++k) tin.cs_threads[k] = p.cs_threads[k];
-        const Translation td = translate(tin, Binding::Test);
+        Translation td = translate(tin, Binding::Test);
         tin.goto_form = true;
-        const Translation to = translate(tin, Binding::Test);
+        Translation to = translate(tin, Binding::Test);
+        // Random inputs can keep a loop going: both builds stop it early (a few thousand passes,
+        // well inside Windows' two seconds before it resets the GPU and the display) and say so
+        // in the dump's spare word (byte 1020), so such a run is not compared.
+        for (Translation* t : {&td, &to}) {
+          const std::pair<std::string, std::string> edits[] = {
+              {"#define AM_SPIN_LIMIT 4194304u", "#define AM_SPIN_LIMIT 16384u"},
+              {"#define AM_DISPATCH_LIMIT 16777216u", "#define AM_DISPATCH_LIMIT 65536u"},
+              {"AM_SPIN_LIMIT) return;", "AM_SPIN_LIMIT) { am_dump.Store(1020u, 1u); return; }"},
+              {"AM_DISPATCH_LIMIT) return;", "AM_DISPATCH_LIMIT) { am_dump.Store(1020u, 1u); return; }"}};
+          for (const auto& [from, into] : edits) {
+            for (size_t at = t->hlsl.find(from); at != std::string::npos; at = t->hlsl.find(from, at + into.size())) {
+              t->hlsl.replace(at, from.size(), into);
+            }
+          }
+        }
         if (!td.ok || !to.ok) {
           record(name, "untranslated");
           continue;
@@ -1396,9 +1414,10 @@ TEST_CASE(translate_ours_matches_dxc_on_game_programs) {
         const uint32_t threads = std::max(1u, p.cs_threads[0]) * std::max(1u, p.cs_threads[1]) * std::max(1u, p.cs_threads[2]);
         const size_t dump_d = kDumpLanes / 4 + static_cast<size_t>(threads) * td.vgpr_count;
         const size_t dump_o = kDumpLanes / 4 + static_cast<size_t>(threads) * to.vgpr_count;
-        std::ofstream(running_file, std::ios::trunc) << name << '\n';
+        std::ofstream(running_file, std::ios::trunc) << name << " dxc\n";
         const am::test::GpuRun d1 = am::test::run_compute(cd.dxil, 1, args, memory, dump_d);
         const am::test::GpuRun d2 = d1.ran ? am::test::run_compute(cd.dxil, 1, args, memory, dump_d) : am::test::GpuRun{};
+        std::ofstream(running_file, std::ios::trunc) << name << " ours\n";
         const am::test::GpuRun o = d2.ran ? am::test::run_compute(co.dxil, 1, args, memory, dump_o) : am::test::GpuRun{};
         if (!d1.ran || !d2.ran || !o.ran) {
           const std::string why = !d1.ran ? d1.why : !d2.ran ? d2.why : o.why;
@@ -1414,6 +1433,10 @@ TEST_CASE(translate_ours_matches_dxc_on_game_programs) {
         }
         if (d1.dump != d2.dump || d1.memory != d2.memory) {
           record(name, "racing");
+          continue;
+        }
+        if (d1.dump.size() > 255 && o.dump.size() > 255 && (d1.dump[255] == 1u || o.dump[255] == 1u)) {
+          record(name, d1.dump[255] == 1u && o.dump[255] == 1u ? "runaway" : d1.dump[255] == 1u ? "runaway-dxc" : "runaway-ours");
           continue;
         }
         const bool comparable = td.vgpr_count == to.vgpr_count;

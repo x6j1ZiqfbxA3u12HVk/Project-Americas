@@ -25,6 +25,9 @@ namespace am::shader::dxil {
 // Compiles `source` into `m` with `entry` as the entry point; then m.finish() and write_bitcode().
 // Float operations carry fast-math flags, as DXC's do at -O3.
 // `profile` (cs_6_6, vs_6_6, ps_6_6, ms_6_6) gives the stage; empty: what the entry declares.
-bool compile_hlsl(std::string_view source, std::string_view entry, Module& m, std::string& error, std::string_view profile = {});
+// `registers_in_memory`: the entry's register arrays (s, v) kept in memory (compute and mesh),
+// for programs too large for the driver's compiler otherwise.
+bool compile_hlsl(std::string_view source, std::string_view entry, Module& m, std::string& error, std::string_view profile = {},
+                  bool registers_in_memory = false);
 
 }  // namespace am::shader::dxil

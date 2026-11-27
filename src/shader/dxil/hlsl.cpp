@@ -488,6 +488,10 @@ struct CBuffer {
 class Compiler {
  public:
   Compiler(Module& m, Syms& syms, std::vector<Token> toks) : m_(m), syms_(syms), t_(std::move(toks)) { names(); }
+  // The entry's register arrays (s, v) in memory, indexed through a value the driver cannot see
+  // is zero: it then keeps them in memory instead of making the program's every register a value
+  // live across all of it (the largest programs are too much for its compiler that way).
+  void registers_in_memory(bool on) { regs_in_memory_ = on; }
 
   void run(std::string_view entry, std::string_view profile) {
     top_level();
@@ -1120,6 +1124,19 @@ class Compiler {
   // ---- the entry point ----
   Fn* fn_ = nullptr;  // the function whose body is being compiled (innermost inline)
 
+  bool regs_in_memory_ = false;
+  Value opaque_zero_ = kNone;
+  // Zero, computed (the group's z id >> 31: ids stay far below 2^31), in the entry block.
+  Value opaque_zero() {
+    if (opaque_zero_ == kNone) {
+      const Block keep = m_.current();
+      m_.at(0);
+      opaque_zero_ = m_.bin(Bin::LShr, m_.group_id(2), m_.u32(31));
+      m_.at(keep);
+    }
+    return opaque_zero_;
+  }
+
   // ---- graphics signatures ----
   Stage stage_ = Stage::Compute;
   // A variable holding a component of an entry input: its element and column (GetAttributeAtVertex).
@@ -1471,7 +1488,8 @@ class Compiler {
         t.arr = static_cast<uint32_t>(next().bits);
         expect(p_rbrack);
       }
-      const bool in_memory = t.arr && fn_ && fn_->dynamic_arrays.count(name);
+      const bool register_array = regs_in_memory_ && rets_.size() == 1 && (syms_.name(name) == "s" || syms_.name(name) == "v");
+      const bool in_memory = t.arr && fn_ && (fn_->dynamic_arrays.count(name) || register_array);
       if (accept(p_assign)) {
         if (t.b == B::Res) {
           const RV init = value(assignment());
@@ -1991,7 +2009,8 @@ class Compiler {
         out.is_lv = true;
         out.lv.kind = LV::Mem;
         out.lv.t = et;
-        const Value i = scalar_of(idx, B::Uint);
+        Value i = scalar_of(idx, B::Uint);
+        if (regs_in_memory_ && constant && (stage_ == Stage::Compute || stage_ == Stage::Mesh)) i = m_.add(i, opaque_zero());
         const Value at = et.n == 1 ? i : m_.mul(i, m_.u32(et.n));
         for (uint32_t j = 0; j < et.n; ++j)
           out.lv.ptrs.push_back(m_.gep(e.lv.arr_type, e.lv.arr, {m_.u32(0), j == 0 ? at : m_.add(at, m_.u32(j))}));
@@ -3018,7 +3037,8 @@ class Compiler {
 
 }  // namespace
 
-bool compile_hlsl(std::string_view source, std::string_view entry, Module& m, std::string& error, std::string_view profile) {
+bool compile_hlsl(std::string_view source, std::string_view entry, Module& m, std::string& error, std::string_view profile,
+                  bool registers_in_memory) {
   try {
     Syms syms;
     std::vector<Token> raw;
@@ -3026,6 +3046,7 @@ bool compile_hlsl(std::string_view source, std::string_view entry, Module& m, st
     Preprocessor pp(syms, raw);
     std::vector<Token> toks = pp.run();
     Compiler c(m, syms, std::move(toks));
+    c.registers_in_memory(registers_in_memory);
     c.run(entry, profile);
     return true;
   } catch (const Failure& f) {

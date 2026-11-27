@@ -149,7 +149,9 @@ int translate(const std::string& wanted, const fs::path& pack_dir, const fs::pat
           host::CompileResult r;
           if (ours) {
             shader::dxil::Module m;
-            if (!shader::dxil::compile_hlsl(t.hlsl, t.entry, m, r.messages, t.profile) || !m.finish(r.messages)) {
+            // AM_SHADERS_REGS_IN_MEMORY=1: the register arrays in memory (giants).
+            const bool regs = GetEnvironmentVariableA("AM_SHADERS_REGS_IN_MEMORY", nullptr, 0) != 0;
+            if (!shader::dxil::compile_hlsl(t.hlsl, t.entry, m, r.messages, t.profile, regs) || !m.finish(r.messages)) {
               r.messages = "ours: " + r.messages;
             } else {
               r = host::assemble_dxil(shader::dxil::write_bitcode(m));
@@ -959,6 +961,40 @@ int invalidate_loops(const fs::path& pack_dir, const fs::path& runtime_dir, cons
   return 0;
 }
 
+// AM_SHADERS_OURS=1: the service compiles with our own compiler (shader/dxil): the goto form
+// (the console's own control flow; irreducible programs the structured form at any depth), keys
+// ending "-ours-o3" (optimized, as the runtime wants large DXIL); DXC takes what ours refuses.
+bool service_ours() {
+  static const bool on = GetEnvironmentVariableA("AM_SHADERS_OURS", nullptr, 0) != 0;
+  return on;
+}
+shader::Translation service_translation(shader::TranslateInput in, bool ours) {
+  in.goto_form = ours;
+  in.any_depth = ours;
+  return shader::translate(in, shader::Binding::Runtime);
+}
+std::string service_key(const shader::Translation& t, bool ours) {
+  return source_key(t) + (ours ? "-ours-o3" : t.hlsl.size() > (1u << 20) ? "-o3" : "");
+}
+// Our compile of a translation: the module, optimized, assembled and signed by the validator
+// (with the validator's flags when ours differ).
+host::CompileResult compile_ours(const shader::Translation& t) {
+  host::CompileResult r;
+  shader::dxil::Module m;
+  if (!shader::dxil::compile_hlsl(t.hlsl, t.entry, m, r.messages, t.profile) || !m.finish(r.messages)) {
+    r.messages = "ours: " + r.messages;
+    return r;
+  }
+  r = host::assemble_dxil(shader::dxil::write_bitcode(m));
+  uint64_t flags = 0;
+  if (!r.ok && shader::dxil::validator_flags(r.messages, flags)) {
+    m.set_flags(flags);
+    r = host::assemble_dxil(shader::dxil::write_bitcode(m));
+  }
+  if (!r.ok) r.messages = "ours, the validator: " + r.messages;
+  return r;
+}
+
 int serve(const fs::path& pack_dir, const fs::path& runtime_dir, const fs::path& out_dir, unsigned jobs, const fs::path& log,
           bool everything) {
   SetPriorityClass(GetCurrentProcess(), BELOW_NORMAL_PRIORITY_CLASS);
@@ -1170,6 +1206,18 @@ int serve(const fs::path& pack_dir, const fs::path& runtime_dir, const fs::path&
   // Which compiled programs the translator now makes differently: each one translated again and
   // its source key compared with the one its DXIL was made from (.src). A translator change
   // thus rebuilds only the programs it changes, without a new version and a rebuild of all.
+  // With AM_SHADERS_OURS: programs ours refused (DXC compiled them), kept across runs so they
+  // are not taken for stale and refused again each time.
+  std::set<std::string> taken_by_dxc;
+  {
+    std::ifstream in(out_dir / L"ours-refused.txt");
+    for (std::string m; std::getline(in, m);) {
+      if (!m.empty() && m.back() == '\r') m.pop_back();
+      if (!m.empty()) taken_by_dxc.insert(m);
+    }
+  }
+  std::ofstream ours_refused(out_dir / L"ours-refused.txt", std::ios::app);
+  if (service_ours()) say("serve: compiling with our own compiler (DXC for what it refuses: %zu so far)\n", taken_by_dxc.size());
   if (everything) {
     std::thread([&] {
       SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
@@ -1195,10 +1243,20 @@ int serve(const fs::path& pack_dir, const fs::path& runtime_dir, const fs::path&
         const auto shader = load(file, error);
         if (!shader) continue;
         const shader::NativeBlob& b = shader->shader.blobs[at.blob];
-        const shader::Translation t = shader::translate(input_of(shader->bytes, b, b.programs[at.program]), shader::Binding::Runtime);
+        const shader::Translation t = service_translation(input_of(shader->bytes, b, b.programs[at.program]), service_ours());
         if (!t.ok) continue;
-        const std::string key = source_key(t) + (t.hlsl.size() > (1u << 20) ? "-o3" : "");
+        const std::string key = service_key(t, service_ours());
+        // A program ours refused and DXC compiled keeps DXC's key: not stale for that.
         if (key == stored) continue;
+        bool dxc_kept = false;
+        if (service_ours() && stored.find("-ours") == std::string::npos) {
+          std::lock_guard<std::mutex> g(lock);
+          dxc_kept = taken_by_dxc.count(m) != 0;
+        }
+        if (dxc_kept) {
+          const shader::Translation td = service_translation(input_of(shader->bytes, b, b.programs[at.program]), false);
+          if (td.ok && service_key(td, false) == stored) continue;
+        }
         std::lock_guard<std::mutex> g(lock);
         if (stale_set.insert(m).second) stale.push_back(m);
         ++found;
@@ -1341,14 +1399,15 @@ int serve(const fs::path& pack_dir, const fs::path& runtime_dir, const fs::path&
     const auto shader = load(file, error);
     if (!shader) return fail("cannot read its container: " + error);
     const shader::NativeBlob& b = shader->shader.blobs[at.blob];
-    const shader::Translation t = shader::translate(input_of(shader->bytes, b, b.programs[at.program]), shader::Binding::Runtime);
+    bool ours = service_ours();
+    shader::Translation t = service_translation(input_of(shader->bytes, b, b.programs[at.program]), ours);
     if (!t.ok) return fail(t.failure);
     // The dispatcher form (one loop over a switch) of a large program keeps DXC busy for hours
     // (two of about 80,000 instructions ran past 45 minutes at 3 GB each): refused until such
-    // programs get a better form, so they do not hold the large-compile slot.
-    if (!t.structured && t.hlsl.size() > (1u << 20)) return fail("dispatcher form over 1 MiB of HLSL (DXC takes hours)");
+    // programs get a better form, so they do not hold the large-compile slot. Ours takes it.
+    if (!ours && !t.structured && t.hlsl.size() > (1u << 20)) return fail("dispatcher form over 1 MiB of HLSL (DXC takes hours)");
     // Large programs' keys say they were compiled optimized: a stored -O0 build is never reused.
-    const std::string key = source_key(t) + (t.hlsl.size() > (1u << 20) ? "-o3" : "");
+    std::string key = service_key(t, ours);
     const fs::path stored = by_source / widen(key + ".dxil");
     if (fs::exists(stored, ec)) {
       fs::copy_file(stored, out_dir / widen(marker + ".dxil"), fs::copy_options::overwrite_existing, ec);
@@ -1387,7 +1446,21 @@ int serve(const fs::path& pack_dir, const fs::path& runtime_dir, const fs::path&
       }
     }
     host::CompileResult c;
-    for (int attempt = 0;; ++attempt) {
+    if (ours) {
+      c = compile_ours(t);
+      if (!c.ok) {
+        // Ours refused it: DXC, from the usual translation, under DXC's key.
+        say("  %s %s: %s; DXC takes it\n", shader::hw_stage_name(at.stage), marker.c_str(), c.messages.substr(0, 160).c_str());
+        std::fflush(stdout);
+        ours = false;
+        t = service_translation(input_of(shader->bytes, b, b.programs[at.program]), false);
+        if (!t.ok) return fail(t.failure);
+        key = service_key(t, false);
+        std::lock_guard<std::mutex> g(lock);
+        if (taken_by_dxc.insert(marker).second) ours_refused << marker << '\n' << std::flush;
+      }
+    }
+    for (int attempt = 0; !ours; ++attempt) {
       c = host::compile_hlsl(t.hlsl, t.entry, t.profile);
       if (c.ok || !c.transient || attempt == 3) break;
       static constexpr DWORD kWaitMs[] = {5000, 20000, 60000};

@@ -3581,13 +3581,19 @@ bool reducible(const std::vector<CfgBlock>& blocks) {
 // The goto form (TranslateInput::goto_form): the blocks in order, each a label, branches gotos.
 std::string gotos(const std::vector<CfgBlock>& blocks) {
   std::string body;
-  const auto go = [](uint32_t at) { return "goto am_block_" + num(at) + ";"; };
+  // Every cycle takes a branch backward in the code (forward ones only go up), so a backward
+  // branch carries the structured form's runaway guard: a loop that wrong data keeps going ends
+  // the program after AM_SPIN_LIMIT passes instead of hanging the GPU (a hang resets the display).
+  const auto go = [](uint32_t from, uint32_t at) {
+    if (at <= from) return "{ if (++am_spins > AM_SPIN_LIMIT) return; goto am_block_" + num(at) + "; }";
+    return "goto am_block_" + num(at) + ";";
+  };
   for (const CfgBlock& b : blocks) {
     body += "am_block_" + num(b.start) + ":\n" + b.code;
     switch (b.end) {
-      case CfgBlock::Fall: body += "      " + go(b.next) + "\n"; break;
-      case CfgBlock::Jump: body += "      " + go(b.target) + "\n"; break;
-      case CfgBlock::Cond: body += "      if (" + b.cond + ") " + go(b.target) + "\n      " + go(b.next) + "\n"; break;
+      case CfgBlock::Fall: body += "      " + go(b.start, b.next) + "\n"; break;
+      case CfgBlock::Jump: body += "      " + go(b.start, b.target) + "\n"; break;
+      case CfgBlock::Cond: body += "      if (" + b.cond + ") " + go(b.start, b.target) + "\n      " + go(b.start, b.next) + "\n"; break;
       case CfgBlock::Stop: break;
     }
   }
