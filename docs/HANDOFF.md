@@ -1595,3 +1595,7 @@ loading does). Work that way.
   after another (`am_go<n>` says which runs). `24ea...`: chained structured, nesting 61, 15 MB
   of HLSL. `am-shaders translate <48-digit marker>` translates and compiles one program as the
   service does and prints form, size, nesting and compile time.
+* **Device slot 71 = CreateUnorderedAccessViewX** (resource description, UAV description with the
+  GPU address at +40, destination descriptor), the twin of slot 70: buffers get a V# over the
+  range, textures the view slot 70 would make. The call site shows it: Flags 0x20004 (UAV) in the
+  resource description, the view description's +40 the address.

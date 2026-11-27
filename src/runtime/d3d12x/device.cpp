@@ -12,6 +12,8 @@
 #include "runtime/d3d12x/object.h"
 #include "runtime/d3d12x/d3d12x.h"
 #include "runtime/d3d12x/root_signature.h"
+#include "core/text.h"
+#include "runtime/d3d12x/formats.h"
 #include "runtime/log.h"
 #include "runtime/shader_service.h"
 
@@ -157,6 +159,40 @@ void WINAPI create_view_x(Device*, const D3D12_RESOURCE_DESC* resource, const ui
   write_shader_view(dest, resource, v, address);
 }
 
+// Slot 71: the unordered-access twin of slot 70: (resource description, UAV description followed
+// by the resource's GPU address at +40, destination descriptor). Buffers get a V# over the
+// address range (raw views in dwords); a texture gets the T# of a view over its memory.
+void WINAPI create_uav_x(Device*, const D3D12_RESOURCE_DESC* resource, const uint8_t* view, uint64_t dest) {
+  if (!view || !dest) return;
+  D3D12_UNORDERED_ACCESS_VIEW_DESC u{};
+  std::memcpy(&u, view, sizeof u);
+  uint64_t address = 0;
+  std::memcpy(&address, view + 40, sizeof address);
+  static std::atomic<int> told{0};
+  if (told.fetch_add(1, std::memory_order_relaxed) < 8) {
+    logf("d3d12x: UAV (slot 71): dimension %u, format %u, at 0x%s", u.ViewDimension, u.Format, hex(address).c_str());
+  }
+  if (u.ViewDimension == D3D12_UAV_DIMENSION_BUFFER || (resource && resource->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)) {
+    const bool raw = (u.Buffer.Flags & D3D12_BUFFER_UAV_FLAG_RAW) != 0;
+    const FormatSize f = format_size(u.Format);
+    const uint64_t element = raw ? 4 : u.Buffer.StructureByteStride ? u.Buffer.StructureByteStride : std::max<uint32_t>(f.bytes, 1);
+    const uint64_t count = u.Buffer.NumElements ? u.Buffer.NumElements : (resource ? resource->Width / element : 0);
+    uint32_t words[8] = {};
+    encode_buffer_descriptor(words, address + u.Buffer.FirstElement * element, count * element,
+                             raw ? 0u : static_cast<uint32_t>(element));
+    std::memcpy(reinterpret_cast<void*>(dest), words, sizeof words);
+    return;
+  }
+  // Textures: a view over the same memory (as slot 70 makes one).
+  D3D12_SHADER_RESOURCE_VIEW_DESC v{};
+  v.Format = u.Format;
+  v.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+  v.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+  v.Texture2D.MipLevels = 1;
+  v.Texture2D.MostDetailedMip = u.Texture2D.MipSlice;
+  write_shader_view(dest, resource, v, address);
+}
+
 // Slot 127: committed resource creation, shaped like D3D12's CreateCommittedResource3: (heap
 // properties, heap flags, description, initial barrier layout, clear value, protected session,
 // castable format count, castable formats, riid, out). The game asks for ID3D12Resource.
@@ -185,6 +221,7 @@ std::vector<Method> device_methods() {
       {62, "CreateComputePipelineStateX", reinterpret_cast<void*>(&create_compute_pipeline_x)},
       {67, "CreatePipelineX (67)", reinterpret_cast<void*>(&create_pipeline_67)},
       {70, "CreateShaderResourceViewX", reinterpret_cast<void*>(&create_view_x)},
+      {71, "CreateUnorderedAccessViewX", reinterpret_cast<void*>(&create_uav_x)},
       {73, "CreateCommandListX", reinterpret_cast<void*>(&create_command_list_x)},
       {86, "CreatePipelineState", reinterpret_cast<void*>(&create_pipeline_state)},
       {127, "CreateCommittedResourceX", reinterpret_cast<void*>(&create_committed_resource_x)},
