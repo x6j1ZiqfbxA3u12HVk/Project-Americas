@@ -100,7 +100,8 @@ std::string fill(const std::string& t, const std::string& a, const std::string& 
 // (one loaded from memory) gives each lane its bit. Programs whose registers hold a mask on one
 // path and a number on another keep the wave's masks (the older form, `lane` false).
 enum : uint8_t { kNum = 1, kMask = 2 };     // what an SGPR may hold; 0: zero or all ones, either
-using MaskKinds = std::array<uint8_t, 128>;
+using MaskKinds = std::array<uint8_t, 129>;  // the SGPRs, then SCC (kSccKind)
+constexpr uint32_t kSccKind = 128;
 
 // ---- the emitter's state for one instruction ----
 
@@ -3163,6 +3164,9 @@ struct CfgBlock {
   std::string code;
   enum End : uint8_t { Fall, Jump, Cond, Stop } end = Fall;
   std::string cond;    // Cond: the branch is taken when this holds
+  // The same branch taken on the wave (WaveActiveAnyTrue of a mask's test, the console's own
+  // semantics), for programs in the chained form (see translate()).
+  std::string cond_wave;
   uint32_t target = 0; // Jump, Cond: the branch's target (dword)
   uint32_t next = 0;   // Fall, Cond: the dword after the block
 };
@@ -3716,6 +3720,11 @@ MaskStep mask_step(const rd::Instruction& insn, bool wave64, MaskKinds& k) {
     if (!regs[i].out) continue;
     for (uint32_t d = regs[i].first; d < regs[i].first + regs[i].count; ++d) k[d] = d == 126 || d == 127 ? kMask : kind;
   }
+  // SCC: from a mask operation the lane's own test, from anything else the wave's.
+  for (int i = 0; i < info.operand_count; ++i) {
+    const rd::OperandInfo& op = info.operands[i];
+    if (op.type == T::OPR_SSRC_SPECIAL_SCC && (op.flags & rd::kOut)) k[kSccKind] = st.mask_op ? kMask : kNum;
+  }
   return st;
 }
 
@@ -4059,6 +4068,18 @@ Translation translate(const TranslateInput& in, Binding binding) {
       else if (name == "s_cbranch_execz") cond = c.zero_test(126);
       else if (name == "s_cbranch_execnz") cond = "!" + c.zero_test(126);
       else ok = c.fail(name);
+      // On the wave: taken when no lane's mask bit is set (execz, vccz, SCC0 of a mask operation)
+      // or when some lane's is (execnz, vccnz, SCC1).
+      std::string wave = cond;
+      if (c.lane) {
+        const bool vcc_mask = !((c.mt[106] | (c.wave64 ? c.mt[107] : 0)) & kNum);
+        if (name == "s_cbranch_execz") wave = "!WaveActiveAnyTrue(s[126] != 0u)";
+        else if (name == "s_cbranch_execnz") wave = "WaveActiveAnyTrue(s[126] != 0u)";
+        else if (name == "s_cbranch_vccz" && vcc_mask) wave = "!WaveActiveAnyTrue(s[106] != 0u)";
+        else if (name == "s_cbranch_vccnz" && vcc_mask) wave = "WaveActiveAnyTrue(s[106] != 0u)";
+        else if (name == "s_cbranch_scc0" && (c.mt[kSccKind] & kMask)) wave = "!WaveActiveAnyTrue(scc)";
+        else if (name == "s_cbranch_scc1" && (c.mt[kSccKind] & kMask)) wave = "WaveActiveAnyTrue(scc)";
+      }
       if (ok) {
         blk.target = static_cast<uint32_t>(target);
         blk.next = next;
@@ -4066,6 +4087,7 @@ Translation translate(const TranslateInput& in, Binding binding) {
         else {
           blk.end = CfgBlock::Cond;
           blk.cond = cond;
+          blk.cond_wave = wave;
         }
       }
     } else {
@@ -4111,6 +4133,12 @@ Translation translate(const TranslateInput& in, Binding binding) {
   if (tr.structured && too_deep(body)) {
     std::string chained;
     bool chained_br = false;
+    // Chains join hundreds of exits at one merge point (one of 716 predecessors in a giant): with
+    // per-lane branches that is divergent control flow AMD's compiler restructures in more than 20
+    // GB. Branched on the wave, as the console does, it stays uniform.
+    for (CfgBlock& b : blocks) {
+      if (b.end == CfgBlock::Cond && !b.cond_wave.empty()) b.cond = b.cond_wave;
+    }
     tr.structured = Structurer(blocks, true).run(chained, chained_br) && !too_deep(chained);
     if (tr.structured) {
       body = std::move(chained);
