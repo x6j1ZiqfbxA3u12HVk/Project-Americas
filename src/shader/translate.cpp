@@ -2871,9 +2871,15 @@ std::string indented(const std::string& code, const std::string& indent) {
 // `switch (0u) { default: }` (break leaves it; LLVM sees no loop) and a loop `for (;;)`; a
 // branch past more than the innermost of them
 // sets am_br to the target's depth and unwinds.
+//
+// Chains (only for programs the nested form would nest past DXC's 256 brackets): a node with
+// many merge points does not open one block inside another per merge point. Its own region and
+// each merge point's region are blocks one after another, at one level; a branch to merge point
+// k sets am_go<n> = k and leaves its region, and the region of k runs `if (am_go<n> == k)`.
+// Merge points come in reverse postorder, so a branch always goes to a later region.
 class Structurer {
  public:
-  explicit Structurer(const std::vector<CfgBlock>& blocks) : b_(blocks) {}
+  explicit Structurer(const std::vector<CfgBlock>& blocks, bool chains = false) : b_(blocks), chains_(chains) {}
 
   // False if the CFG is not reducible (or not what we expect); the caller then dispatches.
   bool run(std::string& out, bool& uses_br) {
@@ -3018,6 +3024,7 @@ class Structurer {
 
   void node_within(int x, const std::vector<int>& ys, size_t i) {
     if (!ok_) return;
+    if (chains_ && i == 0 && ys.size() >= kChainFrom) return chain(x, ys);
     if (i < ys.size()) {
       line("switch (0u) { default:");
       frames_.push_back({Kind::Block, ys[i]});
@@ -3061,8 +3068,39 @@ class Structurer {
     do_tree(to);
   }
 
+  // The chain form of node `x` with merge points `ys` (latest first, as node_within takes them).
+  void chain(int x, const std::vector<int>& ys) {
+    const int id = chains_made_++, marker = -2 - id;
+    const std::string go = "am_go" + std::to_string(id);
+    for (size_t k = 0; k < ys.size(); ++k) chain_of_[ys[ys.size() - 1 - k]] = {marker, static_cast<int>(k) + 1};
+    line("uint " + go + " = 0u;");
+    line("switch (0u) { default:");
+    frames_.push_back({Kind::Block, marker});
+    node_within(x, {}, 0);
+    line("break;");
+    close_loop_like("}");
+    for (size_t k = 0; k < ys.size() && ok_; ++k) {
+      const int y = ys[ys.size() - 1 - k];
+      line("if (" + go + " == " + std::to_string(k + 1) + "u) {");
+      frames_.push_back({Kind::If, -1});
+      line("switch (0u) { default:");
+      frames_.push_back({Kind::Block, marker});
+      do_tree(y);
+      line("break;");
+      close_loop_like("}");
+      frames_.pop_back();
+      line("}");
+    }
+  }
+
   // A branch to the loop headed by `node` (continue) or out of the block that `node` follows.
   void branch_to(Kind kind, int node) {
+    if (kind == Kind::Block) {
+      if (const auto it = chain_of_.find(node); it != chain_of_.end()) {
+        line("am_go" + std::to_string(-2 - it->second.first) + " = " + std::to_string(it->second.second) + "u;");
+        node = it->second.first;
+      }
+    }
     int f = -1, inner = -1;
     for (int k = static_cast<int>(frames_.size()) - 1; k >= 0; --k) {
       if (frames_[k].kind != Kind::If && inner < 0) inner = k;
@@ -3111,7 +3149,11 @@ class Structurer {
     line("}");
   }
 
+  static constexpr size_t kChainFrom = 4;  // merge points of one node that make a chain
   const std::vector<CfgBlock>& b_;
+  const bool chains_;
+  int chains_made_ = 0;
+  std::unordered_map<int, std::pair<int, int>> chain_of_;  // merge point -> (chain marker, its number)
   std::vector<std::vector<int>> succ_, children_;
   std::vector<int> rpo_, order_, idom_;
   std::vector<bool> header_, merge_;
@@ -3434,15 +3476,24 @@ Translation translate(const TranslateInput& in, Binding binding) {
   bool uses_br = false;
   tr.structured = Structurer(blocks).run(body, uses_br);
   // DXC refuses more than 256 nested brackets: structured code nested deeper (programs with
-  // many far jumps) takes the dispatcher instead.
-  if (tr.structured) {
+  // many far jumps) is made again with chains (see the Structurer), and only if that is still
+  // too deep takes the dispatcher. Programs that fit keep their output unchanged.
+  const auto too_deep = [](const std::string& text) {
     int depth = 0, deepest = 0;
-    for (const char ch : body) {
+    for (const char ch : text) {
       if (ch == '{' || ch == '(') deepest = std::max(deepest, ++depth);
       else if (ch == '}' || ch == ')') --depth;
     }
-    if (deepest > 200) {
-      tr.structured = false;
+    return deepest > 200;
+  };
+  if (tr.structured && too_deep(body)) {
+    std::string chained;
+    bool chained_br = false;
+    tr.structured = Structurer(blocks, true).run(chained, chained_br) && !too_deep(chained);
+    if (tr.structured) {
+      body = std::move(chained);
+      uses_br = chained_br;
+    } else {
       uses_br = false;
     }
   }

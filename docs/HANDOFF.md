@@ -1584,3 +1584,14 @@ loading does). Work that way.
   DXIL files (1 GB, the scheme before rt<N> folders), `rt\` (old) and `rt4\` (1.1 GB, the
   previous translator); the runtime reads only `rt5\` and `by-source\`. Old service copies in
   `cache\shaders\service\` and `bin\am-shaders-old*.exe` / `-pass1.exe` can go too.
+* **Progress line:** every compile the service logs ends with `[N left; about Hh MMm to go]`
+  (pace of the last 40 compiles in program code, over the code still queued).
+* **Visible service window:** `C:\Project Americas\tools\shader-service.ps1` runs the service in
+  a console window of its own and appends its output to `logs\serve.txt` (UTF-8). Started from a
+  tool call it must go through WMI (Win32_Process Create, ShowWindow 1), or it dies with the call.
+* **Far-jump giants no longer refused:** DXC (clang) allows 256 nested brackets and has no
+  `-fbracket-depth`. The structurer now has a chain form, used only when the nested form is
+  too deep: a node with many merge points emits its region and each merge point's region one
+  after another (`am_go<n>` says which runs). `24ea...`: chained structured, nesting 61, 15 MB
+  of HLSL. `am-shaders translate <48-digit marker>` translates and compiles one program as the
+  service does and prints form, size, nesting and compile time.

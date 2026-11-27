@@ -91,7 +91,57 @@ shader::TranslateInput input_of(const std::vector<uint8_t>& container, const sha
 
 }  // namespace
 
+std::string marker_of(std::span<const uint8_t> code);
+
 int translate(const std::string& wanted, const fs::path& pack_dir, const fs::path& out_dir) {
+  // A program's 48-digit marker: that program alone, as the shader service translates and
+  // compiles it (runtime binding; -O0 over 1 MiB), with its form, size, nesting and compile time.
+  if (wanted.size() == 48) {
+    std::vector<fs::path> files = containers(pack_dir);
+    std::error_code dir_ec;
+    for (const auto& e : fs::directory_iterator(pack_dir.parent_path() / L"runtime", dir_ec)) {
+      if (e.path().extension() == L".dxbc") files.push_back(e.path());
+    }
+    for (const fs::path& f : files) {
+      std::string error;
+      const auto shader = load(f, error);
+      if (!shader) continue;
+      for (const shader::NativeBlob& b : shader->shader.blobs) {
+        for (const shader::NativeProgram& pr : b.programs) {
+          if (marker_of(b.code(pr)) != wanted) continue;
+          const shader::Translation t = shader::translate(input_of(shader->bytes, b, pr), shader::Binding::Runtime);
+          if (!t.ok) {
+            std::printf("%s: not translated: %s\n", wanted.c_str(), t.failure.c_str());
+            return 1;
+          }
+          int depth = 0, deepest = 0;
+          for (const char ch : t.hlsl) {
+            if (ch == '{' || ch == '(') deepest = std::max(deepest, ++depth);
+            else if (ch == '}' || ch == ')') --depth;
+          }
+          const bool chained = t.hlsl.find("uint am_go0 = 0u;") != std::string::npos;
+          std::error_code ec;
+          fs::create_directories(out_dir, ec);
+          const fs::path hlsl = out_dir / widen(wanted + ".hlsl");
+          std::ofstream(hlsl, std::ios::binary) << t.hlsl;
+          std::printf("%s: %s, %s form, %zu KiB of HLSL, nesting %d (%s)\n", wanted.c_str(), shader::hw_stage_name(pr.stage),
+                      !t.structured ? "dispatcher" : chained ? "chained structured" : "structured", t.hlsl.size() >> 10,
+                      deepest, narrow(hlsl.wstring()).c_str());
+          std::fflush(stdout);
+          const bool huge = t.hlsl.size() > (1u << 20);
+          const auto c0 = std::chrono::steady_clock::now();
+          const host::CompileResult r =
+              host::compile_hlsl(t.hlsl, t.entry, t.profile, huge ? std::vector<std::wstring>{L"-O0"} : std::vector<std::wstring>{});
+          std::printf("%s: %s in %.1f s (%zu bytes of DXIL)\n", wanted.c_str(), r.ok ? "compiled" : "compile failed",
+                      std::chrono::duration<double>(std::chrono::steady_clock::now() - c0).count(), r.dxil.size());
+          if (!r.ok) std::printf("%s\n", r.messages.substr(0, 2000).c_str());
+          return r.ok ? 0 : 1;
+        }
+      }
+    }
+    std::fprintf(stderr, "%s: no program with that marker\n", wanted.c_str());
+    return 1;
+  }
   fs::path file;
   // A container file given by its path (one saved at run time, under cache/shaders/runtime), or
   // the pack's by hash prefix.
@@ -1015,8 +1065,31 @@ int serve(const fs::path& pack_dir, const fs::path& runtime_dir, const fs::path&
     std::lock_guard<std::mutex> g(lock);
     guarded.insert(marker);
     guarded_out << marker << '\n' << std::flush;
-    say("  %s%s %s, %zu KiB of HLSL, %.1f s (%zu compiled, %zu reused)\n", waited ? "waited for: " : "",
-                shader::hw_stage_name(at.stage), marker.c_str(), t.hlsl.size() >> 10, took, compiled.load(), reused.load());
+    // Progress: what is left and when it should be done, from the pace of the last 40 compiles
+    // in program code (the queues run smallest first, so a plain count would promise too much).
+    static std::deque<std::pair<std::chrono::steady_clock::time_point, uint64_t>> recent;
+    const auto now = std::chrono::steady_clock::now();
+    recent.emplace_back(now, at.code_size);
+    if (recent.size() > 40) recent.pop_front();
+    uint64_t left_code = 0, recent_code = 0;
+    const size_t left = urgent.size() + bulk.size() + upgrades.size() + deferred_huge.size();
+    for (const std::string& m : urgent) left_code += where[m].code_size;
+    for (const std::string& m : bulk) left_code += where[m].code_size;
+    for (const std::string& m : upgrades) left_code += where[m].code_size;
+    for (const auto& d : deferred_huge) left_code += where[d.first].code_size;
+    for (const auto& r : recent) recent_code += r.second;
+    const double window = std::chrono::duration<double>(now - recent.front().first).count();
+    std::string eta = "estimating";
+    if (recent.size() >= 10 && window > 0 && recent_code) {
+      const uint64_t seconds = static_cast<uint64_t>(static_cast<double>(left_code) / (recent_code / window));
+      char text[48];
+      std::snprintf(text, sizeof text, "about %lluh %02llum to go", static_cast<unsigned long long>(seconds / 3600),
+                    static_cast<unsigned long long>(seconds / 60 % 60));
+      eta = text;
+    }
+    say("  %s%s %s, %zu KiB of HLSL, %.1f s (%zu compiled, %zu reused) [%zu left; %s]\n", waited ? "waited for: " : "",
+                shader::hw_stage_name(at.stage), marker.c_str(), t.hlsl.size() >> 10, took, compiled.load(), reused.load(), left,
+                eta.c_str());
     std::fflush(stdout);
   };
 
