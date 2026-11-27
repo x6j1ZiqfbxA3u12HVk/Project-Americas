@@ -393,6 +393,28 @@ int image_survey(const fs::path& pack_dir) {
   return 0;
 }
 
+// DXC's messages as a refusal's reason: its first error (the warnings before it say nothing of
+// why), on one line, shortened.
+std::string dxc_error(const std::string& messages) {
+  size_t at = 0;
+  for (size_t line = 0; line < messages.size();) {
+    const size_t end = std::min(messages.find('\n', line), messages.size());
+    const std::string_view l(messages.data() + line, end - line);
+    if (l.find("error:") != std::string_view::npos && l.find("validation errors") == std::string_view::npos) {
+      at = line;
+      break;
+    }
+    line = end + 1;
+  }
+  std::string r = messages.substr(at, 200);
+  for (char& ch : r) {
+    if (ch == '\n' || ch == '\r' || ch == '\t') ch = ' ';
+  }
+  // Drop the file and line ("hlsl.hlsl:720: "): the program's marker says which.
+  const size_t e = r.find("error:");
+  return e == std::string::npos ? r : r.substr(e);
+}
+
 // The 24-byte marker a console program starts with, as hex: the runtime's key for it.
 std::string marker_of(std::span<const uint8_t> code) {
   static const char* const kHex = "0123456789abcdef";
@@ -622,7 +644,7 @@ int precompile(const fs::path& pack_dir, const fs::path& runtime_dir, const fs::
           const double took = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
           std::lock_guard<std::mutex> g(lock);
           if (!c.ok) {
-            for (const auto& [m, stage] : j.markers) fail(m, stage, "DXC: " + c.messages.substr(0, 200));
+            for (const auto& [m, stage] : j.markers) fail(m, stage, "DXC: " + dxc_error(c.messages));
             continue;
           }
           const auto write = [&](const fs::path& f) {
@@ -1183,7 +1205,7 @@ int serve(const fs::path& pack_dir, const fs::path& runtime_dir, const fs::path&
       std::fflush(stdout);
       return;
     }
-    if (!c.ok) return fail("DXC: " + c.messages.substr(0, 200));
+    if (!c.ok) return fail("DXC: " + dxc_error(c.messages));
     const auto write = [&](const fs::path& f) {
       std::ofstream(f, std::ios::binary).write(reinterpret_cast<const char*>(c.dxil.data()), static_cast<std::streamsize>(c.dxil.size()));
     };
