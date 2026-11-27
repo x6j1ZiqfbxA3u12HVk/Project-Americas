@@ -49,10 +49,10 @@ inline void dump_refused(std::string_view hlsl, host::CompileResult& r) {
   r.messages = "(" + path + ") " + r.messages;
 }
 
-inline host::CompileResult compile_ours(std::string_view hlsl, std::string_view entry) {
+inline host::CompileResult compile_ours(std::string_view hlsl, std::string_view entry, std::string_view profile = {}) {
   shader::dxil::Module m;
   host::CompileResult r;
-  if (!shader::dxil::compile_hlsl(hlsl, entry, m, r.messages)) {
+  if (!shader::dxil::compile_hlsl(hlsl, entry, m, r.messages, profile)) {
     r.messages = "our compiler: " + r.messages;
     dump_refused(hlsl, r);
     return r;

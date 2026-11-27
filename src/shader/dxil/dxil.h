@@ -94,6 +94,18 @@ enum class ResourceClass : uint8_t { Srv, Uav, CBuffer, Sampler };
 
 enum class Stage : uint8_t { Compute, Vertex, Pixel, Mesh };
 
+// A signature element, in DXIL's terms: semantic name (without its index) and index, component
+// type (9 f32, 5 u32, 4 i32), semantic kind (0 arbitrary, 1 vertex id, 2 instance id,
+// 3 position, 16 target, 17 depth, 28 barycentrics, ...), interpolation mode, its rows and
+// columns, and where it is packed (row and column; -1 and -1: not packed).
+struct SigElement {
+  std::string name;
+  uint32_t index = 0;
+  uint8_t comp = 9, kind = 0, interp = 0, rows = 1, cols = 4;
+  int32_t row = 0;
+  int8_t col = 0;
+};
+
 class Module {
  public:
   Module();
@@ -127,6 +139,7 @@ class Module {
   Value const_float(Type t, uint64_t bits);
   Value undef(Type t);
   Value null(Type t);
+  Value zero(Type t);  // 0 or 0.0 of a number type (as const_int / const_float make it), else null
   Value aggregate(Type t, const std::vector<Value>& elements);
   const ValueInfo& value(Value v) const { return values_[v]; }
   Type type_of(Value v) const { return values_[v].type; }
@@ -215,6 +228,19 @@ class Module {
 
   // The entry point.
   void set_compute(uint32_t x, uint32_t y, uint32_t z, uint32_t wave_size = 0);
+  void set_graphics(Stage s) { stage_ = s; }
+  // A mesh shader: its group, most vertices and primitives, topology (1 lines, 2 triangles).
+  void set_mesh(uint32_t x, uint32_t y, uint32_t z, uint32_t max_vertices, uint32_t max_primitives, uint32_t topology);
+  // Signatures: elements in order (their ids), packed by the caller. Usage masks are found in
+  // finish() from the loads and stores.
+  uint32_t add_input(const SigElement& e);
+  uint32_t add_output(const SigElement& e);
+  const std::vector<SigElement>& inputs() const { return inputs_; }
+  const std::vector<SigElement>& outputs() const { return outputs_; }
+  Value load_input(uint32_t id, uint8_t col, bool is_float);  // f32 or i32
+  void store_output(uint32_t id, uint8_t col, Value v);
+  Value attribute_at_vertex(uint32_t id, uint8_t col, uint8_t vertex);  // f32
+  void store_vertex_output(uint32_t id, uint8_t col, Value v, Value vertex);  // mesh: vertex `vertex`'s output
 
   // Makes variables SSA and checks every block ends. False with `error` if not.
   bool finish(std::string& error);
@@ -297,8 +323,11 @@ class Module {
   // Resources listed in dx.resources.
   std::vector<Md> srvs_, uavs_, cbuffers_;
   Stage stage_ = Stage::Compute;
+  std::vector<SigElement> inputs_, outputs_;
+  std::vector<uint8_t> input_masks_, output_masks_;  // components read or written (finish())
   uint32_t threads_[3] = {1, 1, 1};
   uint32_t wave_size_ = 0;
+  uint32_t mesh_vertices_ = 0, mesh_primitives_ = 0, mesh_topology_ = 2;
   uint64_t flags_ = 0;
   Md flags_md_ = kNone;
 };

@@ -58,7 +58,7 @@ Result run(const std::vector<uint32_t>& code, std::vector<uint32_t> user = {}, s
     std::printf("    skipped: %s\n", why.c_str());
     return r;
   }
-  const am::host::CompileResult c = ours ? am::test::compile_ours(t.hlsl, t.entry) : am::host::compile_hlsl(t.hlsl, t.entry, t.profile);
+  const am::host::CompileResult c = ours ? am::test::compile_ours(t.hlsl, t.entry, t.profile) : am::host::compile_hlsl(t.hlsl, t.entry, t.profile);
   CHECK(c.ok);
   if (!c.ok) {
     std::printf("    %s: %s\n", ours ? "ours" : "DXC", c.messages.substr(0, 2000).c_str());
@@ -919,6 +919,9 @@ TEST_CASE(translate_vertex_and_pixel_shaders_draw) {
   ps.vgprs = 8;
   ps.inputs = {{"COLOR", 0, 4, 0}};
   ps.outputs = {{"SV_Target", 0}};
+  // AM_DXIL=1: both in the goto form through our compiler.
+  const bool ours = am::test::use_ours();
+  vs.goto_form = ps.goto_form = ours;
   const Translation tv = translate(vs, Binding::Test), tp = translate(ps, Binding::Test);
   CHECK(tv.ok && tp.ok && tv.profile == "vs_6_6" && tp.profile == "ps_6_6");
   if (!tv.ok || !tp.ok) {
@@ -930,11 +933,13 @@ TEST_CASE(translate_vertex_and_pixel_shaders_draw) {
     std::printf("    skipped: %s\n", why.c_str());
     return;
   }
-  const am::host::CompileResult cv = am::host::compile_hlsl(tv.hlsl, tv.entry, tv.profile);
-  const am::host::CompileResult cp = am::host::compile_hlsl(tp.hlsl, tp.entry, tp.profile);
+  const auto compile = [&](const Translation& t) {
+    return ours ? am::test::compile_ours(t.hlsl, t.entry, t.profile) : am::host::compile_hlsl(t.hlsl, t.entry, t.profile);
+  };
+  const am::host::CompileResult cv = compile(tv), cp = compile(tp);
   CHECK(cv.ok && cp.ok);
   if (!cv.ok || !cp.ok) {
-    std::printf("    DXC: %s\n%s\n", cv.messages.substr(0, 1500).c_str(), cp.messages.substr(0, 1500).c_str());
+    std::printf("    %s: %s\n%s\n", ours ? "ours" : "DXC", cv.messages.substr(0, 1500).c_str(), cp.messages.substr(0, 1500).c_str());
     return;
   }
   const std::vector<D3D12_INPUT_ELEMENT_DESC> layout = {
@@ -971,6 +976,8 @@ TEST_CASE(translate_pixel_shader_depth_export) {
   ps.stage = HwStage::Ps;
   ps.vgprs = 8;
   ps.outputs = {{"SV_Target", 0}};
+  const bool ours = am::test::use_ours();
+  ps.goto_form = ours;
   const Translation tp = translate(ps, Binding::Test);
   CHECK(tp.ok);
   if (!tp.ok) {
@@ -983,9 +990,10 @@ TEST_CASE(translate_pixel_shader_depth_export) {
     std::printf("    skipped: %s\n", why.c_str());
     return;
   }
-  const am::host::CompileResult cp = am::host::compile_hlsl(tp.hlsl, tp.entry, tp.profile);
+  const am::host::CompileResult cp =
+      ours ? am::test::compile_ours(tp.hlsl, tp.entry, tp.profile) : am::host::compile_hlsl(tp.hlsl, tp.entry, tp.profile);
   CHECK(cp.ok);
-  if (!cp.ok) std::printf("    DXC: %s\n", cp.messages.substr(0, 1500).c_str());
+  if (!cp.ok) std::printf("    %s: %s\n", ours ? "ours" : "DXC", cp.messages.substr(0, 1500).c_str());
 }
 
 // Half-precision compares: VOPC to VCC with an f16 inline constant, VOP3 to an SGPR pair.

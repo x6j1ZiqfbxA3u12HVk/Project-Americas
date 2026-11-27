@@ -24,6 +24,7 @@ namespace am::shader::dxil {
 
 // Compiles `source` into `m` with `entry` as the entry point; then m.finish() and write_bitcode().
 // Float operations carry fast-math flags, as DXC's do at -O3.
-bool compile_hlsl(std::string_view source, std::string_view entry, Module& m, std::string& error);
+// `profile` (cs_6_6, vs_6_6, ps_6_6, ms_6_6) gives the stage; empty: what the entry declares.
+bool compile_hlsl(std::string_view source, std::string_view entry, Module& m, std::string& error, std::string_view profile = {});
 
 }  // namespace am::shader::dxil

@@ -2039,3 +2039,40 @@ unused internal globals); `asuint(double, out lo, out hi)` (splitDouble).
 2. Irreducible control flow (node splitting).
 3. The full corpus survey (`ours-survey` with no N, ~55 min), then ours in the shader service
    for compute programs (the giants first: 24ea, 3db4, 0849), measured in the driver.
+
+## Our compiler: graphics entry points (2026-11-27, night)
+
+* **Vertex, pixel and mesh shaders** compile in hlsl.cpp (`compile_hlsl(..., profile)`; the stage
+  from the profile, else from the entry). The entry's semantic fields (struct members keep their
+  semantics and nointerpolation) become DXIL signature elements as DXC makes them: system values
+  by name and kind, component type, interpolation (position 4, float 2, integer and
+  nointerpolation 1, VS inputs and PS outputs 0), packed like DXC's prefix-stable packing (in
+  order, sharing a row while it fits with the same interpolation; system values a row of their
+  own; SV_Target at its index; depth, coverage and barycentrics unpacked; VS inputs a row each).
+  Inputs are read at the start (`loadInput`), outputs written at the end (`storeOutput`); usage
+  masks come from the loads and stores after SSA (`Module::finish`).
+* Pixel: `discard`, `ddx/ddy` (coarse and fine), `IsHelperLane`, `GetAttributeAtVertex`
+  (attributeAtVertex on the input's element and column), SV_Barycentrics (flag bit 22),
+  SV_Depth. Mutable `static` globals are variables.
+* Mesh: `out vertices` / `out indices` parameters are places whose stores become
+  `storeVertexOutput` / `emitIndices`; `SetMeshOutputCounts`; the mesh state (tag 9: group, most
+  vertices and primitives, topology). Per-primitive outputs and payloads: not yet.
+* A read before any write is the type's one zero constant (`Module::zero`), so phis of zeros fold.
+* **Tests:** `AM_DXIL=1` also takes the vertex+pixel draw (a triangle drawn with our VS and PS,
+  pixels checked) and the depth-export pixel shader through ours. 26 of 27 pass through ours
+  (irreducible flow left); 113 of 113 with DXC.
+* `AM_SHADERS_OURS=1 am-shaders translate <marker> --raw <dir>`: one program through ours
+  (writes its DXIL; says when the validator wants other flags).
+* **Survey 1 in 20 (1,305 programs): 97.7 % through ours and the validator** (compute 100,
+  vertex 100, pixel 99.8 = every one translated, mesh 97.0). The rest is not ours to fix:
+  16 geometry/ES programs (the translator does not take them), 13 mesh programs over the
+  32 KiB of mesh outputs (DXC refuses them too: 20 outputs for 128 vertices do not fit however
+  packed), 1 untranslated operand. 3 pixel shaders get the tiled-resources flag from a clamp in
+  a register that DXC proves zero (constant propagation): the validator's flags are taken.
+* Full corpus survey: `cache\shaders\bench\ours-survey-full.txt` (run at the end of this session).
+
+**Next:** our compiler's output is valid DXIL, but only the tests check it computes the same as
+DXC's on the GPU (compute, VS/PS draw). Before the service uses it: (1) a GPU comparison of real
+programs, ours against DXC's (compute: same inputs, compare memory; mesh: a DispatchMesh draw
+test); (2) irreducible flow; (3) an optimizer pass (constant propagation, dead code) for the
+driver's sake and exact flags; (4) the shader service compiling with ours, the giants first.

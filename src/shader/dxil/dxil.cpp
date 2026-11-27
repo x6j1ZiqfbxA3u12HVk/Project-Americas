@@ -31,6 +31,7 @@ void key_u32(std::string& k, uint32_t v) { k.append(reinterpret_cast<const char*
 constexpr uint64_t kFlagDouble = 1ull << 2;
 constexpr uint64_t kFlagDoubleExtensions = 1ull << 6;
 constexpr uint64_t kFlagTiledResources = 1ull << 12;
+constexpr uint64_t kFlagBarycentrics = 1ull << 22;
 constexpr uint64_t kFlagRawBuffers = 1ull << 4;
 constexpr uint64_t kFlagUavsEveryStage = 1ull << 16;
 constexpr uint64_t kFlagWaveOps = 1ull << 19;
@@ -135,6 +136,12 @@ Value Module::const_float(Type t, uint64_t bits) {
 
 Value Module::undef(Type t) { return constant(ValueKind::Undef, t, 0); }
 Value Module::null(Type t) { return constant(ValueKind::Null, t, 0); }
+// Zero as the one constant a number type has for it (a phi of zeros is then trivial).
+Value Module::zero(Type t) {
+  if (is_int(t)) return const_int(t, 0);
+  if (is_float(t)) return const_float(t, 0);
+  return null(t);
+}
 
 Value Module::aggregate(Type t, const std::vector<Value>& elements) {
   std::string key("A");
@@ -550,6 +557,45 @@ void Module::set_compute(uint32_t x, uint32_t y, uint32_t z, uint32_t wave_size)
   wave_size_ = wave_size;
 }
 
+uint32_t Module::add_input(const SigElement& e) {
+  inputs_.push_back(e);
+  return static_cast<uint32_t>(inputs_.size() - 1);
+}
+
+uint32_t Module::add_output(const SigElement& e) {
+  outputs_.push_back(e);
+  return static_cast<uint32_t>(outputs_.size() - 1);
+}
+
+Value Module::load_input(uint32_t id, uint8_t col, bool is_float) {
+  const Type t = is_float ? f32_ : i32_;
+  return dx_call(4, "loadInput", t, t, {i32_, i32_, i8_, i32_}, Attr::ReadNone, {u32(id), u32(0), u8(col), undef(i32_)});
+}
+
+void Module::store_output(uint32_t id, uint8_t col, Value v) {
+  const Type t = type_of(v);
+  dx_call(5, "storeOutput", t, void_, {i32_, i32_, i8_, t}, Attr::None, {u32(id), u32(0), u8(col), v});
+}
+
+void Module::set_mesh(uint32_t x, uint32_t y, uint32_t z, uint32_t max_vertices, uint32_t max_primitives, uint32_t topology) {
+  stage_ = Stage::Mesh;
+  threads_[0] = x;
+  threads_[1] = y;
+  threads_[2] = z;
+  mesh_vertices_ = max_vertices;
+  mesh_primitives_ = max_primitives;
+  mesh_topology_ = topology;
+}
+
+void Module::store_vertex_output(uint32_t id, uint8_t col, Value v, Value vertex) {
+  const Type t = type_of(v);
+  dx_call(171, "storeVertexOutput", t, void_, {i32_, i32_, i8_, t, i32_}, Attr::None, {u32(id), u32(0), u8(col), v, vertex});
+}
+
+Value Module::attribute_at_vertex(uint32_t id, uint8_t col, uint8_t vertex) {
+  return dx_call(137, "attributeAtVertex", f32_, f32_, {i32_, i32_, i8_, i8_}, Attr::ReadNone, {u32(id), u32(0), u8(col), u8(vertex)});
+}
+
 // ---- finishing: SSA, checks, metadata ----
 
 bool Module::finish(std::string& error) {
@@ -598,7 +644,10 @@ bool Module::finish(std::string& error) {
   for (auto& b : blocks_) b.preds.clear();
   for (Block b : order_) each_successor(insts_[blocks_[b].insts.back()], [&](uint32_t s) { blocks_[s].preds.push_back(b); });
   build_ssa();
-  // Shader flags from what the program does.
+  // Shader flags from what the program does; the signatures' usage masks from its loads and
+  // stores (attributeAtVertex reads count for no mask, as DXC has it).
+  input_masks_.assign(inputs_.size(), 0);
+  output_masks_.assign(outputs_.size(), 0);
   for (Block b : order_) {
     for (uint32_t ii : blocks_[b].insts) {
       const Inst& in = insts_[ii];
@@ -627,6 +676,16 @@ bool Module::finish(std::string& error) {
           const Value clamp = resolve(in.ops.back());
           if (!(is_constant(clamp) && values_[clamp].bits == 0)) flags_ |= kFlagTiledResources;
         }
+        if (starts("dx.op.loadInput.") || starts("dx.op.storeOutput.") || starts("dx.op.storeVertexOutput.")) {
+          const bool load = starts("dx.op.loadInput.");
+          uint64_t id = 0, col = 0;
+          std::vector<uint8_t>& masks = load ? input_masks_ : output_masks_;
+          if (constant_int(in.ops[2], id) && constant_int(in.ops[4], col) && id < masks.size() && col < 8) {
+            masks[id] |= static_cast<uint8_t>(1u << col);
+            if (load && inputs_[id].kind == 28) flags_ |= kFlagBarycentrics;
+          }
+        }
+        if (starts("dx.op.attributeAtVertex.")) flags_ |= kFlagBarycentrics;
         if (n.compare(0, 10, "dx.op.wave") == 0 || n.compare(0, 10, "dx.op.quad") == 0) flags_ |= kFlagWaveOps;
         if (n == "dx.op.createHandleFromHeap") {
           uint64_t sampler = 0;
@@ -661,11 +720,36 @@ void Module::entry_metadata() {
     props.push_back(md_u32(4));
     props.push_back(md_node({md_u32(threads_[0]), md_u32(threads_[1]), md_u32(threads_[2])}));
   }
+  if (stage_ == Stage::Mesh) {
+    // The mesh state: {group, most vertices, most primitives, topology, payload bytes}.
+    props.push_back(md_u32(9));
+    props.push_back(md_node({md_node({md_u32(threads_[0]), md_u32(threads_[1]), md_u32(threads_[2])}), md_u32(mesh_vertices_),
+                             md_u32(mesh_primitives_), md_u32(mesh_topology_), md_u32(0)}));
+  }
   if (wave_size_) {
     props.push_back(md_u32(11));
     props.push_back(md_node({md_u32(wave_size_)}));
   }
-  const Md entry = md_node({md_value(main_), md_string("main"), kNone, resources, md_node(props)});
+  // Signatures: {inputs, outputs, patch constants}; each element {id, name, component type,
+  // semantic kind, {indices}, interpolation, rows, columns, start row, start column, {3: mask}}.
+  Md signatures = kNone;
+  if (!inputs_.empty() || !outputs_.empty()) {
+    const auto i8md = [&](int v) { return md_value(u8(static_cast<uint8_t>(v))); };
+    const auto list = [&](const std::vector<SigElement>& els, const std::vector<uint8_t>& masks) {
+      if (els.empty()) return kNone;
+      std::vector<Md> nodes;
+      for (size_t k = 0; k < els.size(); ++k) {
+        const SigElement& e = els[k];
+        const Md ext = masks[k] ? md_node({md_u32(3), md_u32(masks[k])}) : kNone;
+        nodes.push_back(md_node({md_u32(static_cast<uint32_t>(k)), md_string(e.name), i8md(e.comp), i8md(e.kind),
+                                 md_node({md_u32(e.index)}), i8md(e.interp), md_u32(e.rows), i8md(e.cols),
+                                 md_u32(static_cast<uint32_t>(e.row)), i8md(e.col), ext}));
+      }
+      return md_node(nodes);
+    };
+    signatures = md_node({list(inputs_, input_masks_), list(outputs_, output_masks_), kNone});
+  }
+  const Md entry = md_node({md_value(main_), md_string("main"), signatures, resources, md_node(props)});
   named_metadata("dx.entryPoints", {entry});
 }
 
@@ -822,7 +906,7 @@ void Module::build_ssa() {
         // instructions that read undef (a masked write keeps the register's old value).
         const Value c = cur[in.aux];
         const Value r = in.result;
-        const Value u = c != kNone ? c : null(var_types_[in.aux]);
+        const Value u = c != kNone ? c : zero(var_types_[in.aux]);
         forward_.resize(values_.size(), kNone);
         forward_[r] = u;
       } else if (in.op == Op::Write) {
@@ -833,7 +917,7 @@ void Module::build_ssa() {
     each_successor(insts_[blocks_[b].insts.back()], [&](uint32_t s) {
       for (uint32_t pi : blocks_[s].phis) {
         const uint32_t var = insts_[pi].aux;
-        const Value c = cur[var] != kNone ? cur[var] : null(var_types_[var]);
+        const Value c = cur[var] != kNone ? cur[var] : zero(var_types_[var]);
         insts_[pi].ops.push_back(c);
         insts_[pi].ops.push_back(b);
       }
@@ -876,7 +960,7 @@ void Module::build_ssa() {
         }
         if (!trivial) continue;
         const Value r = p.result;
-        const Value to = same != kNone ? same : null(p.type);
+        const Value to = same != kNone ? same : zero(p.type);
         forward_.resize(values_.size(), kNone);
         forward_[r] = to;
         again = true;

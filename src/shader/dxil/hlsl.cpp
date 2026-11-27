@@ -396,6 +396,8 @@ Ty scalar(B b, uint8_t n = 1) {
 struct StructDef {
   uint32_t name = 0;
   std::vector<std::pair<uint32_t, Ty>> members;
+  std::vector<uint32_t> semantics;  // per member: its semantic (0: none)
+  std::vector<bool> nointerp;       // per member: nointerpolation
 };
 
 // An rvalue: its scalar components, flattened (a vector's, a struct's members in order, an
@@ -413,7 +415,9 @@ struct RV {
 // writable texture.
 struct LV {
   // Pick: one component of a vector in variables (vars), chosen by a value (pick).
-  enum Kind : uint8_t { Vars, Mem, Texel, Pick } kind = Vars;
+  // MeshVert: a mesh shader's vertex outputs (vars: per component its element << 8 | column;
+  // pick: the vertex); MeshIdx: its primitives' indices (pick: the primitive).
+  enum Kind : uint8_t { Vars, Mem, Texel, Pick, MeshVert, MeshIdx } kind = Vars;
   Ty t;
   std::vector<uint32_t> vars;
   std::vector<Value> ptrs;     // Mem: an element's pointer per component
@@ -434,6 +438,7 @@ struct Param {
   uint32_t name = 0;
   Ty t;
   uint8_t dir = 0;  // 0 in, 1 out, 2 inout
+  uint8_t mesh = 0;  // a mesh entry's output: 1 vertices, 2 indices, 3 primitives
   size_t def_begin = 0, def_end = 0;  // a default value's tokens
 };
 
@@ -444,6 +449,7 @@ struct Fn {
   size_t body = 0;  // the token after '{'
   size_t attr_begin = 0, attr_end = 0;
   std::vector<uint32_t> semantics;  // per parameter (entry points)
+  uint32_t ret_semantic = 0;
   bool dynamic_arrays_known = false;
   std::unordered_set<uint32_t> dynamic_arrays;  // local arrays indexed by a value
 };
@@ -453,11 +459,13 @@ struct Local {
   std::vector<uint32_t> vars;  // a variable per component
   Value mem = kNone;           // an array in memory: the alloca (of [n x elem])
   Value handle = kNone;        // a resource: its handle
+  uint8_t mesh = 0;            // a mesh output (Param::mesh); vars: its slots (LV::MeshVert)
 };
 
 // Globals: bound resources, cbuffer members, groupshared and static const arrays.
 struct Global {
-  enum Kind : uint8_t { Resource, CbMember, Shared, Constant } kind = Resource;
+  // Static: a mutable static, kept in variables (every function is inlined into the entry).
+  enum Kind : uint8_t { Resource, CbMember, Shared, Constant, Static } kind = Resource;
   Ty t;
   ResourceClass cls = ResourceClass::Srv;
   uint32_t space = 0, reg = 0;
@@ -469,6 +477,7 @@ struct Global {
   Value ptr = kNone;
   uint32_t name = 0;
   std::vector<Value> init;  // Constant: the elements
+  std::vector<uint32_t> vars;  // Static: a variable per component, made at first use
 };
 
 struct CBuffer {
@@ -480,18 +489,18 @@ class Compiler {
  public:
   Compiler(Module& m, Syms& syms, std::vector<Token> toks) : m_(m), syms_(syms), t_(std::move(toks)) { names(); }
 
-  void run(std::string_view entry) {
+  void run(std::string_view entry, std::string_view profile) {
     top_level();
     const auto it = fns_.find(syms_.id(entry));
     if (it == fns_.end()) throw Failure{"no entry function " + std::string(entry)};
-    compile_entry(*it->second);
+    compile_entry(*it->second, profile);
   }
 
  private:
   // ---- names ----
   uint32_t s_struct, s_cbuffer, s_register, s_static, s_const, s_groupshared, s_in, s_out, s_inout, s_if, s_else, s_for,
       s_while, s_do, s_switch, s_case, s_default, s_break, s_continue, s_return, s_goto, s_true, s_false, s_void, s_uniform,
-      s_precise, s_nointerp, s_heap, s_sheap, s_nonuniform, s_numthreads, s_wavesize;
+      s_precise, s_nointerp, s_heap, s_sheap, s_nonuniform, s_numthreads, s_wavesize, s_discard, s_outputtopology;
   uint32_t p_lparen, p_rparen, p_lbrack, p_rbrack, p_lbrace, p_rbrace, p_comma, p_semi, p_colon, p_dot, p_quest, p_assign, p_lt,
       p_gt;
   void names() {
@@ -502,7 +511,7 @@ class Compiler {
     s_break = s("break"), s_continue = s("continue"), s_return = s("return"), s_goto = s("goto"), s_true = s("true");
     s_false = s("false"), s_void = s("void"), s_uniform = s("uniform"), s_precise = s("precise"), s_nointerp = s("nointerpolation");
     s_heap = s("ResourceDescriptorHeap"), s_sheap = s("SamplerDescriptorHeap"), s_nonuniform = s("NonUniformResourceIndex");
-    s_numthreads = s("numthreads"), s_wavesize = s("WaveSize");
+    s_numthreads = s("numthreads"), s_wavesize = s("WaveSize"), s_discard = s("discard"), s_outputtopology = s("outputtopology");
     p_lparen = s("("), p_rparen = s(")"), p_lbrack = s("["), p_rbrack = s("]"), p_lbrace = s("{"), p_rbrace = s("}");
     p_comma = s(","), p_semi = s(";"), p_colon = s(":"), p_dot = s("."), p_quest = s("?"), p_assign = s("="), p_lt = s("<");
     p_gt = s(">");
@@ -759,6 +768,8 @@ class Compiler {
         break;
       case LV::Texel: return texel_load(lv);
       case LV::Pick: r.c.push_back(pick_read(lv)); break;
+      case LV::MeshVert:
+      case LV::MeshIdx: fail("a mesh output read");
     }
     return r;
   }
@@ -781,6 +792,18 @@ class Compiler {
       case LV::Pick:
         for (size_t k = 0; k < lv.vars.size(); ++k)
           m_.write(lv.vars[k], m_.select(m_.cmp(Pred::IEq, lv.pick, m_.u32(static_cast<uint32_t>(k))), v.c[0], m_.read(lv.vars[k])));
+        break;
+      case LV::MeshVert:
+        if (lv.pick == kNone) fail("a mesh vertex output without its vertex");
+        for (size_t k = 0; k < lv.vars.size(); ++k) {
+          const Value x = lv.t.b == B::Bool ? conv(v.c[k], B::Bool, B::Uint) : v.c[k];
+          m_.store_vertex_output(lv.vars[k] >> 8, static_cast<uint8_t>(lv.vars[k] & 0xFF), x, lv.pick);
+        }
+        break;
+      case LV::MeshIdx:
+        if (lv.pick == kNone || v.c.size() != 3) fail("indices written other than a primitive's three");
+        m_.dx_call(169, "emitIndices", kNone, m_.void_type(), {m_.i32(), m_.i32(), m_.i32(), m_.i32()}, Attr::None,
+                   {lv.pick, v.c[0], v.c[1], v.c[2]});
         break;
     }
   }
@@ -824,6 +847,11 @@ class Compiler {
   LV local_lv(Local& l) {
     LV lv;
     lv.t = l.t;
+    if (l.mesh) {
+      lv.kind = l.mesh == 1 ? LV::MeshVert : LV::MeshIdx;
+      lv.vars = l.vars;
+      return lv;
+    }
     if (l.mem != kNone) {
       lv.kind = LV::Mem;
       lv.arr = l.mem;
@@ -927,6 +955,10 @@ class Compiler {
         if (elems.size() != t.arr) fail("a static const array with the wrong count");
         g.name = name;
         g.init = std::move(elems);
+      } else if (is_static && !is_const) {
+        g.kind = Global::Static;
+        if (!is_numeric(t.b)) fail("a static of a type outside the subset");
+        if (is_p(p_assign)) fail("a static with an initializer");
       } else {
         fail("a global variable outside the subset");
       }
@@ -967,7 +999,10 @@ class Compiler {
     sd.name = ident();
     expect(p_lbrace);
     while (!accept(p_rbrace)) {
-      while (accept_id(s_nointerp) || accept_id(s_precise)) {
+      bool flat = false;
+      for (;;) {
+        if (accept_id(s_nointerp)) flat = true;
+        else if (!accept_id(s_precise)) break;
       }
       const Ty base = parse_type();
       do {
@@ -977,8 +1012,11 @@ class Compiler {
           mt.arr = static_cast<uint32_t>(next().bits);
           expect(p_rbrack);
         }
-        if (accept(p_colon)) ident();  // a semantic
+        uint32_t sem = 0;
+        if (accept(p_colon)) sem = ident();
         sd.members.emplace_back(mn, mt);
+        sd.semantics.push_back(sem);
+        sd.nointerp.push_back(flat);
       } while (accept(p_comma));
       expect(p_semi);
     }
@@ -1032,8 +1070,10 @@ class Compiler {
         if (accept_id(s_in)) p.dir = p.dir;
         else if (accept_id(s_out)) p.dir = 1;
         else if (accept_id(s_inout)) p.dir = 2;
-        else if (accept_id(s_nointerp) || accept_id(s_const) || accept_id(s_uniform) || accept_id(syms_.id("vertices")) ||
-                 accept_id(syms_.id("indices")) || accept_id(syms_.id("primitives")))
+        else if (accept_id(syms_.id("vertices"))) p.mesh = 1;
+        else if (accept_id(syms_.id("indices"))) p.mesh = 2;
+        else if (accept_id(syms_.id("primitives"))) p.mesh = 3;
+        else if (accept_id(s_nointerp) || accept_id(s_const) || accept_id(s_uniform))
           continue;
         else break;
       }
@@ -1054,7 +1094,7 @@ class Compiler {
       f->semantics.push_back(sem);
       accept(p_comma);
     }
-    if (accept(p_colon)) ident();  // a return semantic
+    if (accept(p_colon)) f->ret_semantic = ident();
     if (!is_p(p_lbrace)) fail("a function declaration without a body");
     f->body = pos_ + 1;
     skip_group();
@@ -1080,19 +1120,126 @@ class Compiler {
   // ---- the entry point ----
   Fn* fn_ = nullptr;  // the function whose body is being compiled (innermost inline)
 
-  void compile_entry(Fn& f) {
+  // ---- graphics signatures ----
+  Stage stage_ = Stage::Compute;
+  // A variable holding a component of an entry input: its element and column (GetAttributeAtVertex).
+  std::unordered_map<uint32_t, std::pair<uint32_t, uint8_t>> input_of_var_;
+  // A field of an entry's signature: its semantic, type, nointerpolation, and first component in
+  // the local (or result) that holds it.
+  struct Field {
+    std::string semantic;
+    Ty t;
+    bool flat = false;
+    size_t at = 0;
+  };
+  void fields_of(const Ty& t, uint32_t sem, size_t at, std::vector<Field>& out) {
+    if (t.b == B::Struct && !t.arr) {
+      const StructDef& sd = structs_[t.st];
+      size_t off = at;
+      for (size_t k = 0; k < sd.members.size(); ++k) {
+        const Ty& mt = sd.members[k].second;
+        if (!sd.semantics[k]) fail("a member without a semantic in an entry's signature");
+        if (mt.b == B::Struct || mt.arr || !is_numeric(mt.b)) fail("a signature member outside the subset");
+        out.push_back({syms_.name(sd.semantics[k]), mt, sd.nointerp[k], off});
+        off += comps(mt);
+      }
+      return;
+    }
+    if (!sem) fail("an entry parameter without a semantic");
+    if (t.arr || !is_numeric(t.b)) fail("a signature parameter outside the subset");
+    out.push_back({syms_.name(sem), t, false, at});
+  }
+  // The element of a field, as DXC makes it (not yet packed).
+  SigElement element_of(const Field& f, bool input) {
+    SigElement e;
+    std::string n = f.semantic;
+    size_t d = n.size();
+    while (d > 0 && n[d - 1] >= '0' && n[d - 1] <= '9') --d;
+    e.index = d < n.size() ? static_cast<uint32_t>(std::stoul(n.substr(d))) : 0u;
+    n.resize(d);
+    const auto lower = [](std::string x) {
+      for (char& ch : x) ch = static_cast<char>(ch >= 'A' && ch <= 'Z' ? ch + 32 : ch);
+      return x;
+    };
+    if (lower(n).compare(0, 3, "sv_") == 0) {
+      struct System {
+        const char* name;
+        uint8_t kind;
+      };
+      static const System kSystem[] = {
+          {"SV_VertexID", 1}, {"SV_InstanceID", 2}, {"SV_Position", 3}, {"SV_RenderTargetArrayIndex", 4},
+          {"SV_ViewportArrayIndex", 5}, {"SV_ClipDistance", 6}, {"SV_CullDistance", 7}, {"SV_PrimitiveID", 10},
+          {"SV_SampleIndex", 12}, {"SV_IsFrontFace", 13}, {"SV_Coverage", 14}, {"SV_Target", 16}, {"SV_Depth", 17},
+          {"SV_Barycentrics", 28}};
+      bool known = false;
+      for (const auto& [name, kind] : kSystem) {
+        if (lower(name) == lower(n)) {
+          n = name;
+          e.kind = kind;
+          known = true;
+        }
+      }
+      if (!known) fail("the system value " + n + " (not yet)");
+    }
+    e.name = n;
+    const B b = f.t.b;
+    e.comp = is_float(b) ? 9 : b == B::Int ? 4 : 5;
+    if (b == B::Double || b == B::Int64 || b == B::Uint64 || b == B::Bool) fail("a signature element of 64 bits or bool");
+    e.cols = f.t.n;
+    if ((input && stage_ == Stage::Vertex) || (!input && stage_ == Stage::Pixel)) e.interp = 0;
+    else if (e.kind == 3) e.interp = 4;  // position: linear, no perspective
+    else if (!is_float(b) || f.flat) e.interp = 1;
+    else e.interp = 2;
+    return e;
+  }
+  // Rows and columns as DXC's prefix-stable packing gives them: elements in order, each where
+  // the previous ended when it fits in that row with the same interpolation; system values start
+  // a row of their own; targets at their index; depth, coverage and barycentrics unpacked; the
+  // vertex shader's inputs a row each.
+  void pack(std::vector<SigElement>& els, bool row_each) {
+    int32_t row = -1;
+    int col = 4;
+    uint8_t interp = 0;
+    for (SigElement& e : els) {
+      if (e.kind == 28 || e.kind == 17 || e.kind == 14) {
+        e.row = -1;
+        e.col = -1;
+        continue;
+      }
+      if (e.kind == 16) {
+        e.row = static_cast<int32_t>(e.index);
+        e.col = 0;
+        row = std::max(row, e.row);
+        col = 4;
+        continue;
+      }
+      if (row_each || e.kind != 0 || row < 0 || col + e.cols > 4 || interp != e.interp) {
+        ++row;
+        col = 0;
+        interp = e.interp;
+      }
+      e.row = row;
+      e.col = static_cast<int8_t>(col);
+      col = e.kind != 0 ? 4 : col + e.cols;
+    }
+  }
+
+  void compile_entry(Fn& f, std::string_view profile) {
     // Attributes: numthreads, WaveSize.
     uint32_t threads[3] = {1, 1, 1}, wave = 0;
-    bool compute = false;
+    bool compute = false, mesh = false;
+    uint32_t topology = 2;
     const size_t keep = pos_;
     pos_ = f.attr_begin;
     while (pos_ < f.attr_end) {
       expect(p_lbrack);
       const uint32_t a = ident();
       std::vector<uint32_t> nums;
+      std::string text;
       if (accept(p_lparen)) {
         while (!accept(p_rparen)) {
           if (peek().kind == Tk::Int) nums.push_back(static_cast<uint32_t>(peek().bits));
+          if (peek().kind == Tk::Str) text = syms_.name(peek().sym);
           next();
         }
       }
@@ -1102,19 +1249,81 @@ class Compiler {
         for (int k = 0; k < 3; ++k) threads[k] = nums[static_cast<size_t>(k)];
       } else if (a == s_wavesize && !nums.empty()) {
         wave = nums[0];
+      } else if (a == s_outputtopology) {
+        mesh = true;
+        topology = text.find("line") != std::string::npos ? 1u : 2u;
       }
     }
     pos_ = keep;
-    if (!compute) fail("an entry point other than a compute shader (not yet)");
-    m_.set_compute(threads[0], threads[1], threads[2], wave);
+    // The stage: the profile's, else what the entry declares.
+    if (profile.size() >= 2) {
+      const std::string_view k = profile.substr(0, 2);
+      stage_ = k == "cs" ? Stage::Compute : k == "vs" ? Stage::Vertex : k == "ps" ? Stage::Pixel : k == "ms" ? Stage::Mesh : Stage::Compute;
+      if (k != "cs" && k != "vs" && k != "ps" && k != "ms") fail("the profile " + std::string(profile));
+    } else if (mesh) {
+      stage_ = Stage::Mesh;
+    } else if (compute) {
+      stage_ = Stage::Compute;
+    } else {
+      bool vertex = false;
+      for (const uint32_t s : f.semantics) vertex = vertex || (s && (syms_.name(s) == "SV_VertexID" || syms_.name(s) == "SV_InstanceID"));
+      stage_ = vertex ? Stage::Vertex : Stage::Pixel;
+    }
+    if (stage_ == Stage::Mesh) {
+      uint32_t vertices = 0, primitives = 0;
+      for (const Param& p : f.params) {
+        if (p.mesh == 1) vertices = p.t.arr;
+        if (p.mesh == 2) primitives = p.t.arr;
+        if (p.mesh == 3) fail("per-primitive mesh outputs (not yet)");
+      }
+      m_.set_mesh(threads[0], threads[1], threads[2], vertices, primitives, topology);
+    } else if (stage_ == Stage::Compute) {
+      m_.set_compute(threads[0], threads[1], threads[2], wave);
+    }
+    else m_.set_graphics(stage_);
     // Block 0 holds handles and allocas made on first use; the code starts in block 1.
     const Block start = m_.block();
     m_.at(start);
     scopes_.emplace_back();
+    struct Input {
+      Field field;
+      Local* local;
+    };
+    std::vector<Input> inputs;
     for (size_t k = 0; k < f.params.size(); ++k) {
       const Param& p = f.params[k];
       const std::string sem = f.semantics[k] ? syms_.name(f.semantics[k]) : std::string();
+      if (p.mesh) {
+        // A mesh output: no variables; its slots (vertices: each component's element and column).
+        if (stage_ != Stage::Mesh || !p.t.arr) fail("a mesh output outside a mesh shader");
+        Local l;
+        l.t = p.t;
+        l.mesh = p.mesh;
+        if (p.mesh == 1) {
+          Ty one = p.t;
+          one.arr = 0;
+          std::vector<Field> fl;
+          fields_of(one, 0, 0, fl);
+          std::vector<SigElement> els;
+          for (const Field& x : fl) els.push_back(element_of(x, false));
+          pack(els, false);
+          l.vars.resize(comps(one));
+          for (size_t i = 0; i < fl.size(); ++i) {
+            const uint32_t id = m_.add_output(els[i]);
+            for (uint32_t c = 0; c < fl[i].t.n; ++c) l.vars[fl[i].at + c] = id << 8 | c;
+          }
+        }
+        scopes_.back()[p.name] = std::move(l);
+        continue;
+      }
       Local& l = declare(p.name, p.t, false);
+      if (stage_ == Stage::Vertex || stage_ == Stage::Pixel) {
+        if (p.dir != 0) fail("an out parameter of a graphics entry (not yet)");
+        std::vector<Field> fl;
+        fields_of(p.t, f.semantics[k], 0, fl);
+        for (const Field& x : fl) inputs.push_back({x, &l});
+        continue;
+      }
       for (uint32_t c = 0; c < p.t.n; ++c) {
         Value v;
         if (sem == "SV_GroupThreadID") v = m_.thread_id_in_group(c);
@@ -1125,16 +1334,55 @@ class Compiler {
         m_.write(l.vars[c], v);
       }
     }
+    // Inputs: the elements packed, then every component read into its variable at the start.
+    if (!inputs.empty()) {
+      std::vector<SigElement> els;
+      for (const Input& x : inputs) els.push_back(element_of(x.field, true));
+      pack(els, stage_ == Stage::Vertex);
+      for (size_t k = 0; k < inputs.size(); ++k) {
+        const uint32_t id = m_.add_input(els[k]);
+        const Field& x = inputs[k].field;
+        for (uint8_t c = 0; c < x.t.n; ++c) {
+          const Value raw = m_.load_input(id, c, is_float(x.t.b));
+          const uint32_t var = inputs[k].local->vars[x.at + c];
+          m_.write(var, is_float(x.t.b) ? raw : conv(raw, B::Uint, x.t.b));
+          input_of_var_[var] = {id, c};
+        }
+      }
+    }
     fn_ = &f;
     find_dynamic_arrays(f);
     Ret r;
     r.exit = m_.block();
+    r.t = f.ret;
+    if (f.ret.b != B::Void) {
+      if (stage_ == Stage::Compute) fail("a compute entry that returns a value");
+      std::vector<B> tb;
+      bases(f.ret, tb);
+      for (B b : tb) r.vars.push_back(m_.variable(ir(b)));
+    }
     rets_.push_back(r);
     pos_ = f.body;
     block_body();
     branch(r.exit);
     rets_.pop_back();
     m_.at(r.exit);
+    // Outputs: every component of the result written at the end.
+    if (f.ret.b != B::Void) {
+      std::vector<Field> fl;
+      fields_of(f.ret, f.ret_semantic, 0, fl);
+      std::vector<SigElement> els;
+      for (const Field& x : fl) els.push_back(element_of(x, false));
+      pack(els, false);
+      for (size_t k = 0; k < fl.size(); ++k) {
+        const uint32_t id = m_.add_output(els[k]);
+        for (uint8_t c = 0; c < fl[k].t.n; ++c) {
+          const Value v = m_.read(r.vars[fl[k].at + c]);
+          const B b = fl[k].t.b;
+          m_.store_output(id, c, b == B::Bool ? conv(v, B::Bool, B::Uint) : v);
+        }
+      }
+    }
     m_.ret();
     m_.at(0);
     m_.br(start);
@@ -1169,6 +1417,13 @@ class Compiler {
       if (s == s_do) return do_statement();
       if (s == s_switch) return switch_statement();
       if (s == s_return) return return_statement();
+      if (s == s_discard) {
+        next();
+        expect(p_semi);
+        if (stage_ != Stage::Pixel) fail("discard outside a pixel shader");
+        m_.dx_call(82, "discard", kNone, m_.void_type(), {m_.i1()}, Attr::None, {m_.boolean(true)});
+        return;
+      }
       if (s == s_break || s == s_continue) {
         next();
         expect(p_semi);
@@ -1670,7 +1925,7 @@ class Compiler {
           if (e.is_lv) {
             out.lv = e.lv;
             out.lv.t = mt;
-            if (e.lv.kind == LV::Vars) out.lv.vars.assign(e.lv.vars.begin() + static_cast<std::ptrdiff_t>(at), e.lv.vars.begin() + static_cast<std::ptrdiff_t>(at + cn));
+            if (e.lv.kind == LV::Vars || e.lv.kind == LV::MeshVert) out.lv.vars.assign(e.lv.vars.begin() + static_cast<std::ptrdiff_t>(at), e.lv.vars.begin() + static_cast<std::ptrdiff_t>(at + cn));
             else fail("a member of a struct in memory");
           } else {
             out.rv.t = mt;
@@ -1698,9 +1953,11 @@ class Compiler {
       }
       if (pick.empty() || pick.size() > 4) fail("swizzle ." + n);
       Ex out;
-      out.is_lv = e.is_lv && e.lv.kind == LV::Vars;
+      out.is_lv = e.is_lv && (e.lv.kind == LV::Vars || e.lv.kind == LV::MeshVert);
       const Ty nt = scalar(t.b, static_cast<uint8_t>(pick.size()));
       if (out.is_lv) {
+        out.lv.kind = e.lv.kind;
+        out.lv.pick = e.lv.pick;
         out.lv.t = nt;
         for (size_t k : pick) out.lv.vars.push_back(e.lv.vars[k]);
       } else {
@@ -1718,6 +1975,13 @@ class Compiler {
     uint64_t k = 0;
     const bool constant = !idx.c.empty() && m_.constant_int(idx.c[0], k);
     if (t.b == B::Res) return texel(e, idx);
+    if (e.is_lv && (e.lv.kind == LV::MeshVert || e.lv.kind == LV::MeshIdx)) {
+      if (!t.arr || e.lv.pick != kNone) fail("a mesh output indexed twice");
+      Ex out = e;
+      out.lv.t = element(t);
+      out.lv.pick = scalar_of(idx, B::Uint);
+      return out;
+    }
     if (t.b == B::HeapRef) fail("an index of a heap reference");
     if (t.arr) {
       const Ty et = element(t);
@@ -1861,6 +2125,18 @@ class Compiler {
   }
 
   Ex global(Global& g) {
+    if (g.kind == Global::Static) {
+      if (g.vars.empty()) {
+        std::vector<B> tb;
+        bases(g.t, tb);
+        for (B b : tb) g.vars.push_back(m_.variable(ir(b)));
+      }
+      Ex e;
+      e.is_lv = true;
+      e.lv.t = g.t;
+      e.lv.vars = g.vars;
+      return e;
+    }
     if (g.kind == Global::Shared && g.ptr == kNone) {
       g.ptr = m_.global("am.shared." + syms_.name(g.name), m_.array(ir(g.t.b), g.t.arr), 3, 4);
     } else if (g.kind == Global::Constant && g.ptr == kNone) {
@@ -2137,6 +2413,24 @@ class Compiler {
         n == "InterlockedXor" || n == "InterlockedExchange" || n == "InterlockedCompareExchange") {
       return shared_atomic(n);
     }
+    if (n == "GetAttributeAtVertex") {
+      // An input's value at one of the triangle's vertices: its element and columns, at a vertex.
+      std::vector<Ex> e = exprs_until_paren();
+      if (e.size() != 2 || !e[0].is_lv || e[0].lv.kind != LV::Vars) fail("GetAttributeAtVertex of something not an input");
+      uint64_t vertex = 0;
+      const RV vx = value(e[1]);
+      if (vx.c.empty() || !m_.constant_int(vx.c[0], vertex) || vertex > 2) fail("GetAttributeAtVertex at a vertex not a constant");
+      if (!is_float(e[0].lv.t.b)) fail("GetAttributeAtVertex of an integer input (not yet)");
+      RV out;
+      out.t = e[0].lv.t;
+      out.t.b = B::Float;
+      for (const uint32_t var : e[0].lv.vars) {
+        const auto it = input_of_var_.find(var);
+        if (it == input_of_var_.end()) fail("GetAttributeAtVertex of something not an input");
+        out.c.push_back(m_.attribute_at_vertex(it->second.first, it->second.second, static_cast<uint8_t>(vertex)));
+      }
+      return out;
+    }
     std::vector<RV> a;
     if (n == "asuint") {
       // asuint(double, out uint lo, out uint hi): DXIL's splitDouble; asuint(x) below.
@@ -2174,6 +2468,25 @@ class Compiler {
     if (n == "select") {
       need(3);
       return select(a[0], a[1], a[2]);
+    }
+    if (n == "ddx_fine" || n == "ddy_fine" || n == "ddx" || n == "ddy" || n == "ddx_coarse" || n == "ddy_coarse") {
+      // DXIL's derivatives: coarse 83 (x) and 84 (y), fine 85 and 86; ddx and ddy are coarse.
+      need(1);
+      if (stage_ != Stage::Pixel) fail(n + " outside a pixel shader");
+      const bool fine = n.find("fine") != std::string::npos, y = n[1] == 'd' && n[2] == 'y';
+      return per(a[0], B::Float, (fine ? 85u : 83u) + (y ? 1u : 0u), "unary");
+    }
+    if (n == "SetMeshOutputCounts") {
+      need(2);
+      if (stage_ != Stage::Mesh) fail("SetMeshOutputCounts outside a mesh shader");
+      m_.dx_call(168, "setMeshOutputCounts", kNone, m_.void_type(), {m_.i32(), m_.i32()}, Attr::None,
+                 {scalar_of(a[0], B::Uint), scalar_of(a[1], B::Uint)});
+      return RV{};
+    }
+    if (n == "IsHelperLane") {
+      need(0);
+      if (stage_ != Stage::Pixel) return make(B::Bool, {m_.boolean(false)});
+      return make(B::Bool, {m_.dx_call(221, "isHelperLane", m_.i1(), m_.i1(), {}, Attr::ReadOnly, {})});
     }
     if (n == "dot") {
       // Floats: DXIL's dot2/dot3/dot4; integers: products added in order.
@@ -2705,7 +3018,7 @@ class Compiler {
 
 }  // namespace
 
-bool compile_hlsl(std::string_view source, std::string_view entry, Module& m, std::string& error) {
+bool compile_hlsl(std::string_view source, std::string_view entry, Module& m, std::string& error, std::string_view profile) {
   try {
     Syms syms;
     std::vector<Token> raw;
@@ -2713,7 +3026,7 @@ bool compile_hlsl(std::string_view source, std::string_view entry, Module& m, st
     Preprocessor pp(syms, raw);
     std::vector<Token> toks = pp.run();
     Compiler c(m, syms, std::move(toks));
-    c.run(entry);
+    c.run(entry, profile);
     return true;
   } catch (const Failure& f) {
     error = f.what;

@@ -115,7 +115,11 @@ int translate(const std::string& wanted, const fs::path& pack_dir, const fs::pat
       for (const shader::NativeBlob& b : shader->shader.blobs) {
         for (const shader::NativeProgram& pr : b.programs) {
           if (marker_of(b.code(pr)) != wanted) continue;
-          const shader::Translation t = shader::translate(input_of(shader->bytes, b, pr), shader::Binding::Runtime);
+          // AM_SHADERS_OURS=1: the goto form through our own compiler (shader/dxil) instead of DXC.
+          const bool ours = GetEnvironmentVariableA("AM_SHADERS_OURS", nullptr, 0) != 0;
+          shader::TranslateInput tin = input_of(shader->bytes, b, pr);
+          tin.goto_form = ours;
+          const shader::Translation t = shader::translate(tin, shader::Binding::Runtime);
           if (!t.ok) {
             std::printf("%s: not translated: %s\n", wanted.c_str(), t.failure.c_str());
             return 1;
@@ -138,8 +142,24 @@ int translate(const std::string& wanted, const fs::path& pack_dir, const fs::pat
           // AM_SHADERS_O0=1: unoptimized over 1 MiB, as the service once did (to compare what the driver does).
           const bool huge = t.hlsl.size() > (1u << 20) && GetEnvironmentVariableA("AM_SHADERS_O0", nullptr, 0);
           const auto c0 = std::chrono::steady_clock::now();
-          const host::CompileResult r =
-              host::compile_hlsl(t.hlsl, t.entry, t.profile, huge ? std::vector<std::wstring>{L"-O0"} : std::vector<std::wstring>{});
+          host::CompileResult r;
+          if (ours) {
+            shader::dxil::Module m;
+            if (!shader::dxil::compile_hlsl(t.hlsl, t.entry, m, r.messages, t.profile) || !m.finish(r.messages)) {
+              r.messages = "ours: " + r.messages;
+            } else {
+              r = host::assemble_dxil(shader::dxil::write_bitcode(m));
+              uint64_t flags = 0;
+              if (!r.ok && shader::dxil::validator_flags(r.messages, flags)) {
+                std::printf("%s: the validator wants flags 0x%llx (ours 0x%llx)\n", wanted.c_str(), static_cast<unsigned long long>(flags),
+                            static_cast<unsigned long long>(m.shader_flags()));
+                m.set_flags(flags);
+                r = host::assemble_dxil(shader::dxil::write_bitcode(m));
+              }
+            }
+          } else {
+            r = host::compile_hlsl(t.hlsl, t.entry, t.profile, huge ? std::vector<std::wstring>{L"-O0"} : std::vector<std::wstring>{});
+          }
           if (r.ok) {
             std::ofstream(out_dir / widen(wanted + ".dxil"), std::ios::binary)
                 .write(reinterpret_cast<const char*>(r.dxil.data()), static_cast<std::streamsize>(r.dxil.size()));
@@ -399,7 +419,7 @@ int ours_survey(const fs::path& pack_dir, const fs::path& out_json, size_t every
               const auto t0 = std::chrono::steady_clock::now();
               shader::dxil::Module m;
               std::string message;
-              compiled = shader::dxil::compile_hlsl(t.hlsl, t.entry, m, message) && m.finish(message);
+              compiled = shader::dxil::compile_hlsl(t.hlsl, t.entry, m, message, t.profile) && m.finish(message);
               const auto t1 = std::chrono::steady_clock::now();
               ours_s = std::chrono::duration<double>(t1 - t0).count();
               if (!compiled) {
