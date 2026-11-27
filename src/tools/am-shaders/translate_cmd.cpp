@@ -897,10 +897,10 @@ int serve(const fs::path& pack_dir, const fs::path& runtime_dir, const fs::path&
       if (everything && at.loops && !guarded.count(m) && fs::exists(out_dir / widen(m + ".dxil"), ec)) upgrades.push_back(m);
     }
     std::sort(upgrades.begin(), upgrades.end(), [&](const std::string& a, const std::string& b) { return where[a].code_size > where[b].code_size; });
-    // Unoptimized DXIL goes before the guard upgrades (the queue is taken from its back).
-    for (const std::string& m : unoptimized) {
-      if (everything && where.count(m) && std::find(upgrades.begin(), upgrades.end(), m) == upgrades.end()) upgrades.push_back(m);
-    }
+    // Unoptimized DXIL is compiled again on demand only: the runtime asks for a large program whose
+    // DXIL is not optimized as if it were missing (host_pipeline.cpp), and needs() takes it then.
+    // Done as idle work, the largest ones held the one large-compile slot for many minutes while
+    // a program the game waited for queued behind them.
     std::sort(bulk.begin(), bulk.end(), [&](const std::string& a, const std::string& b) { return where[a].code_size > where[b].code_size; });
   }
   say("serve: %zu programs mapped in %zu containers (%.0f s); %s; %u at a time\n", where.size(), files.size(),
@@ -1130,10 +1130,13 @@ int serve(const fs::path& pack_dir, const fs::path& runtime_dir, const fs::path&
           if (stopping) return;  // asked to stop: no new work
           idle_item = false;
           // A large program set aside, once a large-compile slot is free.
+          // One the game waits for first.
           if (!deferred_huge.empty() && huge_room()) {
-            marker = deferred_huge.front().first;
-            waited = deferred_huge.front().second;
-            deferred_huge.erase(deferred_huge.begin());
+            auto pick = std::find_if(deferred_huge.begin(), deferred_huge.end(), [](const auto& d) { return d.second; });
+            if (pick == deferred_huge.end()) pick = deferred_huge.begin();
+            marker = pick->first;
+            waited = pick->second;
+            deferred_huge.erase(pick);
           }
           while (!urgent.empty() && marker.empty()) {
             std::string m = urgent.front();

@@ -96,6 +96,23 @@ bool load_precompiled(const std::string& marker, std::vector<uint8_t>& dxil) {
     return false;
   }
   dxil.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+  // Large DXIL compiled unoptimized (its .src key lacks "-o3": from before every compile was
+  // optimized) is not used: AMD's driver compiler takes over 20 GB on it. Treated as missing, the
+  // caller lists it and the shader service compiles it again, optimized.
+  if (dxil.size() >= (1u << 20)) {
+    std::string key;
+    std::ifstream(std::filesystem::path(file).replace_extension(".src")) >> key;
+    if (key.size() < 3 || key.compare(key.size() - 3, 3, "-o3") != 0) {
+      static std::mutex lock;
+      static std::set<std::string> told;
+      std::lock_guard g(lock);
+      if (told.insert(marker).second && told.size() <= 32) {
+        logf("gpu: shader %s was compiled unoptimized (%zu KiB of DXIL): asked for again", marker.c_str(), dxil.size() >> 10);
+      }
+      dxil.clear();
+      return false;
+    }
+  }
   return !dxil.empty();
 }
 

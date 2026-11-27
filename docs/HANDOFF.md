@@ -1622,3 +1622,11 @@ loading does). Work that way.
   code. A big task; worth it once the game runs.
 * Next: a game run once the game's giants are optimized (watch `waited for:` in the service
   window), to see loading past the old 24 GB wall.
+* **Run after the fix (02:32):** commit peaked at 18 GB and fell back to 17 (no runaway; before:
+  past 24 GB). Loading then stalls at frame 3,581 / 80,000 requests on the same unmet waits
+  ("never written by a list of ours"), with `24ea...` and `3db4...` (far-jump giants, chained
+  form) not compiled yet: still the prime suspects for the writer.
+* **Giants on demand only:** idle work had taken the one large-compile slot for unrequested 4-5 MB
+  programs while those two waited. Now unoptimized DXIL is recompiled only when the game uses
+  it (the runtime treats large DXIL without an "-o3" key as missing and asks for it), and a
+  large program the game waits for goes first in the large-compile queue.
