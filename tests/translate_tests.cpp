@@ -45,6 +45,7 @@ Result run(const std::vector<uint32_t>& code, std::vector<uint32_t> user = {}, s
   const Translation t = translate(in, Binding::Test);
   CHECK(t.ok);
   r.structured = t.structured;
+  if (t.ok && !t.lanes) std::printf("    kept the wave's masks (not lanes as threads)\n");
   if (!t.ok) {
     std::printf("    not translated: %s\n", t.failure.c_str());
     return r;

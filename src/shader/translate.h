@@ -27,7 +27,7 @@
 namespace am::shader {
 
 // Bumped whenever the output for some input changes: part of the cache key.
-constexpr uint32_t kTranslatorVersion = 5;
+constexpr uint32_t kTranslatorVersion = 6;
 // The shader-visible heap slot of a null raw UAV (reads give zero, writes are dropped): title
 // memory a page without a GPU window maps to, so memory access needs no branch.
 constexpr uint32_t kNullMemoryView = 65535;
@@ -70,6 +70,7 @@ struct Translation {
   uint32_t wave_size = 64;
   uint32_t vgpr_count = 0;           // VGPRs the HLSL keeps per lane
   bool structured = false;           // nested ifs and loops (else one loop over a switch)
+  bool lanes = false;                // lanes as threads (else the wave's masks: see translate.cpp)
   std::string failure;               // the first reason it failed
   std::map<std::string, int> unsupported;  // instruction names (or reasons) and how often
 };

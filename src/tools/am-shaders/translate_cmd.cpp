@@ -124,9 +124,9 @@ int translate(const std::string& wanted, const fs::path& pack_dir, const fs::pat
           fs::create_directories(out_dir, ec);
           const fs::path hlsl = out_dir / widen(wanted + ".hlsl");
           std::ofstream(hlsl, std::ios::binary) << t.hlsl;
-          std::printf("%s: %s, %s form, %zu KiB of HLSL, nesting %d (%s)\n", wanted.c_str(), shader::hw_stage_name(pr.stage),
-                      !t.structured ? "dispatcher" : chained ? "chained structured" : "structured", t.hlsl.size() >> 10,
-                      deepest, narrow(hlsl.wstring()).c_str());
+          std::printf("%s: %s, %s form, %s, %zu KiB of HLSL, nesting %d (%s)\n", wanted.c_str(), shader::hw_stage_name(pr.stage),
+                      !t.structured ? "dispatcher" : chained ? "chained structured" : "structured",
+                      t.lanes ? "lanes as threads" : "the wave's masks", t.hlsl.size() >> 10, deepest, narrow(hlsl.wstring()).c_str());
           std::fflush(stdout);
           // AM_SHADERS_O0=1: unoptimized over 1 MiB, as the service once did (to compare what the driver does).
           const bool huge = t.hlsl.size() > (1u << 20) && GetEnvironmentVariableA("AM_SHADERS_O0", nullptr, 0);
@@ -198,7 +198,7 @@ int translation_survey(const fs::path& pack_dir, const fs::path& out_json, size_
   const auto start = std::chrono::steady_clock::now();
   SetPriorityClass(GetCurrentProcess(), BELOW_NORMAL_PRIORITY_CLASS);
   std::mutex lock;
-  std::map<std::string, uint64_t> missing, stages_total, stages_ok, stages_structured;  // missing: programs blocked by it
+  std::map<std::string, uint64_t> missing, stages_total, stages_ok, stages_structured, stages_lanes;  // missing: programs blocked by it
   std::map<std::string, uint64_t> first_missing;
   std::vector<std::pair<std::string, shader::Translation>> to_compile;
   std::atomic<size_t> next{0};
@@ -217,6 +217,7 @@ int translation_survey(const fs::path& pack_dir, const fs::path& out_json, size_
             if (t.ok) {
               ++stages_ok[shader::hw_stage_name(p.stage)];
               if (t.structured) ++stages_structured[shader::hw_stage_name(p.stage)];
+              if (t.lanes) ++stages_lanes[shader::hw_stage_name(p.stage)];
               if (to_compile.size() < compile_sample) to_compile.emplace_back(narrow(files[i].stem().wstring()), std::move(t));
             } else {
               for (const auto& [k, n] : t.unsupported) ++missing[k];
@@ -279,7 +280,7 @@ int translation_survey(const fs::path& pack_dir, const fs::path& out_json, size_
   j.begin_object().field("translator_version", static_cast<uint64_t>(shader::kTranslatorVersion)).field("seconds", seconds);
   j.key("programs").begin_object();
   for (const auto& [k, n] : stages_total) {
-    j.key(k).begin_object().field("total", n).field("translated", stages_ok[k]).field("structured", stages_structured[k]).end_object();
+    j.key(k).begin_object().field("total", n).field("translated", stages_ok[k]).field("structured", stages_structured[k]).field("lanes", stages_lanes[k]).end_object();
   }
   j.end_object();
   j.field("compile_sample", static_cast<uint64_t>(to_compile.size())).field("compiled", compiled.load());
@@ -297,9 +298,9 @@ int translation_survey(const fs::path& pack_dir, const fs::path& out_json, size_
 
   std::printf("translation survey (translator %u), %.1f s\n", shader::kTranslatorVersion, seconds);
   for (const auto& [k, n] : stages_total) {
-    std::printf("  %-3s %6llu programs, %6llu translated (%.1f %%), %llu structured\n", k.c_str(),
+    std::printf("  %-3s %6llu programs, %6llu translated (%.1f %%), %llu structured, %llu lanes as threads\n", k.c_str(),
                 static_cast<unsigned long long>(n), static_cast<unsigned long long>(stages_ok[k]), 100.0 * stages_ok[k] / n,
-                static_cast<unsigned long long>(stages_structured[k]));
+                static_cast<unsigned long long>(stages_structured[k]), static_cast<unsigned long long>(stages_lanes[k]));
   }
   std::printf("DXC: %llu of %zu compiled\n", static_cast<unsigned long long>(compiled.load()), to_compile.size());
   std::sort(slowest.rbegin(), slowest.rend());

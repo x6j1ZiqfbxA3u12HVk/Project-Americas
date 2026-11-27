@@ -1737,3 +1737,51 @@ list slots from 59 up are two later than in older titles).
   with the new build and make 3db4/0849/24ea recompile (their old DXIL must be removed or
   rekeyed; the cache cleanup needs the user's OK). Then run the game (black world, stall near
   frame 2,786 with 8 unmet GPU waits).
+
+## Translator 6: lanes as threads, one rebuild of every shader (2026-11-27, ~05:50)
+
+* **The rule (the user's, and it stands):** the translator translates, it does not emulate. A
+  console lane is a host thread running the same program. Translator 5 still emulated the wave's
+  EXEC: a ballot for every compare and carry, 64-bit mask arithmetic, a lane-bit test around
+  every vector write, uniform branches on wave-wide tests. That is what made the giants explode
+  in DXC and in AMD's driver.
+* **Now (translate.cpp, "lanes as threads"):** a lane mask (EXEC, VCC, compare and carry results,
+  saved masks) is the lane's own bit spread over the register (all ones / zero, both dwords).
+  The console's bitwise mask instructions keep their formulas; execz / vccz / the SCC of a mask
+  operation become the thread's own test; compares write `0u - uint(cond & exec)`. A pass over
+  the program's CFG (`mask_kinds`, from the decoder's operand tables) knows which SGPRs hold
+  masks: a mask used as a number (s_bcnt1, mbcnt, v_mov to a VGPR, s_cmp...) is made whole with a
+  ballot there (`am_whole_*`), a number used as a mask (loaded from memory) gives the lane its
+  bit (`am_spread64`, `am_lane_bit`). A program whose register holds a mask on one path and a
+  number on another keeps the wave's masks (`Translation::lanes` false; the old code path is
+  still there). All 28 translator tests run lanes-as-threads, none fall back; 109 tests pass.
+* **Also in this batch:** vector writes are `select()`s (no branch per instruction; the compiler
+  drops them where the lane is known on); no `&&`/`||`/`?:` in emitted code or helpers (HLSL 2021
+  branches on them); multi-dword loads are one `am_load2/3/4` (one window lookup, not one per
+  dword); typed-buffer helpers no longer index a vector by a value (`raw[o >> 5]`, `c[sel - 4]`,
+  `data[o >> 5]`: those were the stack arrays (scratch) found in 153 of 400 DXILs); s_bitset_b64
+  no longer indexes s[] by a value; implicit derivatives are `ddx_fine`/`ddy_fine` in pixel
+  shaders and quad reads in compute (were four cross-lane reads each). Pixel shaders start with
+  helper lanes off (`IsHelperLane()`), as the console does. `kTranslatorVersion` 6: everything is
+  compiled once more into `dxil\rt6` (the game's lists `cpipe-index.tsv` and `wanted-first.txt`
+  were copied over from rt5; they do not depend on the translator).
+* **Measured on ca8f (game-requested compute, 1.6 MB HLSL), translator 5 round 3 -> 6:**
+  conditional branches 5,925 -> 1,172; DXIL instructions 118 K -> 81 K; DXIL 853 -> 565 KiB;
+  ballots and stack arrays 0; **DXC 17 -> 8.1 s; AMD driver build 25 -> 7 s, peak 2.0 -> 0.83 GB**
+  (at the start of step 3: 80 s, 6.8 GB; the -O0 form passed 20 GB). The service compiles about
+  60 programs a minute at first; all 12,907 of the game's pipelines' programs were estimated at
+  4-5 h (translator 5: about 8 h for 1,700).
+* **Running at session end (05:50):** the shader service on translator 6 (window "Project
+  Americas shader service", `tools\start-shader-service.ps1` starts it from the current build;
+  `tools\shader-service.ps1` is what runs in the window). The far-jump giant 3db4 benchmark
+  (`tools\step3\bench-3db4-r6.ps1`, log `cache\shaders\bench\r6-3db4\log.txt`): DXC of its 16.6 MB
+  of HLSL, then the driver's build with its peak (stops past 40 GB; translator 5 passed 49 GB).
+* **Left in the translator (not emulation of EXEC, but run-time decisions worth moving out):**
+  images look their T#/S# up in the bindings hash table per block and pick the view type (float,
+  uint, sint; array or not; SRV or UAV) at run time, so every image instruction carries up to six
+  typed paths; typed buffer loads decode the V#'s format at run time (`am_fmt_*`). Both are tied
+  to how the runtime binds resources; the reference furthest along traces descriptors to their
+  root parameters at translation time. That is the next large item if image-heavy programs are
+  slow. The structurer's chain form (`am_br`, `am_go`) is untouched.
+* Cache housekeeping still needs the user's OK: `dxil\rt5` (now unused by the runtime, 3 GB),
+  `rt4`, `rt`, loose files, old service copies.
