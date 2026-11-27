@@ -65,6 +65,7 @@ int usage() {
                "       am-shaders disasm <hash prefix> [--out <dir>] [--raw <dir>]\n"
                "       am-shaders translate <hash prefix> [--out <dir>] [--raw <hlsl dir>]\n"
                "       am-shaders tsurvey [<programs to compile>] [--out <dir>] [--raw <hlsl dir>]\n"
+               "       am-shaders ours-survey [<one container in N>] [--out <dir>]\n"
                "       am-shaders images [--out <dir>]\n"
                "       am-shaders precompile [all] [refresh] [--out <dir>] [--raw <hlsl dir>]\n"
                "       am-shaders serve [jobs]\n");
@@ -296,6 +297,9 @@ int wmain(int argc, wchar_t** argv) {
     const unsigned jobs = has_jobs ? std::stoul(positional[0]) : std::max(1u, std::thread::hardware_concurrency() - 2);
     return tools::serve(out, out.parent_path() / L"runtime",
                         out.parent_path() / L"dxil" / (L"rt" + std::to_wstring(shader::kTranslatorVersion)), jobs, log, everything);
+  }
+  if (command == L"ours-survey" && positional.size() <= 1) {
+    return tools::ours_survey(out, out.parent_path() / L"ours.json", positional.empty() ? 1 : std::stoul(positional[0]));
   }
   if (command == L"tsurvey" && positional.size() <= 1) {
     const size_t sample = positional.empty() ? 200 : std::stoul(positional[0]);

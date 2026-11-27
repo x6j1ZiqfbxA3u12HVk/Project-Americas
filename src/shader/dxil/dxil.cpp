@@ -29,6 +29,8 @@ void key_u32(std::string& k, uint32_t v) { k.append(reinterpret_cast<const char*
 
 // Shader flags (DXIL's bits, as the validator computes them).
 constexpr uint64_t kFlagDouble = 1ull << 2;
+constexpr uint64_t kFlagDoubleExtensions = 1ull << 6;
+constexpr uint64_t kFlagTiledResources = 1ull << 12;
 constexpr uint64_t kFlagRawBuffers = 1ull << 4;
 constexpr uint64_t kFlagUavsEveryStage = 1ull << 16;
 constexpr uint64_t kFlagWaveOps = 1ull << 19;
@@ -605,9 +607,26 @@ bool Module::finish(std::string& error) {
         const Type t = values_[in.result].type;
         if (t == i64_) flags_ |= kFlagInt64;
         if (t == f64_) flags_ |= kFlagDouble;
+        // Double division and conversions between doubles and integers need DXIL's double
+        // extensions (as DXC decides it).
+        if (in.op == Op::Bin && t == f64_ && static_cast<Bin>(in.code) == Bin::SDiv) flags_ |= kFlagDoubleExtensions;
+        if (in.op == Op::Cast) {
+          const Cast c = static_cast<Cast>(in.code);
+          if ((c == Cast::UiToFp || c == Cast::SiToFp) && t == f64_) flags_ |= kFlagDoubleExtensions;
+          if ((c == Cast::FpToUi || c == Cast::FpToSi) && values_[in.ops[0]].type == f64_) flags_ |= kFlagDoubleExtensions;
+        }
       }
       if (in.op == Op::Call) {
         const std::string& n = functions_[values_[in.ops[0]].bits].name;
+        uint64_t opcode = 0;
+        if (n == "dx.op.tertiary.f64" && constant_int(in.ops[1], opcode) && opcode == 47) flags_ |= kFlagDoubleExtensions;  // fma
+        // A sample's clamp (its last operand) that is neither undef nor zero: tiled resources.
+        const auto starts = [&](std::string_view p) { return std::string_view(n).substr(0, p.size()) == p; };
+        if (starts("dx.op.sampleGrad.") || starts("dx.op.sample.") ||
+            starts("dx.op.sampleBias.") || starts("dx.op.sampleCmp.")) {
+          const Value clamp = resolve(in.ops.back());
+          if (!(is_constant(clamp) && values_[clamp].bits == 0)) flags_ |= kFlagTiledResources;
+        }
         if (n.compare(0, 10, "dx.op.wave") == 0 || n.compare(0, 10, "dx.op.quad") == 0) flags_ |= kFlagWaveOps;
         if (n == "dx.op.createHandleFromHeap") {
           uint64_t sampler = 0;

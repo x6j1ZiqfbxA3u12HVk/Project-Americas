@@ -250,6 +250,9 @@ class Module {
   const std::vector<MdInfo>& metadata() const { return md_; }
   const std::vector<std::pair<std::string, std::vector<Md>>>& named() const { return named_; }
   uint64_t shader_flags() const { return flags_; }
+  // Flags a front end knows from the source (typed UAV loads of more than one component: bit 13),
+  // as DXC sets them.
+  void add_flags(uint64_t f) { flags_ |= f; }
   // After finish(): other flags (the ones the validator computed, when ours differ).
   void set_flags(uint64_t f);
 

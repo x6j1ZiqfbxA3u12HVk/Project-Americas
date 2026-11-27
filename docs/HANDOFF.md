@@ -2007,3 +2007,35 @@ unused internal globals); `asuint(double, out lo, out hi)` (splitDouble).
 4. An optimizer (what DXC's -O3 does for the driver): constant folding, dead code,
    `select(c, x, x)`, common subexpressions, simple phis.
 5. The shader service takes ours for programs DXC cannot do, then for all once it matches.
+
+## Our compiler: images, and how much of the game it covers (2026-11-27, late evening)
+
+* **Images in hlsl.cpp:** heap textures of every kind the translator uses (1D/2D/3D/cube, arrays,
+  MS, RW) and samplers (comparison too), with DXIL's resource properties as DXC writes them;
+  Load, SampleLevel, SampleGrad, SampleCmpLevelZero, Gather*, GetDimensions; `t[at]` reads and
+  writes of RW textures; Interlocked* on texels. Also `dot`, local initializer lists, vectors in
+  memory arrays (flat), and vector components chosen by a value as places (`r[k] = x`).
+* **Shader flags as DXC sets them:** double extensions (double division, fma, int<->double),
+  tiled resources (a sample's clamp that is neither undef nor zero, judged after SSA), typed UAV
+  loads of more than one component.
+* **Tests:** with `AM_DXIL=1`, 26 of 27 translator tests pass through ours with the validator's
+  flags equal to ours; only `translate_irreducible_control_flow` is left. All 113 pass with DXC.
+* **`am-shaders ours-survey [N]`** (one container in N): every program in the goto form with the
+  runtime binding, through ours and the validator; per stage, refusals grouped, flag
+  differences, slowest; `cache\shaders\ours.json`. **1 in 20 (1,305 programs, 164 s):**
+  - **compute 100 %** (115 of 115 compiled, validated and signed; flags equal). The largest
+    (1.6-2.4 MB of HLSL) take 10-15 s in ours where DXC takes minutes.
+  - **pixel, vertex, mesh: 0 %**: hlsl.cpp builds compute entry points only (491 refused as
+    "an entry point other than a compute shader", 433 mesh by an entry parameter with a
+    semantic, 249 by a global outside the subset: the mesh outputs).
+  - geometry/ES (16, ~1 %): the translator does not take them yet.
+  - **in all: 8.8 % of programs**; the remaining 91 % wait on graphics entry points.
+
+**Next for our compiler, in order:**
+1. Graphics entry points: input and output signatures (dx.op.loadInput / storeOutput, the
+   signature metadata and system values, SV_Position, SV_Target, SV_Depth, SV_Barycentrics,
+   nointerpolation), vertex then pixel shaders (~57 % of programs), then mesh (SetMeshOutputCounts,
+   StoreVertexOutput / StorePrimitiveOutput, EmitIndices, groupshared payload; ~33 %).
+2. Irreducible control flow (node splitting).
+3. The full corpus survey (`ours-survey` with no N, ~55 min), then ours in the shader service
+   for compute programs (the giants first: 24ea, 3db4, 0849), measured in the driver.

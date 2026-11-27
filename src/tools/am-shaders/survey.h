@@ -39,6 +39,8 @@ int serve(const std::filesystem::path& pack_dir, const std::filesystem::path& ru
 int precompile(const std::filesystem::path& pack_dir, const std::filesystem::path& runtime_dir,
                const std::filesystem::path& out_dir, bool all, const std::filesystem::path& hlsl_dir = {},
                bool refresh = false);
+// Every program through our own compiler (goto form, shader/dxil) and the validator; one container in `every`.
+int ours_survey(const std::filesystem::path& pack_dir, const std::filesystem::path& out_json, size_t every);
 int translation_survey(const std::filesystem::path& pack_dir, const std::filesystem::path& out_json, size_t compile_sample,
                        const std::filesystem::path& hlsl_dir = {});
 

@@ -26,6 +26,8 @@
 #include "host/dxc_compile.h"
 #include "shader/console_program.h"
 #include "shader/container.h"
+#include "shader/dxil/dxil.h"
+#include "shader/dxil/hlsl.h"
 #include "shader/rdna2.h"
 #include "shader/service.h"
 #include "shader/stage_io.h"
@@ -331,6 +333,169 @@ int translation_survey(const fs::path& pack_dir, const fs::path& out_json, size_
   for (size_t i = 0; i < slowest.size() && i < 8; ++i) std::printf("  %7.1f s  %s\n", slowest[i].first, slowest[i].second.c_str());
   std::printf("most blocking (programs held up by each):\n");
   for (size_t i = 0; i < m.size() && i < 25; ++i) std::printf("  %7llu  %s\n", static_cast<unsigned long long>(m[i].first), m[i].second.c_str());
+  std::printf("wrote %s\n", narrow(out_json.wstring()).c_str());
+  return 0;
+}
+
+// The corpus through our own compiler: every program translated in the goto form (the runtime's
+// binding), compiled by shader/dxil, and checked and signed by DXC's validator. What passes, by
+// stage; why the rest does not, grouped; time spent. `every`: one container in that many.
+int ours_survey(const fs::path& pack_dir, const fs::path& out_json, size_t every) {
+  const auto all = containers(pack_dir);
+  std::vector<fs::path> files;
+  for (size_t i = 0; i < all.size(); i += std::max<size_t>(every, 1)) files.push_back(all[i]);
+  SetPriorityClass(GetCurrentProcess(), BELOW_NORMAL_PRIORITY_CLASS);
+  const auto start = std::chrono::steady_clock::now();
+  struct Counts {
+    uint64_t total = 0, translated = 0, compiled = 0, valid = 0, flags_differ = 0;
+  };
+  std::mutex lock, large;  // large: one program over 2 MiB of HLSL at a time (memory)
+  std::map<std::string, Counts> by_stage;
+  std::map<std::string, uint64_t> reasons;
+  std::map<std::string, std::string> examples, flag_examples;
+  std::map<std::string, uint64_t> flag_reasons;
+  std::vector<std::pair<double, std::string>> slowest;
+  double ours_seconds = 0, validate_seconds = 0;
+  std::atomic<size_t> next{0}, done{0};
+  // A message without its numbers (line numbers, value ids), so like refusals group together.
+  const auto reason_of = [](std::string m) {
+    if (const size_t at = m.find("\n"); at != std::string::npos) m.resize(at);
+    std::string out;
+    bool digits = false;
+    for (const char ch : m) {
+      if (ch >= '0' && ch <= '9') {
+        if (!digits) out += '#';
+        digits = true;
+      } else {
+        out += ch;
+        digits = false;
+      }
+    }
+    return out.substr(0, 110);
+  };
+  std::vector<std::thread> workers;
+  const unsigned jobs = std::max(1u, std::thread::hardware_concurrency() - 2);
+  for (unsigned w = 0; w < jobs; ++w) {
+    workers.emplace_back([&] {
+      for (size_t i; (i = next.fetch_add(1)) < files.size();) {
+        std::string error;
+        const auto shader = load(files[i], error);
+        if (!shader) continue;
+        for (const shader::NativeBlob& b : shader->shader.blobs) {
+          for (const shader::NativeProgram& p : b.programs) {
+            const std::string stage = shader::hw_stage_name(p.stage);
+            shader::TranslateInput in = input_of(shader->bytes, b, p);
+            in.goto_form = true;
+            const shader::Translation t = shader::translate(in, shader::Binding::Runtime);
+            std::string why;
+            bool compiled = false, valid = false, flags_differ = false;
+            std::string flag_note;
+            double ours_s = 0, validate_s = 0;
+            if (!t.ok) {
+              why = "not translated: " + t.failure;
+            } else {
+              std::unique_lock<std::mutex> one(large, std::defer_lock);
+              if (t.hlsl.size() > (2u << 20)) one.lock();
+              const auto t0 = std::chrono::steady_clock::now();
+              shader::dxil::Module m;
+              std::string message;
+              compiled = shader::dxil::compile_hlsl(t.hlsl, t.entry, m, message) && m.finish(message);
+              const auto t1 = std::chrono::steady_clock::now();
+              ours_s = std::chrono::duration<double>(t1 - t0).count();
+              if (!compiled) {
+                why = "ours: " + message;
+              } else {
+                host::CompileResult r = host::assemble_dxil(shader::dxil::write_bitcode(m));
+                uint64_t flags = 0;
+                if (!r.ok && shader::dxil::validator_flags(r.messages, flags)) {
+                  flags_differ = true;
+                  char d[80];
+                  std::snprintf(d, sizeof d, "flags: the validator adds 0x%llx, removes 0x%llx",
+                                static_cast<unsigned long long>(flags & ~m.shader_flags()),
+                                static_cast<unsigned long long>(m.shader_flags() & ~flags));
+                  flag_note = d;
+                  m.set_flags(flags);
+                  r = host::assemble_dxil(shader::dxil::write_bitcode(m));
+                }
+                valid = r.ok;
+                if (!valid) {
+                  // The validator's first error line.
+                  const size_t e = r.messages.find("error:");
+                  why = "validator: " + (e == std::string::npos ? r.messages : r.messages.substr(e + 7));
+                }
+              }
+              validate_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t1).count();
+            }
+            std::lock_guard<std::mutex> g(lock);
+            Counts& c = by_stage[stage];
+            ++c.total;
+            c.translated += t.ok;
+            c.compiled += compiled;
+            c.valid += valid;
+            c.flags_differ += flags_differ;
+            ours_seconds += ours_s;
+            validate_seconds += validate_s;
+            if (t.ok) slowest.emplace_back(ours_s, marker_of(b.code(p)) + " " + stage + " (" + std::to_string(t.hlsl.size() >> 10) + " KiB of HLSL)");
+            if (!flag_note.empty() && !flag_reasons[flag_note]++) flag_examples[flag_note] = marker_of(b.code(p));
+            if (!why.empty()) {
+              const std::string k = reason_of(why);
+              if (!reasons[k]++) examples[k] = marker_of(b.code(p));
+            }
+          }
+        }
+        if (const size_t d = ++done; d % 200 == 0) {
+          std::fprintf(stderr, "  %zu of %zu containers\n", d, files.size());
+        }
+      }
+    });
+  }
+  for (auto& w : workers) w.join();
+  const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+  Counts sum;
+  for (const auto& [k, c] : by_stage) {
+    sum.total += c.total;
+    sum.translated += c.translated;
+    sum.compiled += c.compiled;
+    sum.valid += c.valid;
+    sum.flags_differ += c.flags_differ;
+  }
+  std::vector<std::pair<uint64_t, std::string>> rs;
+  for (const auto& [k, n] : reasons) rs.emplace_back(n, k);
+  std::sort(rs.rbegin(), rs.rend());
+  JsonWriter j;
+  j.begin_object().field("translator_version", static_cast<uint64_t>(shader::kTranslatorVersion)).field("seconds", seconds);
+  j.field("containers", static_cast<uint64_t>(files.size())).field("of_containers", static_cast<uint64_t>(all.size()));
+  j.key("programs").begin_object();
+  for (const auto& [k, c] : by_stage) {
+    j.key(k).begin_object().field("total", c.total).field("translated", c.translated).field("compiled_by_ours", c.compiled);
+    j.field("validated", c.valid).field("flags_differ", c.flags_differ).end_object();
+  }
+  j.end_object();
+  j.key("refused").begin_object();
+  for (const auto& [n, k] : rs) j.field(k + " (e.g. " + examples[k] + ")", n);
+  j.end_object();
+  j.end_object();
+  std::ofstream(out_json, std::ios::binary) << j.str() << '\n';
+
+  const auto pct = [](uint64_t a, uint64_t b) { return b ? 100.0 * static_cast<double>(a) / static_cast<double>(b) : 0.0; };
+  std::printf("our compiler on %zu of %zu containers, %.0f s (ours %.0f s, validator %.0f s in all threads)\n", files.size(), all.size(),
+              seconds, ours_seconds, validate_seconds);
+  for (const auto& [k, c] : by_stage) {
+    std::printf("  %-3s %6llu programs: translated %5.1f %%, compiled by ours %5.1f %%, validated %5.1f %% (flags differed: %llu)\n",
+                k.c_str(), static_cast<unsigned long long>(c.total), pct(c.translated, c.total), pct(c.compiled, c.total),
+                pct(c.valid, c.total), static_cast<unsigned long long>(c.flags_differ));
+  }
+  std::printf("  all %6llu programs: validated %.1f %% (%llu), of those translated %.1f %%\n", static_cast<unsigned long long>(sum.total),
+              pct(sum.valid, sum.total), static_cast<unsigned long long>(sum.valid), pct(sum.valid, sum.translated));
+  std::printf("refused, most common first:\n");
+  for (size_t i = 0; i < rs.size() && i < 25; ++i) {
+    std::printf("  %7llu  %s (e.g. %s)\n", static_cast<unsigned long long>(rs[i].first), rs[i].second.c_str(), examples[rs[i].second].c_str());
+  }
+  for (const auto& [k, n] : flag_reasons)
+    std::printf("  %7llu  %s (e.g. %s)\n", static_cast<unsigned long long>(n), k.c_str(), flag_examples[k].c_str());
+  std::sort(slowest.rbegin(), slowest.rend());
+  std::printf("slowest in our compiler:\n");
+  for (size_t i = 0; i < slowest.size() && i < 6; ++i) std::printf("  %7.2f s  %s\n", slowest[i].first, slowest[i].second.c_str());
   std::printf("wrote %s\n", narrow(out_json.wstring()).c_str());
   return 0;
 }

@@ -412,7 +412,8 @@ struct RV {
 // An lvalue: variables (one per component), memory (a pointer per component), or a texel of a
 // writable texture.
 struct LV {
-  enum Kind : uint8_t { Vars, Mem, Texel } kind = Vars;
+  // Pick: one component of a vector in variables (vars), chosen by a value (pick).
+  enum Kind : uint8_t { Vars, Mem, Texel, Pick } kind = Vars;
   Ty t;
   std::vector<uint32_t> vars;
   std::vector<Value> ptrs;     // Mem: an element's pointer per component
@@ -420,6 +421,7 @@ struct LV {
   Type arr_type = 0;
   Value handle = kNone;        // Texel
   std::vector<Value> coords;
+  Value pick = kNone;
 };
 
 struct Ex {
@@ -756,7 +758,13 @@ class Compiler {
         for (size_t k = 0; k < lv.ptrs.size(); ++k) r.c.push_back(m_.load(ir(tb[k]), lv.ptrs[k], 4));
         break;
       case LV::Texel: return texel_load(lv);
+      case LV::Pick: r.c.push_back(pick_read(lv)); break;
     }
+    return r;
+  }
+  Value pick_read(const LV& lv) {
+    Value r = m_.read(lv.vars.back());
+    for (size_t c = lv.vars.size() - 1; c-- > 0;) r = m_.select(m_.cmp(Pred::IEq, lv.pick, m_.u32(static_cast<uint32_t>(c))), m_.read(lv.vars[c]), r);
     return r;
   }
   void store(const LV& lv, const RV& value) {
@@ -770,6 +778,10 @@ class Compiler {
         for (size_t k = 0; k < lv.ptrs.size(); ++k) m_.store(lv.ptrs[k], v.c[k], 4);
         break;
       case LV::Texel: texel_store(lv, v); break;
+      case LV::Pick:
+        for (size_t k = 0; k < lv.vars.size(); ++k)
+          m_.write(lv.vars[k], m_.select(m_.cmp(Pred::IEq, lv.pick, m_.u32(static_cast<uint32_t>(k))), v.c[0], m_.read(lv.vars[k])));
+        break;
     }
   }
   RV value(const Ex& e) { return e.is_lv ? load(e.lv) : e.rv; }
@@ -799,8 +811,9 @@ class Compiler {
       // a resource: bound to its handle when initialized
     } else if (in_memory && t.arr) {
       Ty e = element(t);
-      if (e.b == B::Struct || e.n != 1) fail("an array of aggregates indexed by a value");
-      l.mem = m_.alloca_(m_.array(ir(e.b), t.arr), 4);
+      if (e.b == B::Struct) fail("an array of structs indexed by a value");
+      // Vectors flat: element k, component j at k * n + j.
+      l.mem = m_.alloca_(m_.array(ir(e.b), t.arr * e.n), 4);
     } else {
       for (B b : tb) l.vars.push_back(m_.variable(ir(b)));
     }
@@ -814,7 +827,7 @@ class Compiler {
     if (l.mem != kNone) {
       lv.kind = LV::Mem;
       lv.arr = l.mem;
-      lv.arr_type = m_.array(ir(l.t.b), l.t.arr);
+      lv.arr_type = m_.array(ir(l.t.b), l.t.arr * l.t.n);
       return lv;
     }
     lv.vars = l.vars;
@@ -1210,7 +1223,20 @@ class Compiler {
           Local& l = declare(name, t, false);
           l.handle = resource_handle(t, init);
         } else if (is_p(p_lbrace)) {
-          fail("a local initializer list");
+          // An initializer list: the components of its values in order (nested braces flatten),
+          // each converted to the declared base type, as many as the declaration has.
+          if (!is_numeric(t.b)) fail("an initializer list for a struct");
+          std::vector<Value> comps_in;
+          init_list(t.b, comps_in);
+          if (comps_in.size() != comps(t)) fail("an initializer list of the wrong size");
+          Local& l = declare(name, t, in_memory);
+          if (l.mem != kNone) {
+            const Type at = m_.array(ir(t.b), t.arr * t.n);
+            for (size_t k = 0; k < comps_in.size(); ++k)
+              m_.store(m_.gep(at, l.mem, {m_.u32(0), m_.u32(static_cast<uint32_t>(k))}), comps_in[k], 4);
+          } else {
+            for (size_t k = 0; k < comps_in.size(); ++k) m_.write(l.vars[k], comps_in[k]);
+          }
         } else {
           const RV init = value(assignment());
           Local& l = declare(name, t, in_memory);
@@ -1221,6 +1247,19 @@ class Compiler {
       }
     } while (accept(p_comma));
     expect(p_semi);
+  }
+
+  void init_list(B base, std::vector<Value>& out) {
+    expect(p_lbrace);
+    while (!accept(p_rbrace)) {
+      if (is_p(p_lbrace)) {
+        init_list(base, out);
+      } else {
+        const RV v = with_base(value(assignment()), base);
+        out.insert(out.end(), v.c.begin(), v.c.end());
+      }
+      accept(p_comma);
+    }
   }
 
   void if_statement() {
@@ -1688,7 +1727,10 @@ class Compiler {
         out.is_lv = true;
         out.lv.kind = LV::Mem;
         out.lv.t = et;
-        out.lv.ptrs.push_back(m_.gep(e.lv.arr_type, e.lv.arr, {m_.u32(0), scalar_of(idx, B::Uint)}));
+        const Value i = scalar_of(idx, B::Uint);
+        const Value at = et.n == 1 ? i : m_.mul(i, m_.u32(et.n));
+        for (uint32_t j = 0; j < et.n; ++j)
+          out.lv.ptrs.push_back(m_.gep(e.lv.arr_type, e.lv.arr, {m_.u32(0), j == 0 ? at : m_.add(at, m_.u32(j))}));
         return out;
       }
       if (!constant) fail("an array in registers indexed by a value");
@@ -1718,7 +1760,16 @@ class Compiler {
         }
         return out;
       }
-      // A vector read at a value: a chain of selects.
+      // A vector at a value: a place (a write selects into each component) or a chain of selects.
+      if (e.is_lv && e.lv.kind == LV::Vars) {
+        Ex out;
+        out.is_lv = true;
+        out.lv.kind = LV::Pick;
+        out.lv.t = scalar(t.b);
+        out.lv.vars = e.lv.vars;
+        out.lv.pick = scalar_of(idx, B::Uint);
+        return out;
+      }
       const RV v = value(e);
       const Value i = scalar_of(idx, B::Uint);
       Value r = v.c[t.n - 1];
@@ -1884,13 +1935,25 @@ class Compiler {
     props(t, p0, p1);
     return m_.heap_handle(init.c[0], init.sampler_heap, init.non_uniform, p0, p1);
   }
+  // DXIL's resource properties: the kind (and 0x1000 for a UAV, 0x8000 for a comparison
+  // sampler); for a typed view its element's component type and count (count << 8).
   void props(const Ty& t, uint32_t& p0, uint32_t& p1) {
-    switch (t.rk) {
-      case RK::Raw: p0 = 11; break;
-      case RK::RWRaw: p0 = 11 | 0x1000; break;
-      default: fail("a heap resource of this kind (not yet)");
-    }
     p1 = 0;
+    switch (t.rk) {
+      case RK::Raw: p0 = 11; return;
+      case RK::RWRaw: p0 = 11 | 0x1000; return;
+      case RK::Sampler: p0 = 14; return;
+      case RK::SamplerCmp: p0 = 14 | 0x8000; return;
+      default: break;
+    }
+    const TexShape s = shape(t.rk);
+    p0 = s.kind | (s.uav ? 0x1000u : 0u);
+    uint32_t ct = 0;
+    if (is_float(t.elem)) ct = 9;
+    else if (t.elem == B::Uint) ct = 5;
+    else if (t.elem == B::Int) ct = 4;
+    else fail("a texture of this element type");
+    p1 = ct | (static_cast<uint32_t>(t.en) << 8);
   }
 
   // ---- calls ----
@@ -2112,6 +2175,27 @@ class Compiler {
       need(3);
       return select(a[0], a[1], a[2]);
     }
+    if (n == "dot") {
+      // Floats: DXIL's dot2/dot3/dot4; integers: products added in order.
+      need(2);
+      const B b = rank(a[0].t.b) >= rank(a[1].t.b) ? a[0].t.b : a[1].t.b;
+      const B base = is_float(b) ? (b == B::Double ? B::Double : B::Float) : (b == B::Bool ? B::Int : b);
+      const size_t w = std::max(a[0].t.n, a[1].t.n);
+      const RV x = convert(a[0], scalar(base, static_cast<uint8_t>(w))), y = convert(a[1], scalar(base, static_cast<uint8_t>(w)));
+      if (base == B::Float && w >= 2) {
+        std::vector<Value> args(x.c.begin(), x.c.end());
+        args.insert(args.end(), y.c.begin(), y.c.end());
+        const Type f = m_.f32();
+        const std::vector<Type> params(2 * w, f);
+        const char* klass = w == 2 ? "dot2" : w == 3 ? "dot3" : "dot4";
+        return make(B::Float, {m_.dx_call(static_cast<uint32_t>(52 + w), klass, f, f, params, Attr::ReadNone, args)});
+      }
+      const uint32_t fm = is_float(base) ? kFastMath : 0;
+      Value acc = m_.bin(Bin::Mul, x.c[0], y.c[0], fm);
+      for (size_t k = 1; k < w; ++k)
+        acc = m_.bin(Bin::Add, acc, m_.bin(Bin::Mul, x.c[k], y.c[k], fm), fm);
+      return make(base, {acc});
+    }
     if (n == "and" || n == "or") {
       need(2);
       return lanes(with_base(a[0], B::Bool), with_base(a[1], B::Bool), B::Bool,
@@ -2300,6 +2384,7 @@ class Compiler {
   // Atomics on groupshared memory: InterlockedOp(lds[i], value[, original]).
   RV shared_atomic(const std::string& n) {
     std::vector<Ex> a = exprs_until_paren();
+    if (a.size() >= 2 && a[0].is_lv && a[0].lv.kind == LV::Texel) return texel_atomic(n, a);
     if (a.size() < 2 || !a[0].is_lv || a[0].lv.kind != LV::Mem || a[0].lv.ptrs.size() != 1) fail(n + " on something not groupshared");
     const Value ptr = a[0].lv.ptrs[0];
     const B b = a[0].lv.t.b;
@@ -2336,7 +2421,8 @@ class Compiler {
     const std::string n = syms_.name(name);
     expect(p_lparen);
     if (obj.t.rk == RK::Raw || obj.t.rk == RK::RWRaw) return rv(raw_method(obj.c[0], obj.t.rk == RK::RWRaw, n));
-    fail("method " + n + " of a texture (not yet)");
+    if (obj.t.rk == RK::Sampler || obj.t.rk == RK::SamplerCmp) fail("method " + n + " of a sampler");
+    return rv(texture_method(obj, n));
   }
   RV raw_method(Value h, bool writable, const std::string& n) {
     if (n == "Load" || n == "Load2" || n == "Load3" || n == "Load4") {
@@ -2395,10 +2481,221 @@ class Compiler {
     fail("buffer method " + n);
   }
 
-  // Textures (not yet in the subset).
-  Ex texel(const Ex&, const RV&) { fail("a texture element (not yet)"); }
-  RV texel_load(const LV&) { fail("a texture element (not yet)"); }
-  void texel_store(const LV&, const RV&) { fail("a texture element (not yet)"); }
+  // ---- textures ----
+  // A texture kind's shape: DXIL's kind number; coordinates a sample takes (with the array
+  // slice), texel coordinates a load takes, offsets, gradient components; sizes GetDimensions
+  // returns before the level count.
+  struct TexShape {
+    uint32_t kind;
+    uint8_t coords, texel, offsets, grads, dims;
+    bool ms, uav;
+  };
+  TexShape shape(RK k) const {
+    switch (k) {
+      case RK::Tex1D: return {1, 1, 1, 1, 1, 1, false, false};
+      case RK::RWTex1D: return {1, 1, 1, 1, 1, 1, false, true};
+      case RK::Tex1DArr: return {6, 2, 2, 1, 1, 2, false, false};
+      case RK::RWTex1DArr: return {6, 2, 2, 1, 1, 2, false, true};
+      case RK::Tex2D: return {2, 2, 2, 2, 2, 2, false, false};
+      case RK::RWTex2D: return {2, 2, 2, 2, 2, 2, false, true};
+      case RK::Tex2DArr: return {7, 3, 3, 2, 2, 3, false, false};
+      case RK::RWTex2DArr: return {7, 3, 3, 2, 2, 3, false, true};
+      case RK::Tex2DMS: return {3, 2, 2, 2, 2, 2, true, false};
+      case RK::Tex2DMSArr: return {8, 3, 3, 2, 2, 3, true, false};
+      case RK::Tex3D: return {4, 3, 3, 3, 3, 3, false, false};
+      case RK::RWTex3D: return {4, 3, 3, 3, 3, 3, false, true};
+      case RK::TexCube: return {5, 3, 0, 0, 3, 2, false, false};
+      case RK::TexCubeArr: return {9, 4, 0, 0, 3, 3, false, false};
+      default: fail("a resource that is not a texture");
+    }
+  }
+  // The dx.op overload of a texture's element (f32, or i32 for integer views).
+  Type overload_of(B elem) const { return is_float(elem) ? m_.f32() : m_.i32(); }
+  Type res_ret(Type o) { return m_.named_struct(o == m_.f32() ? "dx.types.ResRet.f32" : "dx.types.ResRet.i32", {o, o, o, o, m_.i32()}); }
+  // The first `n` values of a ResRet, as the view's element type.
+  RV from_ret(Value r, B elem, uint8_t n) {
+    RV out;
+    out.t = scalar(is_float(elem) ? B::Float : elem, n);
+    for (uint8_t k = 0; k < n; ++k) out.c.push_back(m_.extract(r, k));
+    return out;
+  }
+  // `n` components of `v` as `b`, then undef up to `total` (DXIL's unused coordinates).
+  std::vector<Value> parts(const RV& v, B b, size_t n, size_t total) {
+    const RV x = with_base(v, b);
+    if (x.c.size() < n) fail("a coordinate with too few components");
+    std::vector<Value> out(x.c.begin(), x.c.begin() + static_cast<std::ptrdiff_t>(n));
+    while (out.size() < total) out.push_back(m_.undef(ir(b)));
+    return out;
+  }
+  // Offsets: the given ones, or 0 for each the shape takes (as DXC writes them); undef past it.
+  std::vector<Value> offsets(const RV* given, const TexShape& s, size_t total) {
+    if (given) return parts(*given, B::Int, s.offsets, total);
+    std::vector<Value> out;
+    for (size_t k = 0; k < total; ++k) out.push_back(k < s.offsets ? m_.u32(0) : m_.undef(m_.i32()));
+    return out;
+  }
+  static void append(std::vector<Value>& to, const std::vector<Value>& v) { to.insert(to.end(), v.begin(), v.end()); }
+  Value sampler_of(const RV& s) {
+    if (s.t.b != B::Res || (s.t.rk != RK::Sampler && s.t.rk != RK::SamplerCmp)) fail("a sample without a sampler");
+    return s.c[0];
+  }
+
+  RV texture_method(const RV& obj, const std::string& n) {
+    const TexShape s = shape(obj.t.rk);
+    const Value h = obj.c[0];
+    const B elem = obj.t.elem;
+    const Type o = overload_of(elem);
+    const Type f = m_.f32(), i = m_.i32(), hd = m_.handle_type();
+    if (n == "GetDimensions") {
+      // (mip, sizes..., levels) for a view with levels; (sizes...) for a UAV or an MS texture.
+      std::vector<Ex> a = exprs_until_paren();
+      const bool with_mip = a.size() == static_cast<size_t>(s.dims) + 2u;
+      if (!with_mip && a.size() != s.dims) fail("GetDimensions arguments");
+      const Value mip = with_mip ? scalar_of(value(a[0]), B::Uint) : m_.undef(i);
+      const Type dt = m_.named_struct("dx.types.Dimensions", {i, i, i, i});
+      const Value d = m_.dx_call(72, "getDimensions", kNone, dt, {hd, i}, Attr::ReadOnly, {h, mip});
+      const size_t first = with_mip ? 1 : 0;
+      for (size_t k = 0; k < s.dims; ++k) {
+        if (!a[first + k].is_lv) fail("GetDimensions into a value");
+        store(a[first + k].lv, make(B::Uint, {m_.extract(d, static_cast<uint32_t>(k))}));
+      }
+      if (with_mip) {
+        if (!a.back().is_lv) fail("GetDimensions into a value");
+        store(a.back().lv, make(B::Uint, {m_.extract(d, 3)}));
+      }
+      return RV{};
+    }
+    std::vector<RV> a = args_until_paren();
+    if (n == "Load") {
+      // Load(coordinates with the level last) or, multisampled, Load(coordinates, sample).
+      if (a.empty()) fail("Load arguments");
+      Value mip;
+      std::vector<Value> c;
+      if (s.ms) {
+        if (a.size() != 2) fail("Load of a multisampled texture: arguments");
+        c = parts(a[0], B::Int, s.texel, 3);
+        mip = scalar_of(a[1], B::Int);
+      } else if (s.uav) {
+        c = parts(a[0], B::Int, s.texel, 3);
+        mip = m_.undef(i);
+        if (obj.t.en > 1) m_.add_flags(1ull << 13);
+      } else {
+        const RV x = with_base(a[0], B::Int);
+        if (x.c.size() != static_cast<size_t>(s.texel) + 1u) fail("Load coordinates");
+        mip = x.c.back();
+        c = parts(x, B::Int, s.texel, 3);
+      }
+      std::vector<Value> args{h, mip};
+      append(args, c);
+      append(args, {m_.undef(i), m_.undef(i), m_.undef(i)});
+      const Value r = m_.dx_call(66, "textureLoad", o, res_ret(o), {hd, i, i, i, i, i, i, i}, Attr::ReadOnly, args);
+      return from_ret(r, elem, obj.t.en);
+    }
+    if (n == "SampleLevel" || n == "SampleGrad" || n == "SampleCmpLevelZero") {
+      const bool grad = n == "SampleGrad", cmp = n == "SampleCmpLevelZero";
+      const size_t fixed = grad ? 4 : 3;  // sampler, coordinate, then lod / ddx+ddy / compare
+      if (a.size() < fixed || a.size() > fixed + (grad ? 2u : 1u)) fail(n + " arguments");
+      std::vector<Value> args{h, sampler_of(a[0])};
+      append(args, parts(a[1], B::Float, s.coords, 4));
+      append(args, offsets(a.size() > fixed ? &a[fixed] : nullptr, s, 3));
+      std::vector<Type> params{hd, hd, f, f, f, f, i, i, i};
+      if (grad) {
+        append(args, parts(a[2], B::Float, s.grads, 3));
+        append(args, parts(a[3], B::Float, s.grads, 3));
+        const Value clamp = a.size() > 5 ? scalar_of(a[5], B::Float) : m_.undef(f);
+        args.push_back(clamp);
+        params.insert(params.end(), {f, f, f, f, f, f, f});
+      } else {
+        args.push_back(scalar_of(a[2], B::Float));
+        params.push_back(f);
+      }
+      const uint32_t op = grad ? 63 : cmp ? 65 : 62;
+      const char* klass = grad ? "sampleGrad" : cmp ? "sampleCmpLevelZero" : "sampleLevel";
+      const Type ov = cmp ? f : o;
+      const Value r = m_.dx_call(op, klass, ov, res_ret(ov), params, Attr::ReadOnly, args);
+      return cmp ? from_ret(r, B::Float, 1) : from_ret(r, elem, obj.t.en);
+    }
+    if (n == "GatherRed" || n == "GatherGreen" || n == "GatherBlue" || n == "GatherAlpha" || n == "Gather") {
+      if (a.size() < 2 || a.size() > 3) fail(n + " arguments");
+      const uint32_t channel = n == "GatherGreen" ? 1 : n == "GatherBlue" ? 2 : n == "GatherAlpha" ? 3 : 0;
+      std::vector<Value> args{h, sampler_of(a[0])};
+      append(args, parts(a[1], B::Float, s.coords, 4));
+      append(args, offsets(a.size() > 2 ? &a[2] : nullptr, s, 2));
+      args.push_back(m_.u32(channel));
+      const Value r = m_.dx_call(73, "textureGather", o, res_ret(o), {hd, hd, f, f, f, f, i, i, i}, Attr::ReadOnly, args);
+      return from_ret(r, elem, 4);
+    }
+    fail("texture method " + n);
+  }
+
+  // t[at] of a writable texture: a place to load from, store to or use atomically.
+  Ex texel(const Ex& e, const RV& idx) {
+    const RV obj = value(e);
+    const TexShape s = shape(obj.t.rk);
+    if (!s.uav) fail("an element of a read-only texture");
+    Ex out;
+    out.is_lv = true;
+    out.lv.kind = LV::Texel;
+    out.lv.t = scalar(is_float(obj.t.elem) ? B::Float : obj.t.elem, obj.t.en);
+    out.lv.handle = obj.c[0];
+    out.lv.coords = parts(idx, B::Uint, s.texel, 3);
+    return out;
+  }
+  RV texel_load(const LV& lv) {
+    const Type o = overload_of(lv.t.b), i = m_.i32();
+    if (lv.t.n > 1) m_.add_flags(1ull << 13);  // typed UAV loads of more than one component
+    std::vector<Value> args{lv.handle, m_.undef(i)};
+    append(args, lv.coords);
+    append(args, {m_.undef(i), m_.undef(i), m_.undef(i)});
+    const Value r = m_.dx_call(66, "textureLoad", o, res_ret(o), {m_.handle_type(), i, i, i, i, i, i, i}, Attr::ReadOnly, args);
+    return from_ret(r, lv.t.b, lv.t.n);
+  }
+  void texel_store(const LV& lv, const RV& v) {
+    // Four values and mask 15 always; a narrower view's missing values repeat the first (as DXC).
+    const Type o = overload_of(lv.t.b), i = m_.i32();
+    std::vector<Value> args{lv.handle};
+    append(args, lv.coords);
+    for (size_t k = 0; k < 4; ++k) args.push_back(k < v.c.size() ? v.c[k] : v.c[0]);
+    args.push_back(m_.u8(15));
+    m_.dx_call(67, "textureStore", o, m_.void_type(), {m_.handle_type(), i, i, i, o, o, o, o, m_.i8()}, Attr::None, args);
+  }
+  // InterlockedOp(t[at], value[, original]) and InterlockedCompareExchange(t[at], cmp, value, original).
+  RV texel_atomic(const std::string& n, const std::vector<Ex>& a) {
+    const LV& lv = a[0].lv;
+    const Type i = m_.i32(), hd = m_.handle_type();
+    Value old;
+    size_t out_at;
+    if (n == "InterlockedCompareExchange") {
+      if (a.size() != 4) fail(n + " arguments");
+      std::vector<Value> args{lv.handle};
+      append(args, lv.coords);
+      args.push_back(scalar_of(value(a[1]), lv.t.b));
+      args.push_back(scalar_of(value(a[2]), lv.t.b));
+      old = m_.dx_call(79, "atomicCompareExchange", i, i, {hd, i, i, i, i, i}, Attr::None, args);
+      out_at = 3;
+    } else {
+      const bool sg = lv.t.b == B::Int;
+      uint32_t op = 0;  // DXIL's atomic ops: add, and, or, xor, imin, imax, umin, umax, exchange
+      if (n == "InterlockedAdd") op = 0;
+      else if (n == "InterlockedAnd") op = 1;
+      else if (n == "InterlockedOr") op = 2;
+      else if (n == "InterlockedXor") op = 3;
+      else if (n == "InterlockedMin") op = sg ? 4 : 6;
+      else if (n == "InterlockedMax") op = sg ? 5 : 7;
+      else if (n == "InterlockedExchange") op = 8;
+      else fail(n);
+      std::vector<Value> args{lv.handle, m_.u32(op)};
+      append(args, lv.coords);
+      args.push_back(scalar_of(value(a[1]), lv.t.b));
+      old = m_.dx_call(78, "atomicBinOp", i, i, {hd, i, i, i, i, i}, Attr::None, args);
+      out_at = 2;
+    }
+    if (a.size() > out_at) {
+      if (!a[out_at].is_lv) fail(n + "'s original value into a value");
+      store(a[out_at].lv, make(lv.t.b, {old}));
+    }
+    return RV{};
+  }
 
   Module& m_;
   Syms& syms_;
