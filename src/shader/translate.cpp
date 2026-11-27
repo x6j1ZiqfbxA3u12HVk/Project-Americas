@@ -335,14 +335,17 @@ bool vector_form(Ctx& c) {
 
 // MUBUF / MTBUF: opens a lane's block with the V# in `rs`, the address in `p` and the bytes
 // in bounds from there in `lim`.
-bool buffer_address(Ctx& c) {
+bool buffer_address(Ctx& c, bool guard = true) {
   if (c.f(Field::LDS) || c.f(Field::TFE)) return c.fail("buffer access with lds/tfe");
   const uint32_t r = c.f(Field::SRSRC) * 4, va = c.f(Field::VADDR);
   const bool idx = c.f(Field::IDXEN), off = c.f(Field::OFFEN);
   c.touch_v(va + (idx && off ? 1 : 0));
   const std::string index = idx ? "v[" + num(va) + "]" : "0u";
   const std::string offset = off ? "v[" + num(va + (idx ? 1 : 0)) + "]" : "0u";
-  c.line("if (AM_ACT) { uint4 rs = uint4(s[" + num(r) + "], s[" + num(r + 1) + "], s[" + num(r + 2) + "], s[" + num(r + 3) + "]);");
+  // Loads run for every lane and only their register writes follow EXEC (selects, no branch:
+  // a branch around each memory access made the largest programs too much for the driver).
+  c.line(std::string(guard ? "if (AM_ACT) " : "") + "{ uint4 rs = uint4(s[" + num(r) + "], s[" + num(r + 1) + "], s[" + num(r + 2) +
+         "], s[" + num(r + 3) + "]);");
   c.line("  uint64_t p; uint lim; am_buffer_address(rs, " + index + ", " + offset + " + " + num(c.f(Field::OFFSET)) + "u, " +
          c.src(c.f(Field::SOFFSET)) + ", p, lim);");
   return true;
@@ -1704,7 +1707,7 @@ const std::unordered_map<std::string, Handler>& table() {
         for (const bool tbuffer : {false, true}) {
           const std::string name = std::string(tbuffer ? "tbuffer_" : "buffer_") + (store ? "store" : "load") + "_format_" + kChannels[n - 1];
           t[name] = [n, store, tbuffer](Ctx& c) {
-            if (!buffer_address(c)) return false;
+            if (!buffer_address(c, store)) return false;
             const uint32_t vd = c.f(Field::VDATA);
             c.touch_v(vd + n - 1);
             const std::string fmt = tbuffer ? num(c.f(Field::FORMAT)) + "u" : "((rs.w >> 12) & 0x7Fu)";
@@ -1714,7 +1717,7 @@ const std::unordered_map<std::string, Handler>& table() {
               c.line("  am_fmt_store(p, lim, am_fmt_info(" + fmt + "), " + num(n) + "u, " + val + "));");
             } else {
               c.line("  uint4 r = am_fmt_load(p, lim, am_fmt_info(" + fmt + "), rs.w);");
-              for (int k = 0; k < n; ++k) c.line("  v[" + num(vd + k) + "] = r[" + num(k) + "];");
+              for (int k = 0; k < n; ++k) c.line("  if (AM_ACT != 0u) v[" + num(vd + k) + "] = r[" + num(k) + "];");
             }
             c.line("}");
             return true;
@@ -1725,12 +1728,13 @@ const std::unordered_map<std::string, Handler>& table() {
           t[name] = [n, store, tbuffer](Ctx& c) { return buffer_d16(c, n, store, tbuffer, false); };
         }
         t[(store ? "buffer_store_dword" : "buffer_load_dword") + sfx] = [n, store](Ctx& c) {
-          if (!buffer_address(c)) return false;
+          if (!buffer_address(c, store)) return false;
           const uint32_t vd = c.f(Field::VDATA);
           c.touch_v(vd + n - 1);
           for (int k = 0; k < n; ++k) {
             if (store) c.line("  if (" + num(4 * k) + "u < lim) am_store(p + " + num(4 * k) + ", v[" + num(vd + k) + "]);");
-            else c.line("  v[" + num(vd + k) + "] = " + num(4 * k) + "u < lim ? am_load(p + " + num(4 * k) + ") : 0u;");
+            else c.line("  { uint x = select(" + num(4 * k) + "u < lim, am_load(p + " + num(4 * k) + "), 0u); if (AM_ACT != 0u) v[" +
+                        num(vd + k) + "] = x; }");
           }
           c.line("}");
           return true;
@@ -1748,10 +1752,10 @@ const std::unordered_map<std::string, Handler>& table() {
             addr = "am_u64(s[" + num(sa) + "], s[" + num(sa + 1) + "]) + uint64_t(v[" + num(va) + "])";
           }
           c.touch_v(vd + n - 1);
-          c.line("if (AM_ACT) { uint64_t p = " + addr + " + uint64_t(int64_t(" + std::to_string(imm) + "));");
+          c.line(std::string(store ? "if (AM_ACT) " : "") + "{ uint64_t p = " + addr + " + uint64_t(int64_t(" + std::to_string(imm) + "));");
           for (int k = 0; k < n; ++k) {
             if (store) c.line("  am_store(p + " + num(4 * k) + ", v[" + num(vd + k) + "]);");
-            else c.line("  v[" + num(vd + k) + "] = am_load(p + " + num(4 * k) + ");");
+            else c.line("  { uint x = am_load(p + " + num(4 * k) + "); if (AM_ACT != 0u) v[" + num(vd + k) + "] = x; }");
           }
           c.line("}");
           return true;
@@ -1771,10 +1775,10 @@ const std::unordered_map<std::string, Handler>& table() {
       for (const Narrow& n : kNarrow) {
         const std::string expr = n.expr;
         t[n.name] = [expr](Ctx& c) {
-          if (!buffer_address(c)) return false;
+          if (!buffer_address(c, false)) return false;
           const uint32_t vd = c.f(Field::VDATA);
           c.touch_v(vd);
-          c.line("  { uint x = 0u < lim ? am_load(p) >> (uint(p & 3u) * 8u) : 0u; v[" + num(vd) + "] = " + expr + "; }");
+          c.line("  { uint x = select(0u < lim, am_load(p) >> (uint(p & 3u) * 8u), 0u); if (AM_ACT != 0u) v[" + num(vd) + "] = " + expr + "; }");
           c.line("}");
           return true;
         };
@@ -2775,22 +2779,18 @@ uint am_fmt_chan(uint4 raw, uint info, uint k, uint o) {
 }
 uint am_fmt_select(uint4 c, uint info, uint sel) { return sel >= 4u ? c[sel - 4u] : sel == 1u ? am_fmt_one(info) : 0u; }
 uint4 am_fmt_load(uint64_t p, uint lim, uint info, uint w3) {
+  // No branches: every dword read, the unused ones dropped by select (memory reads are harmless).
   uint eb = am_fmt_bytes(info);
-  if (eb == 0u || eb > lim) return uint4(0u, 0u, 0u, 0u);
-  uint4 raw = uint4(0u, 0u, 0u, 0u);
-  if (eb < 4u) {
-    raw.x = am_load(p & ~uint64_t(3)) >> (uint(p & 3u) * 8u);
-  } else {
-    raw.x = am_load(p);
-    if (eb >= 8u) raw.y = am_load(p + 4u);
-    if (eb >= 12u) raw.z = am_load(p + 8u);
-    if (eb >= 16u) raw.w = am_load(p + 12u);
-  }
+  uint x0 = am_load(p & ~uint64_t(3));
+  uint4 raw = uint4(select(eb < 4u, x0 >> (uint(p & 3u) * 8u), x0), select(eb >= 8u, am_load(p + 4u), 0u),
+                    select(eb >= 12u, am_load(p + 8u), 0u), select(eb >= 16u, am_load(p + 12u), 0u));
   uint w0 = am_fmt_width(info, 0u), w1 = am_fmt_width(info, 1u), w2 = am_fmt_width(info, 2u);
   uint4 c = uint4(am_fmt_chan(raw, info, 0u, 0u), am_fmt_chan(raw, info, 1u, w0), am_fmt_chan(raw, info, 2u, w0 + w1),
                   am_fmt_chan(raw, info, 3u, w0 + w1 + w2));
-  return uint4(am_fmt_select(c, info, w3 & 7u), am_fmt_select(c, info, (w3 >> 3) & 7u), am_fmt_select(c, info, (w3 >> 6) & 7u),
-               am_fmt_select(c, info, (w3 >> 9) & 7u));
+  uint4 res = uint4(am_fmt_select(c, info, w3 & 7u), am_fmt_select(c, info, (w3 >> 3) & 7u), am_fmt_select(c, info, (w3 >> 6) & 7u),
+                    am_fmt_select(c, info, (w3 >> 9) & 7u));
+  // Outside the buffer (or no format): all zeros, as before.
+  return select(eb == 0u || eb > lim, uint4(0u, 0u, 0u, 0u), res);
 }
 
 // Writes the first `n` channels of one typed element.

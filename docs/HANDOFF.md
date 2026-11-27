@@ -1684,3 +1684,13 @@ list slots from 59 up are two later than in older titles).
   driver pipeline build 80 s -> 50 s, **peak 6.8 GB -> 4.5 GB**; DXIL +5 %.
 * Next rounds: the per-instruction `if (AM_ACT)` guards on vector writes, flags (scc) written and
   never read, the chained form's `am_br` unwinding; then the far-jump giants in the driver again.
+
+## Step 3, round 2: vector loads without branches (2026-11-27, ~06:00)
+
+* Vector buffer and global loads (and sub-dword buffer loads) run for every lane; only their
+  register writes follow EXEC (`if (AM_ACT != 0u) v[n] = x;`, which DXC turns into a select).
+  Stores keep their lane test. Bounds use HLSL 2021's `select()` (its `?:` short-circuits into a
+  branch). `am_fmt_load` reads its dwords unconditionally and selects; out of range still gives
+  all zeros.
+* **`ca8f...` after rounds 1+2:** branches 17,632 -> 9,494; **driver peak 6.8 -> 3.4 GB**, build
+  80 -> 37 s; DXC 55 -> 23 s; DXIL size unchanged. Next: the far-jump giant `3db4...` with this.
