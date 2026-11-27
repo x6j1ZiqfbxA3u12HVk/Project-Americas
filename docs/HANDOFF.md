@@ -1785,3 +1785,29 @@ list slots from 59 up are two later than in older titles).
   slow. The structurer's chain form (`am_br`, `am_go`) is untouched.
 * Cache housekeeping still needs the user's OK: `dxil\rt5` (now unused by the runtime, 3 GB),
   `rt4`, `rt`, loose files, old service copies.
+
+## The giants are typed buffer loads (2026-11-27, ~06:40)
+
+* Only two of the game's programs are giants: **3db4** (16.6 MB HLSL, 3,282 typed buffer loads)
+  and **24ea** (15 MB, 1,890). The other entries in `compiling\` were ordinary 170-190 KiB
+  programs. With translator 6, 3db4 compiles in DXC in 10 min to 5.4 MB of DXIL (13 MB before),
+  but its DXIL is 956 K instructions, of which about 820 K are `am_fmt_load`: each
+  `buffer_load_format_*` reads its format from the V# at run time, so every one of the 3,282
+  sites carries the whole software format decoder (4 channels x 7 conversions: the DXIL has 200 K
+  selects, 39 K int-to-float, 26 K divides, 13 K f16 conversions). That is emulating the texture
+  unit, and it is what the driver chokes on: AMD's build of 3db4 swung between 4.6 and 12.6 GB
+  of private bytes for 10+ minutes on the 16 GB PC (stopped; total commit had reached 46 GB with
+  DXC and the service running too).
+* **The fix (the reference's method):** typed loads through typed views, so the GPU's own
+  hardware converts the format. In our memory model: when a window opens, the runtime also
+  creates typed UAVs of it, one per DXGI format a console buffer format maps to, at fixed heap
+  slots (window n, format f -> base + n * formats + f); the translated load finds its window
+  through the page table as raw loads do, and reads element (byte offset in window / element
+  size) from that view, in the format's class (float, uint, sint; scaled formats convert after).
+  32-bit channel formats stay raw dwords (no conversion). Formats without a DXGI twin (10_10_10_2,
+  11_11_10) keep a software path. Expected: ~20-30 instructions a site instead of ~250, so the
+  giants shrink about 4x, and run faster.
+* **The user's question: does it just work with a 48 GB page file?** Measuring: the driver build
+  of 3db4 to the end (capped at 45 GB), `tools\step3\driver-3db4-full.ps1`, log
+  `cache\shaders\bench\r6-3db4\driver-full.txt` (peak private bytes, system commit at the peak,
+  time).
