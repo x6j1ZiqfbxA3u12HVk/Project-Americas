@@ -1918,3 +1918,8 @@ cannot be built. What a console mesh program does (from the reference furthest a
 * The translator-6 24ea DXIL (no wave branches) is installed in `dxil\rt6` for now (key
   bd0ba232..): the runtime would hand it to the driver, which on a 16 GB PC needs a big page
   file. The service will rebuild 24ea with the wave branches when it next starts (stale check).
+* **Result (09:05): no.** With wave branches 24ea's DXIL grew 2.0 -> 3.8 MB and the driver still
+  passed 20 GB (in 145 s). Taken out again. Next idea to try: the nested form instead of chains.
+  The depth check (`too_deep`, > 200) counts expression parentheses with the block nesting;
+  clang's real limit is 256 brackets, so 24ea's nested form may fit (3db4's nested form builds
+  in 7.6 GB). Measure its nested depth first; if under ~250, raise the threshold.
