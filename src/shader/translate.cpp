@@ -100,7 +100,8 @@ std::string fill(const std::string& t, const std::string& a, const std::string& 
 // (one loaded from memory) gives each lane its bit. Programs whose registers hold a mask on one
 // path and a number on another keep the wave's masks (the older form, `lane` false).
 enum : uint8_t { kNum = 1, kMask = 2 };     // what an SGPR may hold; 0: zero or all ones, either
-using MaskKinds = std::array<uint8_t, 128>;
+using MaskKinds = std::array<uint8_t, 129>;  // the SGPRs, then SCC (128)
+constexpr uint32_t kSccKind = 128;
 
 // ---- the emitter's state for one instruction ----
 
@@ -123,6 +124,10 @@ struct Ctx {
   bool depth_export = false;
   bool uses_lod = false;     // image_get_lod: the level-of-detail helpers
   bool uses_typed = false;   // typed buffer loads: kTypedHelpers (only then, so other programs' source stays the same)
+  // The V#s (first SGPR) buffer_load_format reads: their base, range and format parameters are
+  // computed where the V# is written (am_tb<r>), not again at every load (a giant program has
+  // 3,281 loads of one V# that is written 7 times).
+  std::set<uint32_t> typed_vs;
   bool uses_movrel = false;  // v_movrel*: am_nv bounds the indexed VGPRs
   // Descriptor lookups still valid in this block, by first SGPR (T#s, S#s), and every one made.
   std::set<uint32_t> live_images, live_samplers, image_vars, sampler_vars;
@@ -142,6 +147,11 @@ struct Ctx {
   bool lane = false;
   MaskKinds mt{};
   bool mask_op = false;
+  // The largest programs branch as the console does, on the wave: a branch on a mask's test is
+  // taken when no lane passes it (WaveActiveAnyTrue), so all control flow stays uniform. Lanes as
+  // threads branch each on its own test, which the host compiler must turn back into masks: for
+  // a program of 17,000 blocks that took AMD's compiler 13.7 GB.
+  bool wave_branches = false;
 
   // The lane condition of a vector write (EXEC, and DPP's masks when it has them).
   std::string act() const { return dpp ? "and(AM_ACT != 0u, am_dpp_on)" : "(AM_ACT != 0u)"; }
@@ -1801,6 +1811,27 @@ const std::unordered_map<std::string, Handler>& table() {
         for (const bool tbuffer : {false, true}) {
           const std::string name = std::string(tbuffer ? "tbuffer_" : "buffer_") + (store ? "store" : "load") + "_format_" + kChannels[n - 1];
           t[name] = [n, store, tbuffer](Ctx& c) {
+            if (!store && !tbuffer && c.typed_vs.count(c.f(Field::SRSRC) * 4)) {
+              // The V#'s parameters (am_typed) were computed where it was written.
+              if (c.f(Field::LDS) || c.f(Field::TFE)) return c.fail("buffer access with lds/tfe");
+              const uint32_t r = c.f(Field::SRSRC) * 4, va = c.f(Field::VADDR), vd = c.f(Field::VDATA);
+              const bool idx = c.f(Field::IDXEN), off = c.f(Field::OFFEN);
+              c.touch_v(va + (idx && off ? 1 : 0));
+              c.touch_v(vd + n - 1);
+              const std::string index = idx ? "v[" + num(va) + "]" : "0u";
+              const std::string offset = off ? "v[" + num(va + (idx ? 1 : 0)) + "]" : "0u";
+              const std::string tb = "am_tb" + num(r);
+              c.uses_typed = true;
+              c.line("{ uint64_t at = uint64_t(" + index + ") * " + tb + ".stride + (" + offset + " + " + num(c.f(Field::OFFSET)) + "u);");
+              c.line("  uint64_t p = " + tb + ".base + at + " + c.src(c.f(Field::SOFFSET)) + ";");
+              c.line("  uint lim = select(at >= " + tb + ".range, 0u, uint(min(" + tb + ".range - at, uint64_t(16))));");
+              c.line("  uint4 raw = am_traw(" + tb + ", p);");
+              std::vector<std::pair<uint32_t, std::string>> w;
+              for (int k = 0; k < n; ++k) w.emplace_back(vd + k, "am_tch(raw, " + tb + ".c" + num(k) + ", lim, " + tb + ".eb)");
+              c.vwrites(w);
+              c.line("}");
+              return true;
+            }
             if (!buffer_address(c, store)) return false;
             const uint32_t vd = c.f(Field::VDATA);
             c.touch_v(vd + n - 1);
@@ -3000,6 +3031,60 @@ uint am_fmt_ch(uint4 raw, uint info, uint k, uint o) {
            select(t <= 3u, asuint(f), select(t == 4u, x, select(t == 5u, asuint(sx), fl))));
   return select(k >= ((info >> 3) & 7u), select(k == 3u, am_fmt_one(info), 0u), r);
 }
+// A V#'s parameters for typed loads, computed where the V# is written: base, stride, range,
+// element bytes, and for each output (its destination select) where its channel's bits are and
+// how they convert (cls: 0 a constant, 1 normalized, 2 scaled, 3 an unsigned small float or
+// half, 4 the bits as they are, sign-extended for sint).
+struct AmTOut { uint idx; uint sh; uint m; uint ssh; uint hs; uint cval; uint cls; float d; float lo; bool sgn; };
+struct AmTyped { uint64_t base; uint stride; uint64_t range; uint eb; uint win; AmTOut c0; AmTOut c1; AmTOut c2; AmTOut c3; };
+AmTOut am_tout(uint info, uint sel) {
+  AmTOut r;
+  uint k = sel & 3u, t = info & 7u, w0 = am_fmt_width(info, 0u), w1 = am_fmt_width(info, 1u), w2 = am_fmt_width(info, 2u);
+  uint o = select(k == 0u, 0u, select(k == 1u, w0, select(k == 2u, w0 + w1, w0 + w1 + w2)));
+  uint w = am_fmt_width(info, k);
+  bool absent = k >= ((info >> 3) & 7u);
+  r.idx = o >> 5;
+  r.sh = o & 31u;
+  r.m = select(w >= 32u, 0xFFFFFFFFu, (1u << w) - 1u);
+  r.ssh = 32u - w;
+  r.hs = 15u - min(w, 15u);
+  r.sgn = (t & 1u) != 0u;  // snorm, sscaled, sint
+  r.d = float(select(t == 1u, r.m >> 1, r.m));
+  r.lo = select(t == 1u, -1.0f, -3.4028235e38f);
+  uint one = am_fmt_one(info);
+  r.cval = select(sel < 4u, select(sel == 1u, one, 0u), select(k == 3u, one, 0u));
+  r.cls = select(or(sel < 4u, absent), 0u, select(t <= 1u, 1u, select(t <= 3u, 2u, select(and(t == 6u, w < 32u), 3u, 4u))));
+  return r;
+}
+AmTyped am_typed(uint4 rs) {
+  AmTyped t;
+  t.base = am_u64(rs.x, rs.y & 0xFFFFu);
+  t.stride = (rs.y >> 16) & 0x3FFFu;
+  t.range = uint64_t(rs.z) * uint64_t(max(t.stride, 1u));  // raw buffers (stride 0) count bytes
+  t.win = am_twin(t.base);
+  uint info = am_fmt_info((rs.w >> 12) & 0x7Fu);
+  t.eb = am_fmt_bytes(info);
+  t.c0 = am_tout(info, rs.w & 7u);
+  t.c1 = am_tout(info, (rs.w >> 3) & 7u);
+  t.c2 = am_tout(info, (rs.w >> 6) & 7u);
+  t.c3 = am_tout(info, (rs.w >> 9) & 7u);
+  return t;
+}
+uint4 am_traw(AmTyped t, uint64_t p) {
+  uint4 q = am_tload4(t.win, p & ~uint64_t(3));
+  return uint4(select(t.eb < 4u, q.x >> (uint(p & 3u) * 8u), q.x), select(t.eb >= 8u, q.y, 0u), select(t.eb >= 12u, q.z, 0u),
+               select(t.eb >= 16u, q.w, 0u));
+}
+uint am_tch(uint4 raw, AmTOut c, uint lim, uint eb) {
+  uint dw = select(c.idx == 0u, raw.x, select(c.idx == 1u, raw.y, select(c.idx == 2u, raw.z, raw.w)));
+  uint x = (dw >> c.sh) & c.m;
+  int v = select(c.sgn, int(x << c.ssh) >> c.ssh, int(x));
+  float f = float(v);  // normalized and scaled channels are under 32 bits
+  float n = max(select(f == c.d, 1.0f, f / c.d), c.lo);  // the largest value is exactly 1
+  uint r = select(c.cls == 0u, c.cval, select(c.cls == 1u, asuint(n), select(c.cls == 2u, asuint(f),
+           select(c.cls == 3u, asuint(f16tof32(x << c.hs)), asuint(v)))));
+  return select(or(eb == 0u, eb > lim), 0u, r);
+}
 // One output: `sel` is the V#'s destination select for it (0, 1, or channel X..W as 4..7); out
 // of the buffer (or no format) it reads 0.
 uint am_fmt_out(uint4 raw, uint info, uint sel, uint lim) {
@@ -3009,6 +3094,22 @@ uint am_fmt_out(uint4 raw, uint info, uint sel, uint lim) {
   uint eb = am_fmt_bytes(info);
   return select(or(eb == 0u, eb > lim), 0u, v);
 }
+)";
+
+// The window a V#'s buffer lies in, found once where the V# is written: one buffer is one
+// allocation, so every lane reads the same window and the view index is uniform (a per-lane
+// index makes the driver loop over the lanes at every load). The page still comes from each
+// lane's own address (pool pages need not be in a row).
+const char* kTypedRuntime = R"(
+uint am_twin(uint64_t base) { return am_win(am_entry(base)); }
+uint4 am_tload4(uint win, uint64_t a) {
+  RWByteAddressBuffer w = ResourceDescriptorHeap[win];
+  return w.Load4(am_at(am_entry(a), a));
+}
+)";
+const char* kTypedTest = R"(
+uint am_twin(uint64_t base) { return 0u; }
+uint4 am_tload4(uint win, uint64_t a) { return am_memory.Load4(am_offset(a)); }
 )";
 
 // The unified buffer formats (gfx10): bits 0-2 the type (unorm, snorm, uscaled, sscaled, uint,
@@ -3470,6 +3571,9 @@ std::string initial_exec(bool wave64, bool lane, bool ps) {
   return std::string("  { uint4 b = WaveActiveBallot(true); s[126] = b.x; s[127] = ") + (wave64 ? "b.y" : "0u") + "; }\n";
 }
 
+// Programs of more instructions than this branch on the wave (Ctx::wave_branches).
+constexpr size_t kWaveBranchesFrom = 32768;
+
 // ---- lanes as threads: what each SGPR holds, through the program ----
 
 // The scalar bitwise instructions: on masks of the wave's width they work lane by lane.
@@ -3492,6 +3596,33 @@ bool sgpr_operand(rd::OperandType t) {
       return true;
     default:
       return false;
+  }
+}
+
+// The SGPRs an instruction writes, as (first, count), from the decoder's operand tables.
+void sgpr_writes(const rd::Instruction& insn, bool wave64, std::vector<std::pair<uint32_t, uint32_t>>& out) {
+  out.clear();
+  if (!insn.info) return;
+  using E = rd::Encoding;
+  using T = rd::OperandType;
+  const E e = insn.encoding;
+  const bool valu = e == E::Vop1 || e == E::Vop2 || e == E::Vopc || e == E::Vop3 || e == E::Vop3p || e == E::Vintrp;
+  for (int i = 0; i < insn.info->operand_count; ++i) {
+    const rd::OperandInfo& op = insn.info->operands[i];
+    if (!(op.flags & rd::kOut) || !sgpr_operand(op.type)) continue;
+    uint32_t reg;
+    if (op.field == Field::Implicit) {
+      if (op.type == T::OPR_VCC) reg = 106;
+      else if (op.type == T::OPR_EXEC || op.type == T::OPR_SDST_EXEC) reg = 126;
+      else continue;
+    } else {
+      reg = insn.field(op.field);
+    }
+    if (e == E::Vopc && insn.form == rd::Form::Sdwa && insn.field(Field::SD) && reg == 106) reg = insn.field(Field::SDST);
+    if (reg >= 128 || reg == 125) continue;
+    uint32_t count = std::max<uint32_t>(1, op.bits / 32);
+    if (valu && op.bits == 64 && !wave64) count = 1;
+    out.emplace_back(reg, std::min<uint32_t>(count, 128 - reg));
   }
 }
 
@@ -3575,6 +3706,11 @@ MaskStep mask_step(const rd::Instruction& insn, bool wave64, MaskKinds& k) {
   for (int i = 0; i < n; ++i) {
     if (!regs[i].out) continue;
     for (uint32_t d = regs[i].first; d < regs[i].first + regs[i].count; ++d) k[d] = d == 126 || d == 127 ? kMask : kind;
+  }
+  // SCC: from a mask operation the lane's own test, from anything else the wave's.
+  for (int i = 0; i < info.operand_count; ++i) {
+    const rd::OperandInfo& op = info.operands[i];
+    if (op.type == T::OPR_SSRC_SPECIAL_SCC && (op.flags & rd::kOut)) k[kSccKind] = st.mask_op ? kMask : kNum;
   }
   return st;
 }
@@ -3675,7 +3811,7 @@ Translation finish_graphics(const TranslateInput& in, const Ctx& c, Translation 
   h += binding == Binding::Runtime ? kRuntimeBinding : kTestBinding;
   h += format_table();
   h += kBufferHelpers;
-  if (c.uses_typed) h += kTypedHelpers;
+  if (c.uses_typed) h += std::string(binding == Binding::Runtime ? kTypedRuntime : kTypedTest) + kTypedHelpers;
   if (c.uses_images) {
     if (!vs) h += "#define AM_DX(x) ddx_fine(x)\n#define AM_DY(x) ddy_fine(x)\n";
     h += kImageHelpers;
@@ -3738,6 +3874,9 @@ Translation finish_graphics(const TranslateInput& in, const Ctx& c, Translation 
     }
   }
   h += initial_exec(c.wave64, c.lane, !vs);
+  for (const uint32_t r : c.typed_vs) {
+    h += "  AmTyped am_tb" + num(r) + " = am_typed(uint4(s[" + num(r) + "], s[" + num(r + 1) + "], s[" + num(r + 2) + "], s[" + num(r + 3) + "]));\n";
+  }
   const std::string merged = merge_lane_guards(body);
   h += "  uint am_spins = 0u;\n";
   if (tr.structured) {
@@ -3834,6 +3973,22 @@ Translation translate(const TranslateInput& in, Binding binding) {
     c.lane = mask_kinds(in.code, scan, starts, c.wave64, in.stage == HwStage::Vs, kinds, kinds_at);
   }
   tr.lanes = c.lane;
+  c.wave_branches = c.lane && scan.starts.size() > kWaveBranchesFrom;
+  for (const uint32_t at : scan.starts) {
+    rd::Instruction insn;
+    rd::decode(in.code, at, insn);
+    const std::string_view n = insn.info ? insn.info->name : "";
+    if (n.starts_with("buffer_load_format_") && !n.starts_with("buffer_load_format_d16")) c.typed_vs.insert(insn.field(Field::SRSRC) * 4);
+  }
+  const auto typed_params = [&](uint32_t first, uint32_t count) {
+    std::string out;
+    for (const uint32_t r : c.typed_vs) {
+      if (r < first + count && first < r + 4) {
+        out += "      am_tb" + num(r) + " = am_typed(uint4(s[" + num(r) + "], s[" + num(r + 1) + "], s[" + num(r + 2) + "], s[" + num(r + 3) + "]));\n";
+      }
+    }
+    return out;
+  };
   std::vector<CfgBlock> blocks;
   const auto& ops = table();
   for (size_t k = 0; k < scan.starts.size(); ++k) {
@@ -3890,9 +4045,15 @@ Translation translate(const TranslateInput& in, Binding binding) {
       const int64_t target = static_cast<int64_t>(next) + static_cast<int16_t>(insn.field(Field::SIMM16));
       std::string cond;
       if (name == "s_branch") cond = "true";
+      else if (c.lane && c.wave_branches && (c.mt[kSccKind] & kMask) && name == "s_cbranch_scc0") cond = "!WaveActiveAnyTrue(scc)";
+      else if (c.lane && c.wave_branches && (c.mt[kSccKind] & kMask) && name == "s_cbranch_scc1") cond = "WaveActiveAnyTrue(scc)";
       else if (name == "s_cbranch_scc0") cond = "!scc";
       else if (name == "s_cbranch_scc1") cond = "scc";
       // A mask's test is the lane's own with lanes as threads (Ctx::zero_test).
+      else if (c.lane && c.wave_branches && name == "s_cbranch_execz") cond = "!WaveActiveAnyTrue(s[126] != 0u)";
+      else if (c.lane && c.wave_branches && name == "s_cbranch_execnz") cond = "WaveActiveAnyTrue(s[126] != 0u)";
+      else if (c.lane && c.wave_branches && !((c.mt[106] | c.mt[107]) & kNum) && name == "s_cbranch_vccz") cond = "!WaveActiveAnyTrue(s[106] != 0u)";
+      else if (c.lane && c.wave_branches && !((c.mt[106] | c.mt[107]) & kNum) && name == "s_cbranch_vccnz") cond = "WaveActiveAnyTrue(s[106] != 0u)";
       else if (name == "s_cbranch_vccz") cond = c.zero_test(106);
       else if (name == "s_cbranch_vccnz") cond = "!" + c.zero_test(106);
       else if (name == "s_cbranch_execz") cond = c.zero_test(126);
@@ -3921,6 +4082,11 @@ Translation translate(const TranslateInput& in, Binding binding) {
     }
     blk.code += c.out;
     forget_written(c, insn);
+    if (!c.typed_vs.empty()) {
+      std::vector<std::pair<uint32_t, uint32_t>> written;
+      sgpr_writes(insn, c.wave64, written);
+      for (const auto& [first, count] : written) blk.code += typed_params(first, count);
+    }
   }
   // Running off the end of the code ends the program.
   if (!blocks.empty() && blocks.back().end == CfgBlock::Fall) {
@@ -3967,7 +4133,7 @@ Translation translate(const TranslateInput& in, Binding binding) {
   h += binding == Binding::Runtime ? kRuntimeBinding : kTestBinding;
   h += format_table();
   h += kBufferHelpers;
-  if (c.uses_typed) h += kTypedHelpers;
+  if (c.uses_typed) h += std::string(binding == Binding::Runtime ? kTypedRuntime : kTypedTest) + kTypedHelpers;
   if (c.uses_images) {
     h += "#define AM_DX(x) ((QuadReadAcrossX(x) - (x)) * select((am_lane & 1u) != 0u, -1.0f, 1.0f))\n"
          "#define AM_DY(x) ((QuadReadAcrossY(x) - (x)) * select((am_lane & 2u) != 0u, -1.0f, 1.0f))\n";
@@ -4000,6 +4166,9 @@ Translation translate(const TranslateInput& in, Binding binding) {
   if (tid_comps >= 1) h += "  v[1] = am_tid.y;\n";
   if (tid_comps >= 2) h += "  v[2] = am_tid.z;\n";
   h += initial_exec(c.wave64, c.lane, false);
+  for (const uint32_t r : c.typed_vs) {
+    h += "  AmTyped am_tb" + num(r) + " = am_typed(uint4(s[" + num(r) + "], s[" + num(r + 1) + "], s[" + num(r + 2) + "], s[" + num(r + 3) + "]));\n";
+  }
   // At s_endpgm the tests' binding dumps the registers; the runtime's has nothing to do.
   if (binding == Binding::Runtime) {
     h += "#define AM_END() {}\n";
