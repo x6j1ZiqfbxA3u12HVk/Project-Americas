@@ -2126,3 +2126,53 @@ messages, and what was done after:
 2. The GPU comparison again (user away): compute, then a mesh and a VS/PS draw comparison.
 3. Service: DXC for programs that nest (faster in the driver), ours for the rest
    (`AM_SHADERS_OURS`); the giants only once the driver takes them.
+
+## The giants in AMD's driver: what drives its cost (2026-11-27, ~21:30)
+
+Game run (20:06, 24 GB cap): reached frame ~2,894 (earlier runs stalled at 2,786/3,581), then
+two large driver builds at once (1.5 MB and 372 KB of DXIL, 168 s and 126 s) took the process
+from 16 to 23.7 GB, and the title crashed when its page writes were refused at the cap. Mesh
+pipelines are refused (`host pipeline for a mesh pipeline: FAILED (0x80070057)`). The same unmet
+GPU waits as before. The game does wait for 24ea (serve.txt, earlier runs).
+
+Measured with `d3d12x_driver_pipeline_memory` (one DXIL, a private-bytes cap; script in the
+session scratchpad, `peak24.ps1`: run a copy `am_tests_drv.exe` so builds can go on):
+
+| 3db4 from | instructions | blocks | driver |
+|---|---|---|---|
+| DXC (nested form, installed) | 262 K | 11.2 K | 167 s, 7.6 GB |
+| ours, before today | 650 K | 29.7 K | past 10 GB in 18 s, past 20 GB in 30 s |
+| ours + CSE, branch facts, pairs, empty blocks (d96cb42) | 360 K | 15.2 K | past 16 GB in 20 s |
+| ours + DXC's LLVM passes (`AM_DXIL_LLVM_PASSES`) | 245 K | 11.5 K | **109 s, 8.2 GB** |
+
+* So our IR's shape mattered more than its size: seven LLVM passes (`-simplifycfg -instcombine
+  -early-cse -gvn -instcombine -simplifycfg -adce`, through `host::optimize_dxil`, 17 s for 3db4)
+  make ours build like DXC's. Which of them matters is not known yet; using DXC's optimizer
+  after ours is a fine pipeline (dxcompiler.dll is required anyway).
+* Ruled out as causes: the skip-optimization flag (ignored), loops (removing 24ea's 625 made it
+  worse), the first-lane reads, the nested versus goto form, boolean phis (none), handles alone.
+* **24ea** is different: its console code joins hundreds of branches (a block of 568
+  predecessors) and with per-lane branches every scalar after the first EXEC skip is divergent
+  to the driver, which restructures that in tens of GB (12.4 GB at 30 s). With the goto form's
+  wave branches (d96cb42: mask tests on the wave, scalar compares as they are) its growth is
+  steady, not explosive, but the module doubles (179 K -> 397 K instructions after DXC's
+  passes: per-lane tests let both optimizers drop half the paths) and the build passes 24 GB
+  (22 GB after 5 min, a drop to 8.5, then past 24). From over 45 GB before.
+* Tried and dropped: per-lane skips only for regions writing no scalar numbers (3 of 24ea's
+  2,532 qualify: its masked regions do scalar work too); wave operations merged within a block
+  (few repeat).
+* The driver's memory grows about quadratically with the function's size (3db4: 245 K -> 8 GB;
+  24ea: 397 K -> ~22 GB in its first phase).
+
+**Ways on for 24ea (a decision for the user):**
+1. **Split it into several dispatches**: the goto form's blocks in parts of ~100 K instructions,
+   each part a compute program; the registers (s, v, SCC, EXEC, the part to run next) and the
+   group's LDS saved to a scratch buffer between parts; the runtime runs the parts in order
+   (and again for backward jumps across parts). Works on any PC; one or two sessions.
+2. A one-time prebuild with a large page file (needs ~30 GB of commit now): this PC only, and
+   again after a driver update.
+3. Keep shrinking it (finding which DXC pass fixes 3db4 and doing it ourselves; fewer
+   instructions per scalar load).
+
+Also open: the game run's memory (one large driver build at a time, and only with headroom
+under the cap), mesh pipelines refused (0x80070057).

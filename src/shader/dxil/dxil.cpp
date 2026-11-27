@@ -1213,6 +1213,31 @@ void Module::cse() {
     const auto it = known.find(c);
     known_undo.emplace_back(c, it == known.end() ? -1 : static_cast<int>(it->second));
     known[c] = v;
+    // A wave test: WaveActiveAllTrue(x) true says x holds in this lane too, WaveActiveAnyTrue(x)
+    // false that it does not (the goto form's branches on lane masks).
+    if (const Inst* w = def_of(c); w && w->op == Op::Call && w->ops.size() == 3) {
+      const std::string& n = functions_[values_[w->ops[0]].bits].name;
+      if ((n == "dx.op.waveAllTrue" && v) || (n == "dx.op.waveAnyTrue" && !v)) {
+        const Value x = resolve(w->ops[2]);
+        const auto kx = known.find(x);
+        known_undo.emplace_back(x, kx == known.end() ? -1 : static_cast<int>(kx->second));
+        known[x] = v;
+        // and what x says in turn (a compare of a mask with zero)
+        const Inst* d2 = def_of(x);
+        if (d2 && d2->op == Op::Cmp) {
+          const Pred p = static_cast<Pred>(d2->code);
+          uint64_t k = 0;
+          const Value xx = resolve(d2->ops[0]), kv = resolve(d2->ops[1]);
+          if ((p == Pred::IEq || p == Pred::INe) && constant_int(kv, k)) {
+            const bool eq = p == Pred::IEq ? v : !v;
+            const auto key2 = std::make_pair(xx, kv);
+            const auto e = equal.find(key2);
+            equal_undo.emplace_back(key2, e == equal.end() ? -1 : static_cast<int>(e->second));
+            equal[key2] = eq;
+          }
+        }
+      }
+    }
     // A compare of x with a constant: x == k (or not) holds too; a mask's bool likewise.
     const Inst* d = def_of(c);
     if (d && d->op == Op::Cmp) {
