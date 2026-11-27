@@ -1923,3 +1923,33 @@ cannot be built. What a console mesh program does (from the reference furthest a
   The depth check (`too_deep`, > 200) counts expression parentheses with the block nesting;
   clang's real limit is 256 brackets, so 24ea's nested form may fit (3db4's nested form builds
   in 7.6 GB). Measure its nested depth first; if under ~250, raise the threshold.
+
+## Afternoon 2026-11-27: a driver crash fixed, mesh pipelines draw, 24ea prebuilt once
+
+* **The service's overnight result:** idle at 18,086 compiled programs; 590 refused, all mesh
+  programs over D3D12's 32 KiB of mesh outputs (see below; fixed). Its refusal summary groups
+  reasons by DXC's first 60 characters, which are often a warning: the real error is further on.
+* **Game run (14:47): AMD's compiler crashed the process** (`amdxc64.dll+0x7380f8`, a null read
+  in its `SCInstDataShareAtomic` code) building a loading-screen pixel shader (f99f80d5...).
+  Found by keeping each graphics build's programs in `cache\d3d12\building\<thread>-{vs,ps,gs}.dxil`
+  (the crashing thread is the one missing from hang.txt) and reproducing with
+  `AM_PIPELINE_VS=... AM_PIPELINE_PS=... AM_PIPELINE_LAYOUT=COLOR,POSITION am_tests
+  d3d12x_graphics_pipeline_from_files`. The crash needs three things together: `IsHelperLane()`,
+  quad reads (the s_wqm translation) and a ballot feeding `WaveReadLaneAt` (v_readfirstlane);
+  any one removed builds. Fix: pixel shaders read the first lane with `WaveReadLaneFirst`. 3,338
+  pixel shaders compiled before need recompiling (the service's stale check does it): **do not
+  run the game until the service is idle again**, or it may build an old one and crash.
+* **Mesh pipelines draw** (not tested in a game run yet):
+  - translator: mesh user data as vertex shaders take it (the runtime's constants are the SGPRs
+    from s0, user data from s8), up to s31 (b0: s0-s19, b1 `am_user_hi`: s20-s31); outputs
+    declared at their signature width when float4s would pass 16 rows a vertex (the 590).
+  - runtime: `translated_mesh_root_signature()` (MS b0 20 + b1 12 constants, PS b0 20, table u0);
+    console pipelines with a mesh program get a host mesh pipeline from a pipeline-state stream
+    (`console_mesh_pipeline`); list slot 129 DispatchMesh -> `mesh_draw`: the mesh root
+    signature, user data with MESH visibility (`user_data_sgprs`), `DispatchMesh(x*y*z, 1, 1)`.
+    The first 8 DispatchMesh calls are logged with their arguments.
+  - open: the pixel shader links to narrowed mesh outputs (float2) while declaring float4 inputs;
+    if D3D12 refuses such pipelines, the log says `host pipeline for a mesh pipeline: FAILED`.
+* **24ea:** its nested form is 261 deep (DXC's limit 256) and 44 MB of HLSL (the chained form
+  17 MB): no way out there. Prebuilt once instead (the user's idea: a big page file for a
+  one-time build), `tools\step3\prebuild-24ea.ps1`, log `cache\shaders\bench\prebuild-24ea.txt`.
