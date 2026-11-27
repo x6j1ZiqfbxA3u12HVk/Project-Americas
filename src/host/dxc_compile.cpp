@@ -100,4 +100,70 @@ CompileResult compile_hlsl(std::string_view source, std::string_view entry, std:
   return r;
 }
 
+// A DXIL module (LLVM 3.7 bitcode, as DXIL is) into a container, validated and signed:
+// IDxcAssembler builds the container (the signature and PSV0 parts from the module's metadata),
+// IDxcValidator checks it and signs it in place.
+CompileResult assemble_dxil(const std::vector<uint8_t>& module) {
+  CompileResult r;
+  const Loaded& l = loaded();
+  if (!l.create) {
+    r.messages = l.why;
+    return r;
+  }
+  ComPtr<IDxcAssembler> assembler;
+  ComPtr<IDxcUtils> utils;
+  if (FAILED(l.create(CLSID_DxcAssembler, IID_PPV_ARGS(&assembler))) || FAILED(l.create(CLSID_DxcUtils, IID_PPV_ARGS(&utils)))) {
+    r.messages = "cannot create the assembler";
+    return r;
+  }
+  ComPtr<IDxcBlobEncoding> input;
+  if (FAILED(utils->CreateBlob(module.data(), static_cast<UINT32>(module.size()), DXC_CP_ACP, &input))) {
+    r.messages = "cannot make a blob";
+    return r;
+  }
+  ComPtr<IDxcOperationResult> assembled;
+  HRESULT status = E_FAIL;
+  if (FAILED(assembler->AssembleToContainer(input.Get(), &assembled)) || !assembled || FAILED(assembled->GetStatus(&status))) {
+    r.messages = "the assembler failed";
+    r.transient = true;
+    return r;
+  }
+  const auto messages_of = [](IDxcOperationResult* o) {
+    std::string text;
+    ComPtr<IDxcBlobEncoding> e;
+    if (SUCCEEDED(o->GetErrorBuffer(&e)) && e && e->GetBufferSize()) text.assign(static_cast<const char*>(e->GetBufferPointer()), e->GetBufferSize());
+    return text;
+  };
+  if (FAILED(status)) {
+    r.messages = "assembling: " + messages_of(assembled.Get());
+    return r;
+  }
+  ComPtr<IDxcBlob> container;
+  if (FAILED(assembled->GetResult(&container)) || !container) {
+    r.messages = "the assembler gave no container";
+    return r;
+  }
+  ComPtr<IDxcValidator> validator;
+  if (FAILED(l.create(CLSID_DxcValidator, IID_PPV_ARGS(&validator)))) {
+    r.messages = "cannot create the validator";
+    return r;
+  }
+  ComPtr<IDxcOperationResult> validated;
+  status = E_FAIL;
+  if (FAILED(validator->Validate(container.Get(), DxcValidatorFlags_InPlaceEdit, &validated)) || !validated ||
+      FAILED(validated->GetStatus(&status))) {
+    r.messages = "the validator failed";
+    r.transient = true;
+    return r;
+  }
+  if (FAILED(status)) {
+    r.messages = "validating: " + messages_of(validated.Get());
+    return r;
+  }
+  const auto* p = static_cast<const uint8_t*>(container->GetBufferPointer());
+  r.dxil.assign(p, p + container->GetBufferSize());
+  r.ok = true;
+  return r;
+}
+
 }  // namespace am::host

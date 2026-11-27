@@ -22,6 +22,9 @@ struct CompileResult {
 CompileResult compile_hlsl(std::string_view source, std::string_view entry, std::string_view profile,
                            const std::vector<std::wstring>& extra_args = {});
 
+// A DXIL module (LLVM 3.7 bitcode) made into a validated, signed container.
+CompileResult assemble_dxil(const std::vector<uint8_t>& module);
+
 // Whether a compiler was found (probe_dxc), and why not.
 bool dxc_available(std::string* why = nullptr);
 
