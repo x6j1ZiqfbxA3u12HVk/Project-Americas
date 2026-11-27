@@ -943,6 +943,30 @@ int serve(const fs::path& pack_dir, const fs::path& runtime_dir, const fs::path&
   int idle_busy = 0;                       // workers on idle work (not asked for by the game)
   int huge_busy = 0;                       // compiles of over 1 MiB of HLSL running (under `lock`)
   std::vector<std::pair<std::string, bool>> deferred_huge;  // large ones set aside (marker, waited)
+  // Compiles in progress (DXC gives no progress of its own): large ones are announced when they
+  // start, and every 5 minutes the ones running over 3 minutes are listed with their time so far.
+  struct Running {
+    std::chrono::steady_clock::time_point since;
+    size_t hlsl_kib;
+    const char* stage;
+  };
+  std::map<std::string, Running> running;
+  std::thread([&] {
+    for (;;) {
+      Sleep(5 * 60 * 1000);
+      std::lock_guard<std::mutex> g(lock);
+      const auto now = std::chrono::steady_clock::now();
+      for (const auto& [m, r] : running) {
+        const double minutes = std::chrono::duration<double>(now - r.since).count() / 60;
+        if (minutes < 3) continue;
+        say("  still compiling %s %s (%zu KiB of HLSL): %.0f min so far\n", r.stage, m.c_str(), r.hlsl_kib, minutes);
+      }
+      for (const auto& [m, waited] : deferred_huge) {
+        if (waited) say("  waiting for the large-compile slot: %s (the game waits for it)\n", m.c_str());
+      }
+      std::fflush(stdout);
+    }
+  }).detach();
   // Room for another large compile (under `lock`): none running, or 4.5 GB of RAM free.
   const auto huge_room = [&] {
     if (huge_busy == 0) return true;
@@ -1055,6 +1079,15 @@ int serve(const fs::path& pack_dir, const fs::path& runtime_dir, const fs::path&
     // A compile the compiler could not run (not one it refused: out of memory while other
     // compiles or a game run hold it, for one) is tried again a little later, and never counted
     // as a refusal: a refusal is not tried again by this build.
+    {
+      std::lock_guard<std::mutex> g(lock);
+      running[marker] = {std::chrono::steady_clock::now(), t.hlsl.size() >> 10, shader::hw_stage_name(at.stage)};
+      if (huge) {
+        say("  compiling large %s %s (%zu KiB of HLSL)%s: DXC gives no progress; a line every 5 minutes\n",
+            shader::hw_stage_name(at.stage), marker.c_str(), t.hlsl.size() >> 10, waited ? ", the game waits for it" : "");
+        std::fflush(stdout);
+      }
+    }
     host::CompileResult c;
     for (int attempt = 0;; ++attempt) {
       c = host::compile_hlsl(t.hlsl, t.entry, t.profile);
@@ -1065,9 +1098,10 @@ int serve(const fs::path& pack_dir, const fs::path& runtime_dir, const fs::path&
       std::fflush(stdout);
       Sleep(kWaitMs[attempt]);
     }
-    if (huge) {
+    {
       std::lock_guard<std::mutex> g(lock);
-      --huge_busy;
+      running.erase(marker);
+      if (huge) --huge_busy;
     }
     const double took = std::chrono::duration<double>(std::chrono::steady_clock::now() - c0).count();
     if (!c.ok && c.transient) {

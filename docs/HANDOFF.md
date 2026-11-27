@@ -1630,3 +1630,8 @@ loading does). Work that way.
   programs while those two waited. Now unoptimized DXIL is recompiled only when the game uses
   it (the runtime treats large DXIL without an "-o3" key as missing and asks for it), and a
   large program the game waits for goes first in the large-compile queue.
+* **Compile heartbeat:** DXC reports no progress. The service now prints `compiling large ...` when
+  a large compile starts and, every 5 minutes, `still compiling ... : N min so far` for compiles
+  over 3 minutes, plus `waiting for the large-compile slot` for giants the game waits on. In the
+  build after 02:43; the service running then (pid 12512) does not have it and was left alone,
+  so the far-jump giants keep the time they already had (34 min at 03:17).
